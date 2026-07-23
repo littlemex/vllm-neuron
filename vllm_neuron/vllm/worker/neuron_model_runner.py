@@ -406,10 +406,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         # Current: No LORA config or manager initialization
         # Target: self.lora_config = vllm_config.lora_config if vllm_config else None; self.lora_manager = None
 
-        # TODO: Add prefix caching support check
-        # Why required: Prevents silent failures when APC is enabled (not yet supported on Neuron)
-        # Current: No validation, will fail silently or cause incorrect behavior
-        # Target: Raise NotImplementedError if cache_config.enable_prefix_caching is True with clear error message
+        # NOTE: Automatic Prefix Caching (APC) IS supported and is validated
+        # later in __init__: when enable_prefix_caching is True, segmented
+        # prefill must be enabled (max_num_batched_tokens must be a supported
+        # segment size), otherwise a ValueError is raised. See the guard below.
         self.model: Any | None = None
         self._is_synthetic_model: bool = False
         self._tensor_capture_model = None

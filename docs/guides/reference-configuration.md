@@ -153,7 +153,7 @@ For conceptual overview, see [Compilation](features-guide.md#compilation).
 
 | Variable | Type | Default | Description |
 | ---- | ---- | ---- | ---- |
-| `NEURON_COMPILED_ARTIFACTS` | str | -- | Path to cache/load compiled models. Skips recompilation when valid artifacts exist. |
+| `VLLM_CACHE_ROOT` | str | `~/.cache/vllm` | Root of the compile cache; NEFFs are cached under `$VLLM_CACHE_ROOT/neuron/compile_cache` and reused across restarts. |
 | `VLLM_NEURON_CPU_COMPILE` | bool | 0 | Enable CPU-only compilation mode (compile NEFFs without Neuron hardware). |
 | `NEURON_PLATFORM_TARGET_OVERRIDE` | str | -- | Target platform for CPU compile mode (e.g., `trn2`). Required when `VLLM_NEURON_CPU_COMPILE=1`. |
 | `VLLM_NEURON_PARALLEL_COMPILE_WORKERS` | int | -- | Number of parallel compilation workers. |
@@ -237,7 +237,7 @@ outputs = llm.generate(prompts, sampling_params)
 Equivalent CLI:
 
 ```bash
-export NEURON_COMPILED_ARTIFACTS=/opt/neuron-cache/gpt-oss-20b
+export VLLM_CACHE_ROOT=/opt/neuron-cache/gpt-oss-20b
 export VLLM_NEURON_PARALLEL_COMPILE_WORKERS=4
 export VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION=0.35
 

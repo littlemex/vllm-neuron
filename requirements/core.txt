@@ -20,6 +20,14 @@ ml_dtypes
 # NIXL KV transfer (disaggregated inference)
 nixl
 
+# Neuron runtime required by the model path (nki is imported unconditionally,
+# e.g. vllm_neuron/functional/argsort_unstable.py). Install from the Neuron
+# pip index (see the setup guide's --extra-index-url). libtorch-neuronx-lite
+# requires torch==2.11.*, matching vLLM's torch pin.
+nki>=0.5.0
+neuronx-cc~=2.26
+libtorch-neuronx-lite==2.11.*
+
 # benchmark dependency
 psutil
 requests
