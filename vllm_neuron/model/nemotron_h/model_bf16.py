@@ -16,7 +16,7 @@ vLLM-Neuron plugin patterns:
     norm + routed_scaling_factor), 128 routed experts top-6 + 1 shared, relu^2 activation
     (from modeling_nemotron_h.py NemotronHMoE.route_tokens_to_experts). Correctness-first
     per-expert loop; NF.moe_cte fast path is a later optimization.
-  - Mamba2: vectorized-SSD prefill + 1-step-recurrence decode, with recurrent (ssm+conv) state
+  - Mamba2: chunked-SSD prefill (default; O(l*C), long sequences) + 1-step-recurrence decode, with
     carried across decode steps via in-place module buffers that the plugin's
     AliasingOutputRewritePass turns into HLO input_output_alias (batch=1). No runner-side state pool.
     This is the NemotronH-specific piece plamo3 does not have.
@@ -712,15 +712,10 @@ class NemotronHMamba2Mixer(nn.Module):
                 h = h * dA[:, t][..., None, None] + dBx
                 ys.append((h * C[:, t][:, :, None, :]).sum(dim=-1))
             y = torch.stack(ys, dim=1) + x * self.D[..., None]
-        elif os.environ.get("NEMOTRONH_SCAN") == "chunked":
-            # Chunked SSD: O(l*C) so long sequences fit (lifts the quadratic form's short-seq cap).
-            # The scan itself lives in module-level chunked_ssd_scan() — the SAME function the CPU
-            # equivalence test imports, so implementation and test cannot silently diverge.
-            cs = int(os.environ.get("NEMOTRONH_CHUNK", "128"))
-            s0 = ssm_state0.float() if ssm_state0 is not None else None
-            y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
-        else:
-            # DEFAULT: vectorized SSD (quadratic / attention-form) selective scan. No Python time
+        elif os.environ.get("NEMOTRONH_SCAN") == "quadratic":
+            # OPT-IN (NEMOTRONH_SCAN=quadratic): vectorized SSD (quadratic / attention-form). O(l^2)
+            # in sequence length, so it caps practical max_model_len (~32); kept for short-seq and
+            # debugging. The DEFAULT scan is now chunked (the else branch). No Python time
             # loop and no carried-dependency chain — only matmuls + cumsum + a causal mask + a
             # bounded (exponent <= 0) decay, the same op shapes as attention (which compiles). This
             # is what lets Mamba compile on the plugin's neuronx-cc path WITHOUT native
@@ -755,6 +750,13 @@ class NemotronHMamba2Mixer(nn.Module):
             #   h_L[p,n] = sum_s exp(A_h * (csdt_L - csdt_s)) * dt_s * x_s[p] * B_s[n]
             wL = torch.exp(At[:, :, -1:] - At) * dtf.permute(0, 2, 1)   # [b,H,l]
             h = torch.einsum('bhs,bshp,bshn->bhpn', wL, x, B)      # [b,H,P,N]
+        else:
+            # DEFAULT: chunked SSD — O(l*C), lifts the quadratic form's short-seq cap so long
+            # sequences fit. The scan lives in module-level chunked_ssd_scan() (the SAME function
+            # the CPU equivalence test imports, so implementation and test cannot silently diverge).
+            cs = int(os.environ.get("NEMOTRONH_CHUNK", "128"))
+            s0 = ssm_state0.float() if ssm_state0 is not None else None
+            y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
         y = y.reshape(b, seq_len, -1)
         out = self._gated_rmsnorm(y, gate).to(dtype) @ self.out_proj_weight
         if self.world_size > 1:

@@ -57,12 +57,16 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
 
 ## Known limitations
 
-- **Prefill length.** The vectorized SSD scan is O(l²) in sequence length; long prefills need the
-  chunked SSD form (future work). Validated at short prefill buckets.
-- **No chunked / continuation prefill.** The SSD prefill starts from a zero SSM state and does not
-  consume a prior chunk's carried state, and the attention prefill does not read earlier chunks'
-  KV. Run with `max_num_batched_tokens >= prompt length` so each prompt is a single prefill;
-  splitting a prompt across prefill calls would silently drop earlier context.
+- **Prefill length.** The DEFAULT prefill scan is the chunked SSD (`ssd.py`, `chunked_ssd_scan`):
+  O(l·C) in sequence length, so long prefills fit. It splits the sequence into chunks of
+  `NEMOTRONH_CHUNK` (default 128) and combines an intra-chunk diagonal pass with an inter-chunk
+  state pass solved in closed form on the chunk axis — no O(l) Python loop and no strided chunk
+  split, so it compiles on neuronx-cc (verified on trn2). The O(l²) vectorized form is opt-in via
+  `NEMOTRONH_SCAN=quadratic` (short-seq / debugging). CPU equivalence to the sequential recurrence
+  is pinned by `test_chunked_ssd_matches_sequential` (incl. an fp32 long-sequence stress test).
+- **Continuation prefill.** The chunked SSD accepts a prefix `ssm_state0`, so a prompt can be split
+  across prefill calls carrying the SSM state. (The opt-in quadratic form does not support a prefix
+  state and raises if one is passed. The attention prefill still reads only its own chunk's KV.)
 - **Batch size.** batch=1 (`max_num_seqs=1`): the Mamba2 recurrent state is a single per-layer
   buffer (no per-slot pool), so concurrent sequences would corrupt each other. Decode raises on a
   batch size other than 1 rather than producing wrong output.
@@ -78,12 +82,17 @@ card and the Neuron EFA-affinity probe expects a co-located EFA under each Neuro
 (true only on multi-card instances like trn2.48xlarge); the affinity is a CPU-locality optimization,
 not a correctness requirement. On a multi-card instance you can leave it unset.
 
-The following variables are **diagnostic only — do not set them in production**; they change or
-disable the model's numerics:
+Prefill-scan selection:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `NEMOTRONH_SCAN=sequential` | off | Replace the vectorized SSD prefill with the sequential-recurrence oracle (numerically equivalent, but does not compile on the neuronx-cc path). |
+| `NEMOTRONH_SCAN` | chunked | Prefill scan. `chunked` (default): O(l·C), long sequences. `quadratic`: O(l²) vectorized form (short-seq / debugging). `sequential`: the 1-step-recurrence oracle (numerically equivalent, but does not compile on the neuronx-cc path). |
+| `NEMOTRONH_CHUNK` | 128 | Chunk size C for the chunked SSD (only used when `NEMOTRONH_SCAN=chunked`). |
+
+The following are **diagnostic only — do not set them in production**; they change or disable numerics:
+
+| Variable | Default | Effect |
+|---|---|---|
 | `NEMOTRONH_MAMBA_STUB=1` | off | Skip the SSM recurrence entirely (returns non-sense output). For isolating the Mamba path only. |
 | `NEMOTRONH_DEBUG_LOAD=1` | off | Log weight-loading coverage (unmapped params, still-on-meta tensors) at DEBUG level. |
 
@@ -108,6 +117,7 @@ vllm_neuron/model/nemotron_h/
 ├── README.md          # This file
 ├── config.py          # NemotronHConfig: Omni-wrapper unwrap + attribute_map alias recovery
 ├── factory.py         # NemotronHForCausalLM factory (bf16 today; FP8/NVFP4 future)
+├── ssd.py             # chunked_ssd_scan: chunked Mamba2 SSD prefill (single source; test imports it)
 └── model_bf16.py      # RMSNorm / Attention / MoE / Mamba2 mixers + model + HF weight loader
 ```
 
@@ -119,6 +129,8 @@ test/vllm_neuron/model/nemotron_h/bf16/
                                   #  - vectorized-SSD prefill scan vs the sequential recurrence
                                   #  - mask-before-exp is required to avoid inf*0 = NaN
                                   #  - DGE-free dense MoE router vs a scatter-based argmax top-k router
+                                  #  - chunked SSD == sequential recurrence (chunk boundaries, long
+                                  #    sequences, prefix state) + an fp32 long-sequence stress test
 ```
 
 Run with `pytest test/vllm_neuron/model/nemotron_h/bf16/`. Full-model / HF-parity correctness is
