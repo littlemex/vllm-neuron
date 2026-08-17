@@ -58,15 +58,20 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
 ## Known limitations
 
 - **Prefill length.** The DEFAULT prefill scan is the chunked SSD (`ssd.py`, `chunked_ssd_scan`):
-  O(l·C) in sequence length, so long prefills fit. It splits the sequence into chunks of
-  `NEMOTRONH_CHUNK` (default 128) and combines an intra-chunk diagonal pass with an inter-chunk
-  state pass solved in closed form on the chunk axis — no O(l) Python loop and no strided chunk
-  split, so it compiles on neuronx-cc (verified on trn2). The O(l²) vectorized form is opt-in via
-  `NEMOTRONH_SCAN=quadratic` (short-seq / debugging). CPU equivalence to the sequential recurrence
-  is pinned by `test_chunked_ssd_matches_sequential` (incl. an fp32 long-sequence stress test).
-- **Continuation prefill.** The chunked SSD accepts a prefix `ssm_state0`, so a prompt can be split
-  across prefill calls carrying the SSM state. (The opt-in quadratic form does not support a prefix
-  state and raises if one is passed. The attention prefill still reads only its own chunk's KV.)
+  O(l·C + T²) in sequence length (T = l/C chunks), so for a realistic `max_model_len` the linear
+  `l·C` term dominates and long prefills fit where the full-sequence O(l²) form does not. It splits
+  the sequence into chunks of `NEMOTRONH_CHUNK` (default 128) and combines an intra-chunk diagonal
+  pass with an inter-chunk state pass solved in closed form on the chunk axis — no O(l) Python loop
+  and no strided chunk split, so it compiles on neuronx-cc (verified on trn2). The full-sequence
+  O(l²) vectorized form is opt-in via `NEMOTRONH_SCAN=quadratic` (short-seq / debugging). CPU
+  equivalence to the sequential recurrence is pinned by `test_chunked_ssd_matches_sequential`
+  (incl. an fp32 long-sequence stress test). The practical `max_model_len` ceiling is the per-bucket
+  NEFF compile time (which grows with the number of sequence-length buckets), not the scan.
+- **Continuation prefill — primitive only, not wired.** `chunked_ssd_scan` accepts a prefix
+  `ssm_state0` (the low-level primitive for splitting a prompt across prefill calls carrying the SSM
+  state), but the runner does not yet split prefills, so this is groundwork rather than an active
+  feature. (The opt-in quadratic form does not support a prefix state and raises if one is passed.
+  The attention prefill reads only its own chunk's KV.)
 - **Batch size.** batch=1 (`max_num_seqs=1`): the Mamba2 recurrent state is a single per-layer
   buffer (no per-slot pool), so concurrent sequences would corrupt each other. Decode raises on a
   batch size other than 1 rather than producing wrong output.
