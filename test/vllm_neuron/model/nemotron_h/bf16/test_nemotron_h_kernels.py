@@ -30,6 +30,7 @@ for _ in range(8):
 _spec = importlib.util.spec_from_file_location("nemotron_ssd", _cand)
 _ssd = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_ssd)
 chunked_ssd_scan = _ssd.chunked_ssd_scan
+segmented_causal_conv1d = _ssd.segmented_causal_conv1d
 
 
 def _sequential_ssd(x, B, C, dt, A, D, state0=None):
@@ -91,6 +92,86 @@ def test_chunked_ssd_matches_sequential():
             y_ch, h_ch = chunked_ssd_scan(x, B, C, dt, A, D, cs, s0)
             assert torch.allclose(y_seq, y_ch, atol=1e-8), (l, cs, use_state0, (y_seq - y_ch).abs().max())
             assert torch.allclose(h_seq, h_ch, atol=1e-8), (l, cs, use_state0, (h_seq - h_ch).abs().max())
+
+
+def _mamba_prefill_core(xBC_t, conv_w, conv_b, dt, A, D, K, cs, im, gn, G, ssm_state0, conv_state0):
+    """Faithful CPU replica of NemotronHMamba2Mixer.forward_prefill's conv + SSD pipeline, used as a
+    segmented-vs-single-shot oracle. Mirrors the shipped ops (depthwise causal conv1d, SiLU, split
+    x/B/C, chunked_ssd_scan). conv_state0 is the previous segment's last (K-1) RAW conv inputs (None
+    on the first segment => zero left-pad, i.e. single-shot start). Returns
+    (y[b,l,H,P], h_final[b,H,P,N], conv_state_out[b,conv_dim,K-1])."""
+    b, conv_dim, seq = xBC_t.shape
+    # Use the SHIPPED conv-carry helper (single source of truth): cont=1 on a continuation segment,
+    # None conv_state0 => single-shot / first segment (fresh zero left-pad).
+    cont = None if conv_state0 is None else torch.ones((), dtype=xBC_t.dtype)
+    xBC_c, conv_state_out = segmented_causal_conv1d(xBC_t, conv_w, conv_b, K, conv_dim,
+                                                    conv_state=conv_state0, cont=cont)
+    xBC = F.silu(xBC_c.transpose(1, 2))                              # [b, seq, conv_dim]
+    P = im // (A.shape[0])
+    H, N = A.shape[0], gn // G
+    rep = H // G
+    x = xBC[..., :im].reshape(b, seq, H, P)
+    B = xBC[..., im:im + gn].reshape(b, seq, G, N).repeat_interleave(rep, dim=2)
+    C = xBC[..., im + gn:im + 2 * gn].reshape(b, seq, G, N).repeat_interleave(rep, dim=2)
+    y, h = chunked_ssd_scan(x, B, C, dt, A, D, cs, ssm_state0)
+    return y, h, conv_state_out
+
+
+def test_segmented_prefill_matches_single_shot():
+    """A prefill split into segments (carrying BOTH the SSM state AND the causal-conv1d state across
+    the boundary) is numerically identical to a single-shot prefill. This pins the segmented /
+    continuation prefill path (NemotronHMamba2Mixer.forward_prefill cont_prefill=True), in particular
+    that the conv1d history is carried (not zero-padded) at every segment boundary."""
+    for L, splits, cs in [(40, [24], 16), (40, [16, 28], 16), (256, [128], 128), (300, [128, 200], 128)]:
+        torch.manual_seed(L * 7 + cs + len(splits))
+        b, H, P, N, G, K = 1, 4, 8, 6, 2, 4
+        im, gn = H * P, G * N
+        conv_dim = im + 2 * gn
+        xBC_t = torch.randn(b, conv_dim, L, dtype=torch.float64)
+        conv_w = torch.randn(conv_dim, 1, K, dtype=torch.float64)
+        conv_b = torch.randn(conv_dim, dtype=torch.float64)
+        dt = F.softplus(torch.randn(b, L, H, dtype=torch.float64))
+        A = -torch.exp(torch.randn(H, dtype=torch.float64))
+        D = torch.randn(H, dtype=torch.float64)
+
+        # single-shot over the whole sequence
+        y_full, h_full, _ = _mamba_prefill_core(xBC_t, conv_w, conv_b, dt, A, D, K, cs, im, gn, G,
+                                                 ssm_state0=None, conv_state0=None)
+
+        # segmented: walk boundaries carrying ssm_state (h) and conv_state (raw last K-1 inputs)
+        bounds = [0] + splits + [L]
+        ys, ssm, conv = [], None, None
+        for i in range(len(bounds) - 1):
+            s, e = bounds[i], bounds[i + 1]
+            y_seg, ssm, conv = _mamba_prefill_core(
+                xBC_t[..., s:e], conv_w, conv_b, dt[:, s:e], A, D, K, cs, im, gn, G,
+                ssm_state0=ssm, conv_state0=conv)
+            ys.append(y_seg)
+        y_seg = torch.cat(ys, dim=1)
+        assert torch.allclose(y_full, y_seg, atol=1e-8), (L, splits, (y_full - y_seg).abs().max())
+        assert torch.allclose(h_full, ssm, atol=1e-8), (L, splits, (h_full - ssm).abs().max())
+
+
+def test_segmented_prefill_needs_conv_carry():
+    """Guard the top segmented-Mamba pitfall: dropping the conv1d state carry (zero-padding each
+    segment) must visibly diverge from single-shot, so a regression that forgets it is caught."""
+    torch.manual_seed(11)
+    b, H, P, N, G, K, L = 1, 4, 8, 6, 2, 4, 64
+    im, gn = H * P, G * N
+    conv_dim = im + 2 * gn
+    xBC_t = torch.randn(b, conv_dim, L, dtype=torch.float64)
+    conv_w = torch.randn(conv_dim, 1, K, dtype=torch.float64)
+    conv_b = torch.randn(conv_dim, dtype=torch.float64)
+    dt = F.softplus(torch.randn(b, L, H, dtype=torch.float64))
+    A = -torch.exp(torch.randn(H, dtype=torch.float64))
+    D = torch.randn(H, dtype=torch.float64)
+    y_full, _, _ = _mamba_prefill_core(xBC_t, conv_w, conv_b, dt, A, D, K, 16, im, gn, G, None, None)
+    # segment 2 WITHOUT conv carry (conv_state0=None on the continuation) but WITH ssm carry
+    y0, ssm, _ = _mamba_prefill_core(xBC_t[..., :32], conv_w, conv_b, dt[:, :32], A, D, K, 16, im, gn, G, None, None)
+    y1, _, _ = _mamba_prefill_core(xBC_t[..., 32:], conv_w, conv_b, dt[:, 32:], A, D, K, 16, im, gn, G,
+                                   ssm_state0=ssm, conv_state0=None)   # BUG: no conv carry
+    y_bad = torch.cat([y0, y1], dim=1)
+    assert not torch.allclose(y_full, y_bad, atol=1e-6), "dropping conv carry must diverge (documents the pitfall)"
 
 
 def test_chunked_ssd_fp32_long_sequence_stress():

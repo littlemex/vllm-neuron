@@ -6,6 +6,32 @@ Kept in a dedicated, dependency-light module so it is the SINGLE SOURCE OF TRUTH
 so the shipped implementation and the tested one can never silently diverge.
 """
 import torch
+import torch.nn.functional as F
+
+
+def segmented_causal_conv1d(xBC_t, conv_weight, conv_bias, kernel_size, groups,
+                            conv_state=None, cont=None):
+    """Depthwise causal conv1d for (segmented) Mamba2 prefill. SINGLE SOURCE OF TRUTH shared by the
+    model (NemotronHMamba2Mixer.forward_prefill) and the CPU test, so the shipped conv-history carry
+    and the tested one cannot silently diverge.
+
+    xBC_t[b, C, seq]. Returns (conv_out[b, C, seq], new_conv_state[b, C, kernel_size-1]) where
+    new_conv_state is this segment's last (kernel_size-1) RAW inputs (carried to the next segment).
+
+    conv_state is None for a single-shot prefill (fresh: a kernel_size-1 zero left-pad). For a
+    segment, conv_state is the previous segment's new_conv_state and cont is a runtime {0,1} mask
+    (0 on the first segment): the history is `conv_state * cont`, so the first segment degenerates to
+    the fresh zero-left-pad and a continuation segment prepends the real history. GRAPH-STATIC: no
+    Python branch on a runtime value — cont is applied as tensor arithmetic.
+    """
+    K = kernel_size
+    new_conv_state = xBC_t[..., -(K - 1):]
+    if conv_state is None:
+        out = F.conv1d(xBC_t, conv_weight, conv_bias, padding=K - 1, groups=groups)[..., :xBC_t.shape[-1]]
+    else:
+        hist = conv_state.to(xBC_t.dtype) * cont.to(xBC_t.dtype)
+        out = F.conv1d(torch.cat([hist, xBC_t], dim=-1), conv_weight, conv_bias, groups=groups)
+    return out, new_conv_state
 
 
 def chunked_ssd_scan(x, B, C, dt, A, D, chunk_size, ssm_state0=None):

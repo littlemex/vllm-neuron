@@ -38,7 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
-from .ssd import chunked_ssd_scan
+from .ssd import chunked_ssd_scan, segmented_causal_conv1d
 
 from vllm.distributed.parallel_state import get_tp_group
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
@@ -212,16 +212,39 @@ class NemotronHAttention(nn.Module):
         # the HF reference.
         slot_mapping = attn_metadata[layer_name]["slot_mapping"]
         block_size = attn_metadata[layer_name]["block_size"]
+        block_table = attn_metadata[layer_name]["block_table_tensor"]
+        kv_segment_size = attn_metadata[layer_name].get("kv_segment_size")
         self._write_kv_cache(k, v, slot_mapping, block_size)
 
-        k = k.repeat_interleave(self.num_key_value_groups, dim=0)
-        v = v.repeat_interleave(self.num_key_value_groups, dim=0)
-        q_flash = q.transpose(1, 2)   # [Nh, Dh, T]
-        k_flash = k.transpose(1, 2)
-        v_flash = v                    # [Nh, T, Dh]
-        attn_output = NF.flash_attention(
-            q_flash, k_flash, v_flash, scale=self.scaling, causal_mask=True, tp_q=False, tp_out=True,
-        )  # [Nh, Dh, T]
+        if kv_segment_size:
+            # Segmented / continuation prefill: this segment's queries attend to the KV of ALL prior
+            # segments (in the paged cache) plus this segment, via the attention_segmented_cte NKI
+            # kernel. GQA is handled inside the kernel (q keeps its Q heads; the cache holds KV heads
+            # — no repeat_interleave). NoPE, so no cos/sin; no attention sink; full attention
+            # (sliding_window=None). prior_tokens=cached_seq_len (0 on the first segment) selects how
+            # much cached KV to read. Mirrors the gpt_oss/llama3 segmented branch on our plain-matmul
+            # (non-NF.qkv_proj) path.
+            cached_seq_len = attn_metadata[layer_name].get("cached_seq_len")
+            attn_output = NF.segmented_attention(
+                q,                                   # [Nh, T, Dh], tp_q=True (B=Nh, S=T, D=Dh)
+                k_cache=self.k_cache, v_cache=self.v_cache,
+                block_tables=block_table,
+                prior_tokens=cached_seq_len,
+                block_size=block_size,
+                kv_segment_size=kv_segment_size,
+                scale=self.scaling,
+                tp_q=True, tp_out=True,
+                sliding_window=None, sink=None, fp8_packed=False,
+            )  # [Nh, Dh, T]
+        else:
+            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
+            v = v.repeat_interleave(self.num_key_value_groups, dim=0)
+            q_flash = q.transpose(1, 2)   # [Nh, Dh, T]
+            k_flash = k.transpose(1, 2)
+            v_flash = v                    # [Nh, T, Dh]
+            attn_output = NF.flash_attention(
+                q_flash, k_flash, v_flash, scale=self.scaling, causal_mask=True, tp_q=False, tp_out=True,
+            )  # [Nh, Dh, T]
         attn_output = attn_output.unsqueeze(0)
         attn_output = NF.o_proj(attn_output, self.o_proj_weight, None).squeeze(0)  # [T, H]
         if self.world_size > 1:
@@ -669,15 +692,37 @@ class NemotronHMamba2Mixer(nn.Module):
         dt = proj[..., off:off + self.num_heads_pr]
         return gate, xBC, dt
 
-    def forward_prefill(self, hidden_states, ssm_state0=None):
+    def forward_prefill(self, hidden_states, ssm_state0=None, cached_seq_len=None):
+        # cached_seq_len is None for a single-shot prefill (unchanged path). When set (segmented /
+        # continuation prefill), this is one SEGMENT of a longer prompt: the SSM/conv state left by
+        # the previous segment (in self.ssm_state / self.conv_state, persisted across segment graphs
+        # by the AliasingOutputRewritePass, exactly like decode) is this segment's initial state.
+        # Splitting a prefill this way is mathematically identical to a single-shot prefill (the SSM
+        # is a linear recurrence; the conv is causal) — pinned on CPU by
+        # test_segmented_prefill_matches_single_shot, INCLUDING the conv-history carry.
+        #
+        # GRAPH-STATIC: cached_seq_len is a runtime tensor, so we must NOT branch first-vs-continuation
+        # in Python (that would need two graphs). Instead we ALWAYS use the continuation form and
+        # multiply the carried state by a runtime first-segment mask cont = (cached_seq_len > 0): on
+        # the first segment cont == 0 zeroes the carry, which is exactly a fresh prefill (a K-1 zero
+        # left-pad of the conv + a zero SSM state).
         b, seq_len, _ = hidden_states.shape
         dtype = hidden_states.dtype
         proj = self._in_proj(hidden_states)
         gate, xBC, dt = self._split_proj(proj)
         xBC_t = xBC.transpose(1, 2)
-        conv_state = xBC_t[..., -(self.conv_kernel_size - 1):]
-        xBC_c = F.conv1d(xBC_t, self.conv1d_weight, self.conv1d_bias,
-                         padding=self.conv_kernel_size - 1, groups=self.conv_dim_pr)[..., :seq_len]
+        # Causal conv1d with (segmented) history carry — the SAME helper the CPU test uses, so the
+        # shipped and tested carry cannot diverge. Single-shot (cached_seq_len None): fresh K-1 zero
+        # left-pad. Segment: prepend the prior segment's conv_state, zeroed by the first-segment mask.
+        if cached_seq_len is None:
+            xBC_c, conv_state = segmented_causal_conv1d(
+                xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr)
+        else:
+            cont = (cached_seq_len.reshape(()) > 0)
+            xBC_c, conv_state = segmented_causal_conv1d(
+                xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr,
+                conv_state=self.conv_state, cont=cont)
+            ssm_state0 = self.ssm_state * cont.to(self.ssm_state.dtype)          # zeroed on first segment
         xBC = self.act(xBC_c.transpose(1, 2))
 
         gn = self.groups_pr * self.ssm_state_size
@@ -853,11 +898,26 @@ class NemotronHModel(nn.Module):
                 return m["max_query_len"] > m["decode_token_threshold"]
         return True
 
+    def _segmented_cached_len(self, attn_metadata):
+        # Segmented prefill is a static per-deployment mode: kv_segment_size (a Python int) is set at
+        # trace time when max_num_batched_tokens < max_model_len. In that mode we hand the Mamba
+        # mixers cached_seq_len (a RUNTIME tensor = tokens already processed) so they carry the
+        # SSM/conv state across segments with a graph-static first-segment mask. Returns None when
+        # not segmented (single-shot), leaving the prefill path unchanged.
+        for i, layer in enumerate(self.layers):
+            if layer.layer_type == ATTENTION:
+                m = attn_metadata[f"layers.{i}.self_attn"]
+                if m.get("kv_segment_size"):
+                    return m.get("cached_seq_len")
+                return None
+        return None
+
     def forward(self, input_ids, positions, attn_metadata):
         # Derive prefill/decode from attn_metadata (authoritative during compile warmup AND real
         # runs); a runner-supplied is_decode flag is unreliable at trace time (the decode bucket
         # compiles with 1 token but can arrive flagged prefill), which would wrongly SP-scatter it.
         is_prefill = self._is_prefill(attn_metadata)
+        seg_cached_len = self._segmented_cached_len(attn_metadata) if is_prefill else None
         if is_prefill and self.world_size > 1:
             T = input_ids.shape[0]
             if T <= self.world_size or T % self.world_size != 0:
@@ -893,7 +953,7 @@ class NemotronHModel(nn.Module):
                 # [T, H] -> [1, T, H] (batch=1 bring-up)
                 h_b = h_norm.unsqueeze(0)
                 if is_prefill:
-                    out = layer.mixer.forward_prefill(h_b)
+                    out = layer.mixer.forward_prefill(h_b, cached_seq_len=seg_cached_len)
                 else:
                     out = layer.mixer.forward_decode(h_b)
                 out = out.squeeze(0)
