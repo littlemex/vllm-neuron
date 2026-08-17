@@ -15,6 +15,21 @@ these tests pin the numerics that a refactor could silently break.
 """
 import torch
 import torch.nn.functional as F
+import importlib.util
+import os as _os
+
+# Load the SHIPPED scan directly from ssd.py (single source of truth). Loading the file avoids the
+# plugin package __init__ chain (Neuron-only imports), so this stays CPU/pytest-friendly.
+_here = _os.path.dirname(_os.path.abspath(__file__))
+_ssd_path = _here
+for _ in range(8):
+    _cand = _os.path.join(_ssd_path, "vllm_neuron", "model", "nemotron_h", "ssd.py")
+    if _os.path.exists(_cand):
+        break
+    _ssd_path = _os.path.dirname(_ssd_path)
+_spec = importlib.util.spec_from_file_location("nemotron_ssd", _cand)
+_ssd = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_ssd)
+chunked_ssd_scan = _ssd.chunked_ssd_scan
 
 
 def _sequential_ssd(x, B, C, dt, A, D, state0=None):
@@ -55,42 +70,6 @@ def _vectorized_ssd(x, B, C, dt, A, D, mask_before_exp=True):
     return y, h
 
 
-def _chunked_ssd(x, B, C, dt, A, D, chunk_size, state0=None):
-    """Chunked SSD (Mamba2 SSD): O(l*C) alternative to the quadratic O(l^2) form. Two bounded
-    attention-form passes — intra-chunk (C x C) + inter-chunk state passing solved in CLOSED FORM
-    on the chunk axis (T x T). No l-length Python loop, no strided chunk split (contiguous reshape).
-    Supports a prefix state0. Mirrors model_bf16 forward_prefill's NEMOTRONH_SCAN=chunked branch."""
-    b, l, H, P = x.shape; N = B.shape[-1]; cs = chunk_size
-    Lp = ((l + cs - 1) // cs) * cs; T = Lp // cs; pad = Lp - l
-
-    def padl(t):
-        if pad == 0:
-            return t
-        shp = list(t.shape); shp[1] = pad
-        return torch.cat([t, torch.zeros(shp, dtype=t.dtype)], dim=1)
-
-    xc = padl(x).reshape(b, T, cs, H, P); Bc = padl(B).reshape(b, T, cs, H, N)
-    Cc = padl(C).reshape(b, T, cs, H, N); dtc = padl(dt).reshape(b, T, cs, H)
-    Atc = (torch.cumsum(dtc, dim=2) * A).permute(0, 1, 3, 2)          # [b,T,H,cs] <=0
-    ar = torch.arange(cs); causal = ar[:, None] >= ar[None, :]
-    expo = (Atc.unsqueeze(-1) - Atc.unsqueeze(-2)).masked_fill(~causal.view(1, 1, 1, cs, cs), float("-inf"))
-    M = torch.einsum('btihn,btjhn->bthij', Cc, Bc) * torch.exp(expo) * dtc.permute(0, 1, 3, 2).unsqueeze(-2)
-    Ydiag = torch.einsum('bthij,btjhp->btihp', M, xc)
-    wc = torch.exp(Atc[..., -1:] - Atc) * dtc.permute(0, 1, 3, 2)
-    states = torch.einsum('bthi,btihp,btihn->bthpn', wc, xc, Bc)      # [b,T,H,P,N]
-    logg = Atc[..., -1]; Ginc = torch.cumsum(logg, dim=1); Gexc = Ginc - logg
-    arT = torch.arange(T); strict = arT[:, None] > arT[None, :]
-    De = (Gexc.permute(0, 2, 1).unsqueeze(-1) - Ginc.permute(0, 2, 1).unsqueeze(-2))
-    De = De.masked_fill(~strict.view(1, 1, T, T), float("-inf"))
-    state_in = torch.einsum('bhck,bkhpn->bchpn', torch.exp(De), states)
-    if state0 is not None:
-        state_in = state_in + torch.exp(Gexc).unsqueeze(-1).unsqueeze(-1) * state0.unsqueeze(1)
-    Yoff = torch.exp(Atc).permute(0, 1, 3, 2).unsqueeze(-1) * torch.einsum('btihn,bthpn->btihp', Cc, state_in)
-    y = (Ydiag + Yoff).reshape(b, Lp, H, P)[:, :l] + x * D[..., None]
-    h = torch.exp(logg[:, -1])[..., None, None] * state_in[:, -1] + states[:, -1]
-    return y, h
-
-
 def test_chunked_ssd_matches_sequential():
     """Chunked SSD == sequential oracle across chunk boundaries, long sequences, and prefix state."""
     for l, cs in [(40, 128), (128, 128), (130, 128), (256, 128), (1024, 128),
@@ -106,9 +85,28 @@ def test_chunked_ssd_matches_sequential():
             D = torch.randn(H, dtype=torch.float64)
             s0 = torch.randn(b, H, P, N, dtype=torch.float64) if use_state0 else None
             y_seq, h_seq = _sequential_ssd(x, B, C, dt, A, D, s0)
-            y_ch, h_ch = _chunked_ssd(x, B, C, dt, A, D, cs, s0)
+            y_ch, h_ch = chunked_ssd_scan(x, B, C, dt, A, D, cs, s0)
             assert torch.allclose(y_seq, y_ch, atol=1e-8), (l, cs, use_state0, (y_seq - y_ch).abs().max())
             assert torch.allclose(h_seq, h_ch, atol=1e-8), (l, cs, use_state0, (h_seq - h_ch).abs().max())
+
+
+def test_chunked_ssd_fp32_long_sequence_stress():
+    """fp32 (the production dtype) at long sequences with small AND large dt, vs the fp32 sequential
+    oracle. Guards catastrophic cancellation / underflow in the cross-chunk cumsum(log gamma)."""
+    for l, cs, dt_scale in [(2048, 128, 1.0), (4096, 256, 0.05), (4096, 256, 3.0), (8192, 256, 1.0)]:
+        torch.manual_seed(l + cs + int(dt_scale * 100))
+        b, H, P, N = 1, 4, 8, 6
+        x = torch.randn(b, l, H, P, dtype=torch.float32)
+        B = torch.randn(b, l, H, N, dtype=torch.float32)
+        C = torch.randn(b, l, H, N, dtype=torch.float32)
+        dt = F.softplus(torch.randn(b, l, H, dtype=torch.float32)) * dt_scale
+        A = -torch.exp(torch.randn(H, dtype=torch.float32))
+        D = torch.randn(H, dtype=torch.float32)
+        y_seq, h_seq = _sequential_ssd(x, B, C, dt, A, D)
+        y_ch, h_ch = chunked_ssd_scan(x, B, C, dt, A, D, cs)
+        assert torch.isfinite(y_ch).all() and torch.isfinite(h_ch).all(), (l, cs, dt_scale)
+        # fp32 accumulation over thousands of steps: compare with a relaxed atol/rtol.
+        assert torch.allclose(y_seq, y_ch, atol=2e-3, rtol=2e-3), (l, cs, dt_scale, (y_seq - y_ch).abs().max())
 
 
 def test_vectorized_ssd_matches_sequential():
@@ -215,6 +213,7 @@ def test_dense_router_tiebreak_prefers_lowest_index():
 if __name__ == "__main__":
     test_vectorized_ssd_matches_sequential()
     test_chunked_ssd_matches_sequential()
+    test_chunked_ssd_fp32_long_sequence_stress()
     test_mask_before_exp_is_required_to_avoid_nan()
     test_dense_router_matches_scatter_router()
     test_dense_router_tiebreak_prefers_lowest_index()

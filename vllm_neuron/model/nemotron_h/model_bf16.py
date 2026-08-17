@@ -38,6 +38,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from .ssd import chunked_ssd_scan
+
 from vllm.distributed.parallel_state import get_tp_group
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -711,64 +713,12 @@ class NemotronHMamba2Mixer(nn.Module):
                 ys.append((h * C[:, t][:, :, None, :]).sum(dim=-1))
             y = torch.stack(ys, dim=1) + x * self.D[..., None]
         elif os.environ.get("NEMOTRONH_SCAN") == "chunked":
-            # Chunked SSD (Mamba2 SSD / state-space duality). Decomposes the single O(l^2) quadratic
-            # into two BOUNDED attention-form passes so long sequences fit: intra-chunk (C x C, per
-            # chunk) + inter-chunk state passing solved in CLOSED FORM on the chunk axis (T x T).
-            # No Python time loop (avoids NCC_IFML902) and no strided chunk split (chunk axis is a
-            # CONTIGUOUS reshape, avoids NCC_IBCG901). Compute O(l*C), memory O(l*C). Supports a
-            # prefix ssm_state0 (enables continuation prefill). CPU-verified equal to the sequential
-            # recurrence and the quadratic form (test_chunked_ssd_matches_sequential).
+            # Chunked SSD: O(l*C) so long sequences fit (lifts the quadratic form's short-seq cap).
+            # The scan itself lives in module-level chunked_ssd_scan() — the SAME function the CPU
+            # equivalence test imports, so implementation and test cannot silently diverge.
             cs = int(os.environ.get("NEMOTRONH_CHUNK", "128"))
-            dtf = dt.float()
-            Lp = ((seq_len + cs - 1) // cs) * cs
-            T = Lp // cs
-            pad = Lp - seq_len
-            if pad:
-                zx = torch.zeros(b, pad, H, P, dtype=torch.float32, device=x.device)
-                zbc = torch.zeros(b, pad, H, N, dtype=torch.float32, device=x.device)
-                zdt = torch.zeros(b, pad, H, dtype=torch.float32, device=x.device)
-                xp, Bp, Cp, dtp = (torch.cat([x, zx], 1), torch.cat([B, zbc], 1),
-                                   torch.cat([C, zbc], 1), torch.cat([dtf, zdt], 1))
-            else:
-                xp, Bp, Cp, dtp = x, B, C, dtf
-            xc = xp.reshape(b, T, cs, H, P); Bc = Bp.reshape(b, T, cs, H, N)
-            Cc = Cp.reshape(b, T, cs, H, N); dtc = dtp.reshape(b, T, cs, H)
-            Atloc = torch.cumsum(dtc, dim=2) * A                       # [b,T,cs,H], <=0
-            Atc = Atloc.permute(0, 1, 3, 2)                            # [b,T,H,cs]
-            ar = torch.arange(cs, device=x.device)
-            causal = (ar[:, None] >= ar[None, :])                     # [cs,cs] j<=i
-            # intra-chunk (diagonal blocks): same shape as attention, C x C per chunk. mask-before-exp.
-            expo = Atc.unsqueeze(-1) - Atc.unsqueeze(-2)              # [b,T,H,i,j]
-            expo = expo.masked_fill(~causal.view(1, 1, 1, cs, cs), float("-inf"))
-            decay = torch.exp(expo)
-            CB = torch.einsum('btihn,btjhn->bthij', Cc, Bc)
-            dtj = dtc.permute(0, 1, 3, 2).unsqueeze(-2)               # [b,T,H,1,cs]
-            M = CB * decay * dtj
-            Ydiag = torch.einsum('bthij,btjhp->btihp', M, xc)         # [b,T,cs,H,P]
-            # each chunk's end-state contribution
-            wc = torch.exp(Atc[..., -1:] - Atc) * dtc.permute(0, 1, 3, 2)   # [b,T,H,cs]
-            states = torch.einsum('bthi,btihp,btihn->bthpn', wc, xc, Bc)    # [b,T,H,P,N]
-            # inter-chunk state passing, CLOSED FORM (no loop). states_c' coefficient EXCLUDES gamma_c'
-            # (it is already applied at chunk c''s end): Prod_{c'<k<c} gamma_k = exp(Gexc[c]-Ginc[c']).
-            logg = Atc[..., -1]                                       # [b,T,H] = log gamma_c (<=0)
-            Ginc = torch.cumsum(logg, dim=1)                          # inclusive prefix
-            Gexc = Ginc - logg                                        # exclusive prefix
-            arT = torch.arange(T, device=x.device)
-            strict = (arT[:, None] > arT[None, :])                    # c' < c
-            De = Gexc.permute(0, 2, 1).unsqueeze(-1) - Ginc.permute(0, 2, 1).unsqueeze(-2)  # [b,H,c,c']
-            De = De.masked_fill(~strict.view(1, 1, T, T), float("-inf"))
-            Dchunk = torch.exp(De)
-            state_in = torch.einsum('bhck,bkhpn->bchpn', Dchunk, states)   # [b,c,H,P,N] (k=c')
-            if ssm_state0 is not None:
-                state_in = state_in + torch.exp(Gexc).unsqueeze(-1).unsqueeze(-1) * ssm_state0.float().unsqueeze(1)
-            # off-diagonal output: decayed incoming state
-            Cstate = torch.einsum('btihn,bthpn->btihp', Cc, state_in)      # [b,T,cs,H,P]
-            Yoff = torch.exp(Atc).permute(0, 1, 3, 2).unsqueeze(-1) * Cstate
-            y = (Ydiag + Yoff).reshape(b, Lp, H, P)[:, :seq_len]
-            y = y + x * self.D[..., None]
-            # final state for decode carry: state_carry_T = gamma_{T-1}*state_in[T-1] + states[T-1]
-            gT = torch.exp(logg[:, -1])                              # [b,H]
-            h = gT[..., None, None] * state_in[:, -1] + states[:, -1]   # [b,H,P,N]
+            s0 = ssm_state0.float() if ssm_state0 is not None else None
+            y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
         else:
             # DEFAULT: vectorized SSD (quadratic / attention-form) selective scan. No Python time
             # loop and no carried-dependency chain — only matmuls + cumsum + a causal mask + a
@@ -777,8 +727,13 @@ class NemotronHMamba2Mixer(nn.Module):
             # torch_neuronx.trace delegation. Mathematically identical to the sequential recurrence:
             #   y_t[p] = sum_{s<=t} exp(A_h * (csdt_t - csdt_s)) * dt_s * (C_t . B_s) * x_s[p]
             # where csdt = cumsum(dt) and A_h < 0, so the decay exponent is <= 0 for s <= t (fp32
-            # stable, no overflow). ssm_state0 (prefix carry) is not supported by this closed form;
-            # it is used only for fresh prefills (ssm_state0 is None) in this bring-up.
+            # stable, no overflow). This closed form starts from a zero SSM state, so it does NOT
+            # support a prefix ssm_state0 — guard against silently dropping it (use NEMOTRONH_SCAN=
+            # chunked for continuation prefill).
+            if ssm_state0 is not None:
+                raise NotImplementedError(
+                    "prefix ssm_state0 is not supported by the vectorized (quadratic) prefill scan; "
+                    "use NEMOTRONH_SCAN=chunked for continuation prefill.")
             dtf = dt.float()                                        # [b,l,H]
             csdt = torch.cumsum(dtf, dim=1)                         # [b,l,H]
             At = (csdt * A).permute(0, 2, 1)                        # [b,H,l]  (A_h * csdt_t)
