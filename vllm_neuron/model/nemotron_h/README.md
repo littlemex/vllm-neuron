@@ -91,8 +91,23 @@ Prefill-scan selection:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `NEMOTRONH_SCAN` | chunked | Prefill scan. `chunked` (default): O(l·C), long sequences. `quadratic`: O(l²) vectorized form (short-seq / debugging). `sequential`: the 1-step-recurrence oracle (numerically equivalent, but does not compile on the neuronx-cc path). |
-| `NEMOTRONH_CHUNK` | 128 | Chunk size C for the chunked SSD (only used when `NEMOTRONH_SCAN=chunked`). |
+| `NEMOTRONH_SCAN` | chunked | Prefill scan. `chunked` (default): O(l·C + T²), long sequences. `quadratic`: O(l²) vectorized form (short-seq / debugging). `sequential`: the 1-step-recurrence oracle (numerically equivalent, but does not compile on the neuronx-cc path). |
+| `NEMOTRONH_CHUNK` | 128 | Chunk size C for the chunked SSD (only used when `NEMOTRONH_SCAN=chunked`). Must be `<= max_model_len` so a prefill spans at least one full chunk without heavy right-padding — see the compile caveat below. |
+
+**Compile caveat — keep `NEMOTRONH_CHUNK <= max_model_len`.** When a compiled prefill bucket is
+shorter than the chunk size, the sequence is right-padded up to a single chunk (T = 1, large pad),
+and neuronx-cc fails that graph with `NCC_IMPR902` (MaskPropagation, `isl_set_union … spaces don't
+match`). A bucket that spans two or more chunks with no heavy padding (T >= 2) compiles cleanly. The
+shipped preset (`max_model_len` 512, chunk 128 → T = 4) is safe; only a `max_model_len` below the
+default chunk size needs a smaller `NEMOTRONH_CHUNK` (e.g. 16 for `max_model_len` 32). This is a
+compile-time limit on the degenerate short-bucket case, not a numerical one — the scan math is
+identical for any chunk size (pinned by `test_chunked_ssd_matches_sequential`, which covers small
+chunk sizes down to T = 2 at l = 32).
+
+Numerics vs the opt-in quadratic form: the two scans are mathematically identical (fp64 agreement is
+machine-epsilon) but reduce in a different order, so in bf16 they can pick a different greedy token on
+a near-tie — exactly as the quadratic form itself differs from the 1-step recurrence in bf16 (the
+chunked scan adds no error beyond that reformulation-rounding envelope).
 
 The following are **diagnostic only — do not set them in production**; they change or disable numerics:
 

@@ -72,8 +72,11 @@ def _vectorized_ssd(x, B, C, dt, A, D, mask_before_exp=True):
 
 def test_chunked_ssd_matches_sequential():
     """Chunked SSD == sequential oracle across chunk boundaries, long sequences, and prefix state."""
+    # incl. small chunk sizes that force many chunks at short l (cs=16 -> T=2 at l=32; cs=8 -> T=5
+    # at l=40), which exercise the cross-chunk closed form at boundaries an on-device short
+    # max_model_len run hits.
     for l, cs in [(40, 128), (128, 128), (130, 128), (256, 128), (1024, 128),
-                  (1000, 128), (4096, 256), (300, 64)]:
+                  (1000, 128), (4096, 256), (300, 64), (32, 16), (32, 8), (40, 8), (17, 16)]:
         for use_state0 in (False, True):
             torch.manual_seed(l * 100 + cs + int(use_state0))
             b, H, P, N = 1, 4, 8, 6
