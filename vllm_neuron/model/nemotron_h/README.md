@@ -67,11 +67,24 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
   equivalence to the sequential recurrence is pinned by `test_chunked_ssd_matches_sequential`
   (incl. an fp32 long-sequence stress test). The practical `max_model_len` ceiling is the per-bucket
   NEFF compile time (which grows with the number of sequence-length buckets), not the scan.
-- **Continuation prefill — primitive only, not wired.** `chunked_ssd_scan` accepts a prefix
-  `ssm_state0` (the low-level primitive for splitting a prompt across prefill calls carrying the SSM
-  state), but the runner does not yet split prefills, so this is groundwork rather than an active
-  feature. (The opt-in quadratic form does not support a prefix state and raises if one is passed.
-  The attention prefill reads only its own chunk's KV.)
+- **Segmented / continuation prefill (supported).** When `max_num_batched_tokens < max_model_len`
+  (a supported segment size, e.g. `--max-num-batched-tokens 512`), the plugin auto-enables segmented
+  prefill: the prompt is processed in `kv_segment_size` segments and the model carries state across
+  the boundary — the Mamba2 layers carry BOTH the SSM state and the causal-conv1d state (in fp32,
+  via the same in-place buffers + `AliasingOutputRewritePass` used for decode), and the Attention
+  layers use `NF.segmented_attention` to read the prior segments' KV. `forward_prefill` takes a
+  runtime `cached_seq_len`; the first-segment case (`cached_seq_len == 0`) is handled graph-statically
+  by a mask that zeroes the carried state (no Python branch on a runtime value). This is what lets a
+  `max_model_len` that a single-shot prefill cannot fit in host RAM run on one trn2 chip: e.g.
+  `max_model_len 1024` with `--max-num-batched-tokens 512` serves 1024-token contexts on
+  trn2.3xlarge (a single-shot 1024 prefill OOMs the 30B model's compile there), verified on-device by
+  recalling a fact placed in the first 512-token segment when asked in the second. Split-vs-single-shot
+  numerical equivalence (including the conv-history carry) is pinned by
+  `test_segmented_prefill_matches_single_shot`. The opt-in quadratic form does not support this.
+- **Single-shot prefill length is host-RAM-bound on one chip.** Without segmentation, the peak
+  compile + NEFF/weight-load memory grows with `max_model_len`; on trn2.3xlarge (≈125 GiB) the 30B
+  model fits single-shot up to a few hundred tokens (256 verified) but a 1024 single-shot prefill
+  OOMs — use segmented prefill (above) or a larger instance for longer single-shot contexts.
 - **Batch size.** batch=1 (`max_num_seqs=1`): the Mamba2 recurrent state is a single per-layer
   buffer (no per-slot pool), so concurrent sequences would corrupt each other. Decode raises on a
   batch size other than 1 rather than producing wrong output.
