@@ -207,6 +207,55 @@ def test_prefill_pad_invariance():
         assert torch.allclose(cs_r, cs_p, atol=1e-8), (n, N, (cs_r - cs_p).abs().max())
 
 
+def _seg_step(xBC_t, conv_w, conv_b, dt_soft, A, D, K, cs, im, gn, G, ssm_state0, conv_state0, valid_len):
+    """One segmented-prefill step mirroring forward_prefill: conv history carry (valid_len tail),
+    dt masked on pad, chunked scan with ssm_state0. valid_len = real tokens in THIS segment."""
+    b, conv_dim, seq = xBC_t.shape
+    is_cont = None if conv_state0 is None else torch.ones((), dtype=xBC_t.dtype)
+    xBC_c, conv_out = segmented_causal_conv1d(xBC_t, conv_w, conv_b, K, conv_dim,
+                                              conv_state=conv_state0, is_continuation=is_cont,
+                                              valid_len=torch.tensor(valid_len))
+    xBC = F.silu(xBC_c.transpose(1, 2))
+    P = im // A.shape[0]; H, N = A.shape[0], gn // G; rep = H // G
+    x = xBC[..., :im].reshape(b, seq, H, P)
+    B = xBC[..., im:im + gn].reshape(b, seq, G, N).repeat_interleave(rep, dim=2)
+    C = xBC[..., im + gn:im + 2 * gn].reshape(b, seq, G, N).repeat_interleave(rep, dim=2)
+    dt_m = dt_soft * (torch.arange(seq) < valid_len).to(xBC_t.dtype).reshape(1, seq, 1)
+    y, h = chunked_ssd_scan(x, B, C, dt_m, A, D, cs, ssm_state0)
+    return y, h, conv_out
+
+
+def test_segmented_prefill_pad_invariance():
+    """Production path: segmented (continuation carrying nonzero ssm/conv state) AND the last segment
+    bucket-padded. Must equal a single-shot prefill over the concatenated REAL tokens — pins that the
+    conv carry, the SSM state carry, and the pad mask compose correctly (the combo the earlier tests
+    exercised only separately)."""
+    for L0, L1r, seg, cs in [(300, 91, 512, 128), (128, 5, 512, 128), (64, 40, 128, 16)]:
+        torch.manual_seed(L0 * 17 + L1r + seg)
+        b, H, P, N, G, K = 1, 4, 8, 6, 2, 4
+        im, gn = H * P, G * N; conv_dim = im + 2 * gn
+        conv_w = torch.randn(conv_dim, 1, K, dtype=torch.float64)
+        conv_b = torch.randn(conv_dim, dtype=torch.float64)
+        A = -torch.exp(torch.randn(H, dtype=torch.float64)); D = torch.randn(H, dtype=torch.float64)
+        dt_bias = torch.randn(H, dtype=torch.float64)
+        Lr = L0 + L1r                                                   # total real tokens
+        xBC_real = torch.randn(b, conv_dim, Lr, dtype=torch.float64)
+        dt_real = torch.randn(b, Lr, H, dtype=torch.float64)
+        # single-shot over all real tokens (reference); no padding, valid_len=Lr
+        y_full, h_full, _ = _masked_prefill_core(xBC_real, conv_w, conv_b,
+                                                 F.softplus(dt_real + dt_bias), A, D, K, cs, im, gn, G, Lr)
+        # segment 0: first L0 real (full, no pad). segment 1: remaining L1r real + pad to `seg`.
+        s0x, s1x = xBC_real[..., :L0], xBC_real[..., L0:]
+        s1x = torch.cat([s1x, torch.randn(b, conv_dim, seg - L1r, dtype=torch.float64)], dim=-1)  # pad
+        s0dt = F.softplus(dt_real[:, :L0] + dt_bias)
+        s1dt = F.softplus(torch.cat([dt_real[:, L0:], torch.randn(b, seg - L1r, H, dtype=torch.float64)], dim=1) + dt_bias)
+        y0, ssm, conv = _seg_step(s0x, conv_w, conv_b, s0dt, A, D, K, cs, im, gn, G, None, None, L0)
+        y1, ssm, conv = _seg_step(s1x, conv_w, conv_b, s1dt, A, D, K, cs, im, gn, G, ssm, conv, L1r)
+        y_seg = torch.cat([y0, y1[:, :L1r]], dim=1)                     # keep only real outputs
+        assert torch.allclose(y_full, y_seg, atol=1e-8), (L0, L1r, (y_full - y_seg).abs().max())
+        assert torch.allclose(h_full, ssm, atol=1e-8), (L0, L1r, (h_full - ssm).abs().max())
+
+
 def test_prefill_pad_contamination_without_mask():
     """Guard: if the pad mask / valid_len tail were dropped (process all N as real), the state must
     visibly diverge from the unpadded run — documents why the mask is required."""

@@ -162,5 +162,15 @@ class NemotronHConfig:
                     filtered[fname] = getattr(hf_config, fname)
         if isinstance(filtered.get("torch_dtype"), str):
             filtered["torch_dtype"] = getattr(torch, filtered["torch_dtype"])
+        # HF NemotronH names the RMSNorm epsilon `layer_norm_epsilon` (used by every norm in the
+        # reference modeling code); our field is `rms_norm_eps`. Map it explicitly so a checkpoint
+        # that changes the eps is honored instead of silently using the dataclass default. (The
+        # config's `norm_eps` field is not referenced by the HF modeling code.)
+        if "rms_norm_eps" not in filtered:
+            eps = config_dict.get("layer_norm_epsilon")
+            if eps is None and isinstance(hf_config, PretrainedConfig):
+                eps = getattr(hf_config, "layer_norm_epsilon", None)
+            if eps is not None:
+                filtered["rms_norm_eps"] = eps
         filtered["neuron_config"] = neuron_config
         return cls(**filtered)

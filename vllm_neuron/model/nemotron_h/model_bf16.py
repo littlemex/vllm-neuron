@@ -678,7 +678,9 @@ class NemotronHMamba2Mixer(nn.Module):
         # mamba_intermediate/n_groups = 512): normalize WITHIN each group of `gsz`, not over the whole
         # inner dim. A plain mean(-1) over the full inner dim is a different function and degrades the
         # real 30B to repetitive output (single-layer CPU parity: grouped -> cosine 1.0 vs HF).
-        y = y * self.act(gate)
+        # SiLU on the fp32 gate (HF rms_norm_ref upcasts z before F.silu(z)); SiLU is nonlinear, so
+        # computing it in bf16 vs fp32 moves the rounding.
+        y = y * self.act(gate.float())
         gsz = self.intermediate_size // self.n_groups
         yf = y.float().reshape(*y.shape[:-1], -1, gsz)
         yf = yf * torch.rsqrt(yf.pow(2).mean(-1, keepdim=True) + self.norm_eps)
@@ -727,6 +729,11 @@ class NemotronHMamba2Mixer(nn.Module):
                 "NemotronH Mamba2 forward_prefill supports batch size 1 only: the recurrent state is "
                 f"a single per-layer buffer (no per-slot pool). Got batch size {b}.")
         dtype = hidden_states.dtype
+        # valid_mask must be per-token over THIS forward's tokens (derived from the same-length
+        # slot_mapping). A static-shape check so a future SP/gather refactor fails loudly here rather
+        # than silently masking the wrong axis.
+        assert valid_mask is None or valid_mask.numel() == seq_len, \
+            f"valid_mask length {None if valid_mask is None else valid_mask.numel()} != seq_len {seq_len}"
         # Number of real (non-pad) tokens, as a runtime scalar; used to gather the real conv tail.
         valid_len = None if valid_mask is None else valid_mask.reshape(-1).to(torch.int32).sum()
         proj = self._in_proj(hidden_states)
@@ -979,11 +986,13 @@ class NemotronHModel(nn.Module):
                     f"tensor_parallel_size ({self.world_size}) for the sequence-parallel scatter at "
                     f"the embedding. Pad the prompt or adjust max_num_batched_tokens."
                 )
-        # embed (SP scatter on prefill mirrors plamo3). Keep the RESIDUAL STREAM in fp32
-        # (config residual_in_fp32=True; HF NemotronH does the same). Over 52 hybrid layers the bf16
-        # residual degenerates — real 30B weights produced all-zero tokens with a bf16 residual, and
-        # fp32 residual is what the reference model uses. Each block: norm(residual)->bf16 for the
-        # mixer weights, mixer out cast back to fp32 for the residual add.
+        # embed (SP scatter on prefill mirrors plamo3). Keep the RESIDUAL STREAM in fp32.
+        # NOTE: this is a DELIBERATE deviation from the checkpoint config (which sets
+        # residual_in_fp32=false, i.e. HF accumulates the residual in bf16). Over the 52-layer hybrid
+        # stack this bf16 mixer path is numerically unstable with a bf16 residual — real 30B weights
+        # produced all-zero tokens — so we keep the residual in fp32 (strictly more precise). Greedy
+        # output matches the HF reference. Each block: norm(residual)->bf16 for the mixer weights,
+        # mixer out cast back to fp32 for the residual add.
         DT = self.config.torch_dtype
         hidden_states = self.embed_tokens(input_ids, scatter_tokens=is_prefill).to(torch.float32)
         # <-- MODEL-SPECIFIC: per-layer-type dispatch loop (Mamba2/Attention/MoE), unique to this
