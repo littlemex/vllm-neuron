@@ -86,8 +86,21 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
   model fits single-shot up to a few hundred tokens (256 verified) but a 1024 single-shot prefill
   OOMs — use segmented prefill (above) or a larger instance for longer single-shot contexts.
 - **Batch size.** batch=1 (`max_num_seqs=1`): the Mamba2 recurrent state is a single per-layer
-  buffer (no per-slot pool), so concurrent sequences would corrupt each other. Decode raises on a
-  batch size other than 1 rather than producing wrong output.
+  buffer (no per-slot pool), so concurrent sequences would corrupt each other. Both the Mamba prefill
+  (batch != 1) and attention decode raise rather than producing wrong output.
+- **Automatic Prefix Caching (APC) is not supported.** Do not set `--enable-prefix-caching`. The
+  attention KV is addressable by block hash and can be reused across requests, but the Mamba2
+  recurrent state is a single mutable buffer with no block-hash addressing, so a reused prefix would
+  silently continue from the wrong SSM/conv state. (The stock runner only checks that APC implies
+  segmented prefill; it does not know this model is recurrent, so the guard is the operator's.)
+- **Speculative decoding is not supported.** The SSM `forward_decode` advances the state by exactly
+  one token; a multi-token verify step would silently process only the first. `forward_decode` raises
+  on `T != 1` rather than mis-generating.
+- **Bucket padding is masked out of the SSM/conv state.** Neuron pads a prefill up to a fixed bucket
+  width; attention ignores the pad via `slot_mapping = -1`, and the Mamba path derives the same
+  real/pad mask from `slot_mapping` to zero `dt` on pad positions (identity recurrence steps) and to
+  gather the conv state from the real tail — so the state handed to decode is independent of the
+  padding (pinned by `test_prefill_pad_invariance`).
 - **Precision.** bf16 only (FP8/NVFP4 is future work).
 - **Layer types.** Only the `M` (Mamba2), `E` (MoE), and `*` (Attention) `hybrid_override_pattern`
   entries are implemented. Plain-MLP layers (`-`) are not supported and raise at construction; the

@@ -696,7 +696,16 @@ class NemotronHMamba2Mixer(nn.Module):
         dt = proj[..., off:off + self.num_heads_pr]
         return gate, xBC, dt
 
-    def forward_prefill(self, hidden_states, ssm_state0=None, cached_seq_len=None):
+    def forward_prefill(self, hidden_states, ssm_state0=None, cached_seq_len=None, valid_mask=None):
+        # valid_mask[seq] (runtime {0,1} per token, None when the whole prefill is real) marks the
+        # REAL tokens: Neuron pads a prefill up to a fixed bucket width with a contiguous suffix of
+        # pad tokens. Attention masks pad via slot_mapping=-1, but the Mamba SSM/conv have no such
+        # mask, so WITHOUT this the pad tokens would be convolved as real steps and corrupt the
+        # ssm_state / conv_state handed to decode (silently wrong from the 2nd decode token on). We
+        # zero dt on pad positions (dt=0 ⇒ dA=exp(0)=1 frozen, dBx=0 ⇒ an identity recurrence step,
+        # so the final SSM state equals the state at the last real token) and gather conv_state from
+        # the real tail (see segmented_causal_conv1d valid_len). GRAPH-STATIC: a tensor mask, not a
+        # Python branch.
         # cached_seq_len is None for a single-shot prefill (unchanged path). When set (segmented /
         # continuation prefill), this is one SEGMENT of a longer prompt: the SSM/conv state left by
         # the previous segment (in self.ssm_state / self.conv_state, persisted across segment graphs
@@ -713,7 +722,13 @@ class NemotronHMamba2Mixer(nn.Module):
         #       zero the carried state on the first segment (is_continuation == 0 ⇒ a fresh prefill:
         #       a K-1 zero-left-pad conv + a zero SSM state). This is the GRAPH-STATIC requirement.
         b, seq_len, _ = hidden_states.shape
+        if b != 1:
+            raise NotImplementedError(
+                "NemotronH Mamba2 forward_prefill supports batch size 1 only: the recurrent state is "
+                f"a single per-layer buffer (no per-slot pool). Got batch size {b}.")
         dtype = hidden_states.dtype
+        # Number of real (non-pad) tokens, as a runtime scalar; used to gather the real conv tail.
+        valid_len = None if valid_mask is None else valid_mask.reshape(-1).to(torch.int32).sum()
         proj = self._in_proj(hidden_states)
         gate, xBC, dt = self._split_proj(proj)
         xBC_t = xBC.transpose(1, 2)
@@ -722,12 +737,13 @@ class NemotronHMamba2Mixer(nn.Module):
         # left-pad. Segment: prepend the prior segment's conv_state, zeroed by the first-segment mask.
         if cached_seq_len is None:
             xBC_c, conv_state = segmented_causal_conv1d(
-                xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr)
+                xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr,
+                valid_len=valid_len)
         else:
             is_continuation = (cached_seq_len.reshape(()) > 0)               # runtime {0,1} mask
             xBC_c, conv_state = segmented_causal_conv1d(
                 xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr,
-                conv_state=self.conv_state, is_continuation=is_continuation)
+                conv_state=self.conv_state, is_continuation=is_continuation, valid_len=valid_len)
             ssm_state0 = self.ssm_state * is_continuation.to(self.ssm_state.dtype)   # zeroed on first segment
         xBC = self.act(xBC_c.transpose(1, 2))
 
@@ -736,6 +752,11 @@ class NemotronHMamba2Mixer(nn.Module):
         x = xBC[..., :im]; B = xBC[..., im:im + gn]; C = xBC[..., im + gn:im + 2 * gn]
         A = -torch.exp(self.A_log.float())
         dt = F.softplus(dt + self.dt_bias)
+        if valid_mask is not None:
+            # Zero dt on pad positions so they are identity recurrence steps (dA=1, dBx=0) — the final
+            # SSM state then equals the state at the last real token (softplus(dt_bias) is nonzero, so
+            # pad tokens would otherwise advance the state). Applied after softplus, before the scan.
+            dt = dt * valid_mask.reshape(1, seq_len, 1).to(dt.dtype)
         # NemotronH config has time_step_limit=(0.0, inf) => NO lower clamp. Clamping dt up to
         # time_step_min (0.001) perturbs small dt and, compounded over the 23 Mamba layers, degrades
         # generation into repetition. With no lower clamp the layer matches HF exactly (cosine 1.0,
@@ -825,7 +846,14 @@ class NemotronHMamba2Mixer(nn.Module):
         return out
 
     def forward_decode(self, hidden_states):
-        b = hidden_states.shape[0]
+        b, T = hidden_states.shape[0], hidden_states.shape[1]
+        if T != 1:
+            # Multi-token decode (e.g. speculative decoding's verify step) is not implemented for the
+            # recurrent SSM path: this method advances the state by ONE token, so T>1 would silently
+            # process only token 0 and desync ssm/conv state. Fail fast rather than mis-generate.
+            raise NotImplementedError(
+                "NemotronH Mamba2 forward_decode supports single-token decode only (speculative / "
+                f"multi-token decode is not implemented for the SSM recurrence). Got T={T}.")
         dtype = hidden_states.dtype
         proj = self._in_proj(hidden_states)
         gate, xBC, dt = self._split_proj(proj)
@@ -924,12 +952,25 @@ class NemotronHModel(nn.Module):
                 return None
         return None
 
+    def _prefill_valid_mask(self, attn_metadata):
+        # Per-token real/pad mask for the current prefill, taken from the attention slot_mapping
+        # (pad tokens are marked PAD_SLOT_ID = -1 by the runner; real tokens get a valid slot). The
+        # Mamba layers have no other pad signal (NoPE, no positions), so this is how they avoid
+        # convolving the bucket-padding tail into the SSM/conv state. Same length/order as the full
+        # token axis the Mamba mixers see. None if no attention layer / no slot_mapping.
+        for i, layer in enumerate(self.layers):
+            if layer.layer_type == ATTENTION:
+                sm = attn_metadata[f"layers.{i}.self_attn"].get("slot_mapping")
+                return None if sm is None else (sm >= 0)
+        return None
+
     def forward(self, input_ids, positions, attn_metadata):
         # Derive prefill/decode from attn_metadata (authoritative during compile warmup AND real
         # runs); a runner-supplied is_decode flag is unreliable at trace time (the decode bucket
         # compiles with 1 token but can arrive flagged prefill), which would wrongly SP-scatter it.
         is_prefill = self._is_prefill(attn_metadata)
         seg_cached_len = self._segmented_cached_len(attn_metadata) if is_prefill else None
+        valid_mask = self._prefill_valid_mask(attn_metadata) if is_prefill else None
         if is_prefill and self.world_size > 1:
             T = input_ids.shape[0]
             if T <= self.world_size or T % self.world_size != 0:
@@ -965,7 +1006,8 @@ class NemotronHModel(nn.Module):
                 # [T, H] -> [1, T, H] (batch=1 bring-up)
                 h_b = h_norm.unsqueeze(0)
                 if is_prefill:
-                    out = layer.mixer.forward_prefill(h_b, cached_seq_len=seg_cached_len)
+                    out = layer.mixer.forward_prefill(h_b, cached_seq_len=seg_cached_len,
+                                                      valid_mask=valid_mask)
                 else:
                     out = layer.mixer.forward_decode(h_b)
                 out = out.squeeze(0)

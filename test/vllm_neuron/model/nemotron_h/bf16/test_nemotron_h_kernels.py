@@ -160,6 +160,73 @@ def test_segmented_prefill_matches_single_shot():
         assert torch.allclose(h_full, ssm, atol=1e-8), (L, splits, (h_full - ssm).abs().max())
 
 
+def _masked_prefill_core(xBC_t, conv_w, conv_b, dt, A, D, K, cs, im, gn, G, valid_len):
+    """Mirror of forward_prefill's pad-masked pipeline: conv with valid_len tail, dt zeroed on pad,
+    chunked scan. valid_len = number of REAL tokens (rest is bucket padding)."""
+    b, conv_dim, seq = xBC_t.shape
+    vl = torch.tensor(valid_len)
+    is_real = (torch.arange(seq) < valid_len).to(xBC_t.dtype)
+    xBC_c, conv_state = segmented_causal_conv1d(xBC_t, conv_w, conv_b, K, conv_dim, valid_len=vl)
+    xBC = F.silu(xBC_c.transpose(1, 2))
+    P = im // A.shape[0]; H, N = A.shape[0], gn // G; rep = H // G
+    x = xBC[..., :im].reshape(b, seq, H, P)
+    B = xBC[..., im:im + gn].reshape(b, seq, G, N).repeat_interleave(rep, dim=2)
+    C = xBC[..., im + gn:im + 2 * gn].reshape(b, seq, G, N).repeat_interleave(rep, dim=2)
+    dt_m = dt * is_real.reshape(1, seq, 1)
+    y, h = chunked_ssd_scan(x, B, C, dt_m, A, D, cs, None)
+    return y, h, conv_state
+
+
+def test_prefill_pad_invariance():
+    """Bucket padding must not change the Mamba state. Neuron pads a prefill to a fixed bucket width
+    with nonzero pad tokens; without a pad mask the SSM/conv would fold them in and corrupt the state
+    handed to decode. Pin that a run over `n` real tokens padded to `N` (dt zeroed on pad, conv tail
+    gathered at the real end) yields the SAME y[:n], final ssm state, and conv_state as the unpadded
+    n-token run — dt_bias is nonzero so a missing mask would visibly diverge."""
+    for n, N, cs in [(40, 128, 16), (85, 512, 128), (2, 128, 16), (300, 512, 128)]:
+        torch.manual_seed(n * 31 + N)
+        b, H, P, Nst, G, K = 1, 4, 8, 6, 2, 4
+        im, gn = H * P, G * Nst
+        conv_dim = im + 2 * gn
+        conv_w = torch.randn(conv_dim, 1, K, dtype=torch.float64)
+        conv_b = torch.randn(conv_dim, dtype=torch.float64)
+        A = -torch.exp(torch.randn(H, dtype=torch.float64))
+        D = torch.randn(H, dtype=torch.float64)
+        dt_bias = torch.randn(H, dtype=torch.float64)                    # nonzero: pad dt != 0 without mask
+        xBC_real = torch.randn(b, conv_dim, n, dtype=torch.float64)
+        dt_real = torch.randn(b, n, H, dtype=torch.float64)
+        # padded: real tokens then N-n arbitrary (nonzero) pad columns
+        xBC_pad = torch.cat([xBC_real, torch.randn(b, conv_dim, N - n, dtype=torch.float64)], dim=-1)
+        dt_pad = torch.cat([dt_real, torch.randn(b, N - n, H, dtype=torch.float64)], dim=1)
+        y_r, h_r, cs_r = _masked_prefill_core(xBC_real, conv_w, conv_b,
+                                              F.softplus(dt_real + dt_bias), A, D, K, cs, im, gn, G, n)
+        y_p, h_p, cs_p = _masked_prefill_core(xBC_pad, conv_w, conv_b,
+                                              F.softplus(dt_pad + dt_bias), A, D, K, cs, im, gn, G, n)
+        assert torch.allclose(y_r, y_p[:, :n], atol=1e-8), (n, N, (y_r - y_p[:, :n]).abs().max())
+        assert torch.allclose(h_r, h_p, atol=1e-8), (n, N, (h_r - h_p).abs().max())
+        assert torch.allclose(cs_r, cs_p, atol=1e-8), (n, N, (cs_r - cs_p).abs().max())
+
+
+def test_prefill_pad_contamination_without_mask():
+    """Guard: if the pad mask / valid_len tail were dropped (process all N as real), the state must
+    visibly diverge from the unpadded run — documents why the mask is required."""
+    torch.manual_seed(7)
+    b, H, P, Nst, G, K, n, N, cs = 1, 4, 8, 6, 2, 4, 85, 512, 128
+    im, gn = H * P, G * Nst; conv_dim = im + 2 * gn
+    conv_w = torch.randn(conv_dim, 1, K, dtype=torch.float64)
+    conv_b = torch.randn(conv_dim, dtype=torch.float64)
+    A = -torch.exp(torch.randn(H, dtype=torch.float64)); D = torch.randn(H, dtype=torch.float64)
+    dt_bias = torch.randn(H, dtype=torch.float64)
+    xBC_real = torch.randn(b, conv_dim, n, dtype=torch.float64)
+    dt_real = torch.randn(b, n, H, dtype=torch.float64)
+    xBC_pad = torch.cat([xBC_real, torch.randn(b, conv_dim, N - n, dtype=torch.float64)], dim=-1)
+    dt_pad = torch.cat([dt_real, torch.randn(b, N - n, H, dtype=torch.float64)], dim=1)
+    _, h_real, _ = _masked_prefill_core(xBC_real, conv_w, conv_b, F.softplus(dt_real + dt_bias), A, D, K, cs, im, gn, G, n)
+    # BUG path: no mask -> valid_len=N (treat all padded tokens as real)
+    _, h_bad, _ = _masked_prefill_core(xBC_pad, conv_w, conv_b, F.softplus(dt_pad + dt_bias), A, D, K, cs, im, gn, G, N)
+    assert not torch.allclose(h_real, h_bad, atol=1e-6), "processing pad as real must diverge (documents the pitfall)"
+
+
 def test_segmented_prefill_needs_conv_carry():
     """Guard the top segmented-Mamba pitfall: dropping the conv1d state carry (zero-padding each
     segment) must visibly diverge from single-shot, so a regression that forgets it is caught."""

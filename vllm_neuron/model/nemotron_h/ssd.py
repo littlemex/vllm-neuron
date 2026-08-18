@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 
 def segmented_causal_conv1d(xBC_t, conv_weight, conv_bias, kernel_size, groups,
-                            conv_state=None, is_continuation=None):
+                            conv_state=None, is_continuation=None, valid_len=None):
     """Depthwise causal conv1d for (segmented) Mamba2 prefill. SINGLE SOURCE OF TRUTH shared by the
     model (NemotronHMamba2Mixer.forward_prefill) and the CPU test, so the shipped conv-history carry
     and the tested one cannot silently diverge.
@@ -25,9 +25,13 @@ def segmented_causal_conv1d(xBC_t, conv_weight, conv_bias, kernel_size, groups,
     segment degenerates to the fresh zero-left-pad and a continuation segment prepends the real
     history. GRAPH-STATIC: no Python branch on a runtime value — is_continuation is tensor arithmetic.
 
-    new_conv_state is always exactly kernel_size-1 wide: it is sliced from cat(history, xBC_t), so a
-    segment shorter than kernel_size-1 is still zero-/history-padded up to the buffer width rather
-    than returning a too-short tensor that a later `copy_` would silently broadcast.
+    valid_len (runtime scalar tensor) is the number of REAL tokens; Neuron pads a prefill up to a
+    fixed bucket width with a contiguous suffix of pad tokens, so `seq` can exceed the real length.
+    new_conv_state must be the last (kernel_size-1) real conv inputs, NOT the padded tail. It is
+    gathered from cat(history, xBC_t) at indices `valid_len + [0..K-2]`: for a full (unpadded) segment
+    valid_len==seq and this is the last K-1 of xBC_t; for a padded segment it is the real tail; for a
+    segment shorter than K-1 the low indices fall into the (zero or history) prefix. valid_len=None
+    keeps the simple `last K-1` behaviour (CPU tests that build exact-length segments).
     """
     K = kernel_size
     if conv_state is None:
@@ -36,7 +40,12 @@ def segmented_causal_conv1d(xBC_t, conv_weight, conv_bias, kernel_size, groups,
     else:
         hist = conv_state.to(xBC_t.dtype) * is_continuation.to(xBC_t.dtype)
         out = F.conv1d(torch.cat([hist, xBC_t], dim=-1), conv_weight, conv_bias, groups=groups)
-    new_conv_state = torch.cat([hist, xBC_t], dim=-1)[..., -(K - 1):]   # always [b, conv_dim, K-1]
+    full = torch.cat([hist, xBC_t], dim=-1)                            # [b, conv_dim, (K-1)+seq]
+    if valid_len is None:
+        new_conv_state = full[..., -(K - 1):]                          # always [b, conv_dim, K-1]
+    else:
+        idx = valid_len.reshape(()).long() + torch.arange(K - 1, device=xBC_t.device)
+        new_conv_state = torch.index_select(full, -1, idx)             # real last K-1 (pad-safe)
     return out, new_conv_state
 
 
