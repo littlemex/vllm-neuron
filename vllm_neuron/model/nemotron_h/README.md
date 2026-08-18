@@ -163,7 +163,8 @@ vllm_neuron/model/nemotron_h/
 ├── README.md          # This file
 ├── config.py          # NemotronHConfig: Omni-wrapper unwrap + attribute_map alias recovery
 ├── factory.py         # NemotronHForCausalLM factory (bf16 today; FP8/NVFP4 future)
-├── ssd.py             # chunked_ssd_scan: chunked Mamba2 SSD prefill (single source; test imports it)
+├── ssd.py             # chunked_ssd_scan + segmented_causal_conv1d: Mamba2 SSD prefill + conv carry
+├── ops.py             # gated_rmsnorm + dense_moe_gate (single source; test compares vs HF reference)
 └── model_bf16.py      # RMSNorm / Attention / MoE / Mamba2 mixers + model + HF weight loader
 ```
 
@@ -172,11 +173,15 @@ vllm_neuron/model/nemotron_h/
 ```text
 test/vllm_neuron/model/nemotron_h/bf16/
 └── test_nemotron_h_kernels.py   # CPU equivalence tests (no Neuron device / no checkpoint):
-                                  #  - vectorized-SSD prefill scan vs the sequential recurrence
-                                  #  - mask-before-exp is required to avoid inf*0 = NaN
-                                  #  - DGE-free dense MoE router vs a scatter-based argmax top-k router
                                   #  - chunked SSD == sequential recurrence (chunk boundaries, long
-                                  #    sequences, prefix state) + an fp32 long-sequence stress test
+                                  #    sequences, small chunks, prefix state) + fp32 stress
+                                  #  - segmented/continuation prefill == single-shot (SSM + conv1d
+                                  #    carry, first-segment mask); bucket-padding does not change the
+                                  #    state (pad-invariance) + negative tests (missing mask diverges)
+                                  #  - mask-before-exp is required to avoid inf*0 = NaN
+                                  #  - gated RMSNorm and DGE-free MoE gate match the ACTUAL HF
+                                  #    reference (MambaRMSNormGated / NemotronHTopkRouter), not a
+                                  #    self-authored oracle
 ```
 
 Run with `pytest test/vllm_neuron/model/nemotron_h/bf16/`. Full-model / HF-parity correctness is
