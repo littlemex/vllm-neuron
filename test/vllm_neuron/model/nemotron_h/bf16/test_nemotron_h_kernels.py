@@ -101,11 +101,11 @@ def _mamba_prefill_core(xBC_t, conv_w, conv_b, dt, A, D, K, cs, im, gn, G, ssm_s
     on the first segment => zero left-pad, i.e. single-shot start). Returns
     (y[b,l,H,P], h_final[b,H,P,N], conv_state_out[b,conv_dim,K-1])."""
     b, conv_dim, seq = xBC_t.shape
-    # Use the SHIPPED conv-carry helper (single source of truth): cont=1 on a continuation segment,
-    # None conv_state0 => single-shot / first segment (fresh zero left-pad).
-    cont = None if conv_state0 is None else torch.ones((), dtype=xBC_t.dtype)
+    # Use the SHIPPED conv-carry helper (single source of truth): is_continuation=1 on a continuation
+    # segment, None conv_state0 => single-shot / first segment (fresh zero left-pad).
+    is_cont = None if conv_state0 is None else torch.ones((), dtype=xBC_t.dtype)
     xBC_c, conv_state_out = segmented_causal_conv1d(xBC_t, conv_w, conv_b, K, conv_dim,
-                                                    conv_state=conv_state0, cont=cont)
+                                                    conv_state=conv_state0, is_continuation=is_cont)
     xBC = F.silu(xBC_c.transpose(1, 2))                              # [b, seq, conv_dim]
     P = im // (A.shape[0])
     H, N = A.shape[0], gn // G
@@ -122,7 +122,10 @@ def test_segmented_prefill_matches_single_shot():
     the boundary) is numerically identical to a single-shot prefill. This pins the segmented /
     continuation prefill path (NemotronHMamba2Mixer.forward_prefill cont_prefill=True), in particular
     that the conv1d history is carried (not zero-padded) at every segment boundary."""
-    for L, splits, cs in [(40, [24], 16), (40, [16, 28], 16), (256, [128], 128), (300, [128, 200], 128)]:
+    # incl. boundary cases where a segment (or the whole prompt) is SHORTER than the conv kernel
+    # history K-1=3 — the conv_state carry must still be exactly K-1 wide (no silent broadcast).
+    for L, splits, cs in [(40, [24], 16), (40, [16, 28], 16), (256, [128], 128), (300, [128, 200], 128),
+                          (5, [2], 16), (5, [1, 3], 16), (2, [1], 16), (1, [], 16)]:
         torch.manual_seed(L * 7 + cs + len(splits))
         b, H, P, N, G, K = 1, 4, 8, 6, 2, 4
         im, gn = H * P, G * N
@@ -138,6 +141,10 @@ def test_segmented_prefill_matches_single_shot():
         y_full, h_full, _ = _mamba_prefill_core(xBC_t, conv_w, conv_b, dt, A, D, K, cs, im, gn, G,
                                                  ssm_state0=None, conv_state0=None)
 
+        # the conv state carried out of single-shot must always be exactly K-1 wide, even for L<K-1.
+        _, _, cs_full = _mamba_prefill_core(xBC_t, conv_w, conv_b, dt, A, D, K, cs, im, gn, G, None, None)
+        assert cs_full.shape[-1] == K - 1, (L, cs_full.shape)
+
         # segmented: walk boundaries carrying ssm_state (h) and conv_state (raw last K-1 inputs)
         bounds = [0] + splits + [L]
         ys, ssm, conv = [], None, None
@@ -146,6 +153,7 @@ def test_segmented_prefill_matches_single_shot():
             y_seg, ssm, conv = _mamba_prefill_core(
                 xBC_t[..., s:e], conv_w, conv_b, dt[:, s:e], A, D, K, cs, im, gn, G,
                 ssm_state0=ssm, conv_state0=conv)
+            assert conv.shape[-1] == K - 1, (L, splits, i, conv.shape)   # never a too-short broadcast
             ys.append(y_seg)
         y_seg = torch.cat(ys, dim=1)
         assert torch.allclose(y_full, y_seg, atol=1e-8), (L, splits, (y_full - y_seg).abs().max())
@@ -172,6 +180,27 @@ def test_segmented_prefill_needs_conv_carry():
                                    ssm_state0=ssm, conv_state0=None)   # BUG: no conv carry
     y_bad = torch.cat([y0, y1], dim=1)
     assert not torch.allclose(y_full, y_bad, atol=1e-6), "dropping conv carry must diverge (documents the pitfall)"
+
+
+def test_segmented_conv_first_segment_mask_equals_fresh():
+    """The graph-static first-segment path: on-device the FIRST segment still takes the continuation
+    form (conv_state != None) but with is_continuation == 0, which must zero the carried history and
+    reproduce a fresh single-shot conv EXACTLY. This is the runtime-mask branch the model relies on
+    (forward_prefill), and it is otherwise only exercised implicitly — pin it directly."""
+    for K, seq, conv_dim in [(4, 40, 8), (4, 2, 8), (4, 1, 8)]:   # incl. seq < K-1
+        torch.manual_seed(seq * 13 + conv_dim)
+        b = 1
+        xBC_t = torch.randn(b, conv_dim, seq, dtype=torch.float64)
+        w = torch.randn(conv_dim, 1, K, dtype=torch.float64)
+        bias = torch.randn(conv_dim, dtype=torch.float64)
+        prev = torch.randn(b, conv_dim, K - 1, dtype=torch.float64)   # arbitrary non-zero history
+        out_fresh, cs_fresh = segmented_causal_conv1d(xBC_t, w, bias, K, conv_dim)   # single-shot
+        out_first, cs_first = segmented_causal_conv1d(
+            xBC_t, w, bias, K, conv_dim, conv_state=prev,
+            is_continuation=torch.zeros((), dtype=torch.float64))    # first segment: mask == 0
+        assert torch.allclose(out_fresh, out_first, atol=1e-12), (seq, (out_fresh - out_first).abs().max())
+        assert torch.allclose(cs_fresh, cs_first, atol=1e-12)
+        assert cs_first.shape[-1] == K - 1
 
 
 def test_chunked_ssd_fp32_long_sequence_stress():

@@ -56,6 +56,10 @@ from .config import NemotronHConfig, MAMBA, MOE, ATTENTION
 
 logger = logging.getLogger(__name__)
 
+# Default chunk size for the chunked SSD prefill scan = the checkpoint config's mamba `chunk_size`
+# (config.json `chunk_size` = 128). Overridable per-run via NEMOTRONH_CHUNK (experiments only).
+_DEFAULT_MAMBA_CHUNK = 128
+
 
 # ============================================================
 # RMSNorm (NemotronH: standard RMSNorm, weight * normed, no offset)
@@ -701,11 +705,13 @@ class NemotronHMamba2Mixer(nn.Module):
         # is a linear recurrence; the conv is causal) — pinned on CPU by
         # test_segmented_prefill_matches_single_shot, INCLUDING the conv-history carry.
         #
-        # GRAPH-STATIC: cached_seq_len is a runtime tensor, so we must NOT branch first-vs-continuation
-        # in Python (that would need two graphs). Instead we ALWAYS use the continuation form and
-        # multiply the carried state by a runtime first-segment mask cont = (cached_seq_len > 0): on
-        # the first segment cont == 0 zeroes the carry, which is exactly a fresh prefill (a K-1 zero
-        # left-pad of the conv + a zero SSM state).
+        # Two DISTINCT kinds of branch live here — do not conflate them:
+        #   (a) `cached_seq_len is None` below is a Python branch on a DEPLOYMENT-TIME-STATIC mode
+        #       (single-shot vs segmented, fixed by whether kv_segment_size is set) — safe to trace.
+        #   (b) `is_continuation = (cached_seq_len > 0)` is a RUNTIME-TENSOR mask, so it must NOT be a
+        #       Python branch (that would need two graphs). We always use the continuation form and
+        #       zero the carried state on the first segment (is_continuation == 0 ⇒ a fresh prefill:
+        #       a K-1 zero-left-pad conv + a zero SSM state). This is the GRAPH-STATIC requirement.
         b, seq_len, _ = hidden_states.shape
         dtype = hidden_states.dtype
         proj = self._in_proj(hidden_states)
@@ -718,11 +724,11 @@ class NemotronHMamba2Mixer(nn.Module):
             xBC_c, conv_state = segmented_causal_conv1d(
                 xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr)
         else:
-            cont = (cached_seq_len.reshape(()) > 0)
+            is_continuation = (cached_seq_len.reshape(()) > 0)               # runtime {0,1} mask
             xBC_c, conv_state = segmented_causal_conv1d(
                 xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr,
-                conv_state=self.conv_state, cont=cont)
-            ssm_state0 = self.ssm_state * cont.to(self.ssm_state.dtype)          # zeroed on first segment
+                conv_state=self.conv_state, is_continuation=is_continuation)
+            ssm_state0 = self.ssm_state * is_continuation.to(self.ssm_state.dtype)   # zeroed on first segment
         xBC = self.act(xBC_c.transpose(1, 2))
 
         gn = self.groups_pr * self.ssm_state_size
@@ -769,7 +775,10 @@ class NemotronHMamba2Mixer(nn.Module):
             # where csdt = cumsum(dt) and A_h < 0, so the decay exponent is <= 0 for s <= t (fp32
             # stable, no overflow). This closed form starts from a zero SSM state, so it does NOT
             # support a prefix ssm_state0 — guard against silently dropping it (use NEMOTRONH_SCAN=
-            # chunked for continuation prefill).
+            # chunked for continuation prefill). Note: under segmented prefill the graph-static mask
+            # makes ssm_state0 a ZERO tensor (not None) even on the first segment, so this guard fires
+            # for NEMOTRONH_SCAN=quadratic + segmented — intended (quadratic is a short-seq/debug path
+            # only; segmented long-context requires the default chunked scan).
             if ssm_state0 is not None:
                 raise NotImplementedError(
                     "prefix ssm_state0 is not supported by the vectorized (quadratic) prefill scan; "
@@ -799,7 +808,10 @@ class NemotronHMamba2Mixer(nn.Module):
             # DEFAULT: chunked SSD — O(l*C), lifts the quadratic form's short-seq cap so long
             # sequences fit. The scan lives in module-level chunked_ssd_scan() (the SAME function
             # the CPU equivalence test imports, so implementation and test cannot silently diverge).
-            cs = int(os.environ.get("NEMOTRONH_CHUNK", "128"))
+            # Default chunk 128 = the checkpoint config's mamba `chunk_size` (config.json chunk_size);
+            # it trades the intra-chunk O(chunk^2) pass against the chunk count T=ceil(l/chunk). Kept
+            # overridable for experiments; a bad (non-int) value raises here rather than mis-shaping.
+            cs = int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK)))
             s0 = ssm_state0.float() if ssm_state0 is not None else None
             y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
         y = y.reshape(b, seq_len, -1)

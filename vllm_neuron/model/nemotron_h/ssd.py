@@ -10,27 +10,33 @@ import torch.nn.functional as F
 
 
 def segmented_causal_conv1d(xBC_t, conv_weight, conv_bias, kernel_size, groups,
-                            conv_state=None, cont=None):
+                            conv_state=None, is_continuation=None):
     """Depthwise causal conv1d for (segmented) Mamba2 prefill. SINGLE SOURCE OF TRUTH shared by the
     model (NemotronHMamba2Mixer.forward_prefill) and the CPU test, so the shipped conv-history carry
     and the tested one cannot silently diverge.
 
-    xBC_t[b, C, seq]. Returns (conv_out[b, C, seq], new_conv_state[b, C, kernel_size-1]) where
-    new_conv_state is this segment's last (kernel_size-1) RAW inputs (carried to the next segment).
+    xBC_t[b, conv_dim, seq] (conv_dim to avoid colliding with the Mamba2 C matrix). Returns
+    (conv_out[b, conv_dim, seq], new_conv_state[b, conv_dim, kernel_size-1]) where new_conv_state is
+    the last (kernel_size-1) RAW conv inputs carried to the next segment / decode.
 
     conv_state is None for a single-shot prefill (fresh: a kernel_size-1 zero left-pad). For a
-    segment, conv_state is the previous segment's new_conv_state and cont is a runtime {0,1} mask
-    (0 on the first segment): the history is `conv_state * cont`, so the first segment degenerates to
-    the fresh zero-left-pad and a continuation segment prepends the real history. GRAPH-STATIC: no
-    Python branch on a runtime value — cont is applied as tensor arithmetic.
+    segment, conv_state is the previous segment's new_conv_state and is_continuation is a runtime
+    {0,1} mask (0 on the FIRST segment): the history is `conv_state * is_continuation`, so the first
+    segment degenerates to the fresh zero-left-pad and a continuation segment prepends the real
+    history. GRAPH-STATIC: no Python branch on a runtime value — is_continuation is tensor arithmetic.
+
+    new_conv_state is always exactly kernel_size-1 wide: it is sliced from cat(history, xBC_t), so a
+    segment shorter than kernel_size-1 is still zero-/history-padded up to the buffer width rather
+    than returning a too-short tensor that a later `copy_` would silently broadcast.
     """
     K = kernel_size
-    new_conv_state = xBC_t[..., -(K - 1):]
     if conv_state is None:
+        hist = torch.zeros(*xBC_t.shape[:-1], K - 1, dtype=xBC_t.dtype, device=xBC_t.device)
         out = F.conv1d(xBC_t, conv_weight, conv_bias, padding=K - 1, groups=groups)[..., :xBC_t.shape[-1]]
     else:
-        hist = conv_state.to(xBC_t.dtype) * cont.to(xBC_t.dtype)
+        hist = conv_state.to(xBC_t.dtype) * is_continuation.to(xBC_t.dtype)
         out = F.conv1d(torch.cat([hist, xBC_t], dim=-1), conv_weight, conv_bias, groups=groups)
+    new_conv_state = torch.cat([hist, xBC_t], dim=-1)[..., -(K - 1):]   # always [b, conv_dim, K-1]
     return out, new_conv_state
 
 
@@ -52,7 +58,8 @@ def chunked_ssd_scan(x, B, C, dt, A, D, chunk_size, ssm_state0=None):
     b, l, H, P = x.shape
     N = B.shape[-1]
     cs = chunk_size
-    assert l > 0, "chunked_ssd_scan requires a non-empty sequence"
+    if l <= 0:   # ValueError (not assert): survives `python -O`, which strips asserts.
+        raise ValueError("chunked_ssd_scan requires a non-empty sequence")
     Lp = ((l + cs - 1) // cs) * cs
     T = Lp // cs
     pad = Lp - l
