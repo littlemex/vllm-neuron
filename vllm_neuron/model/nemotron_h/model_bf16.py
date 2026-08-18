@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from .ssd import chunked_ssd_scan, segmented_causal_conv1d
+from .ops import gated_rmsnorm, dense_moe_gate
 
 from vllm.distributed.parallel_state import get_tp_group
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
@@ -453,26 +454,12 @@ class NemotronHMoE(nn.Module):
         sidesteps the bug. Math is identical to a scatter-based argmax top-k router (argmax's
         lowest-index tie-break is reproduced exactly), so greedy outputs are unchanged.
         """
+        # Delegates to ops.dense_moe_gate (single source of truth; the CPU test compares it against HF
+        # NemotronHTopkRouter). Logits+sigmoid here, the DGE-free selection/weighting there.
         logits = F.linear(x.to(torch.float32), self.gate_weight)   # [T, E]
         scores = logits.sigmoid()
-        sfc = scores + self.e_score_correction_bias                # scores_for_choice [T, E]
-        E = self.E
-        iota = torch.arange(E, device=x.device).view(1, E).to(sfc.dtype)   # [1, E]
-        big = torch.full_like(sfc, float(E))
-        work = sfc
-        sel_mask = torch.zeros_like(sfc)                           # [T, E], 1.0 at chosen experts
-        for _ in range(self.k):
-            m = work.max(dim=-1, keepdim=True).values              # [T, 1]
-            is_max = work >= m                                     # [T, E] (>=1 True on ties)
-            # lowest index among the maxima == torch.argmax semantics
-            idx_first = torch.where(is_max, iota, big).min(dim=-1, keepdim=True).values  # [T, 1]
-            onehot = (iota == idx_first).to(sfc.dtype)             # [T, E], exactly one 1.0
-            sel_mask = sel_mask + onehot
-            work = work - onehot * 1e30                            # drop the chosen expert (dense)
-        gate = sel_mask * scores                                   # weights from RAW sigmoid scores
-        if self.norm_topk_prob:
-            gate = gate / (gate.sum(dim=-1, keepdim=True) + 1e-20)
-        gate = gate * self.routed_scaling_factor
+        gate = dense_moe_gate(scores, self.e_score_correction_bias, self.k,
+                              self.norm_topk_prob, self.routed_scaling_factor)
         return gate.to(self.dtype)                                 # [T, E] dense gate
 
     def _expert_mlp(self, x_e, e):
@@ -678,14 +665,10 @@ class NemotronHMamba2Mixer(nn.Module):
         # mamba_intermediate/n_groups = 512): normalize WITHIN each group of `gsz`, not over the whole
         # inner dim. A plain mean(-1) over the full inner dim is a different function and degrades the
         # real 30B to repetitive output (single-layer CPU parity: grouped -> cosine 1.0 vs HF).
-        # SiLU on the fp32 gate (HF rms_norm_ref upcasts z before F.silu(z)); SiLU is nonlinear, so
-        # computing it in bf16 vs fp32 moves the rounding.
-        y = y * self.act(gate.float())
-        gsz = self.intermediate_size // self.n_groups
-        yf = y.float().reshape(*y.shape[:-1], -1, gsz)
-        yf = yf * torch.rsqrt(yf.pow(2).mean(-1, keepdim=True) + self.norm_eps)
-        yf = yf.reshape(*y.shape)
-        return (yf * self.norm_weight.float()).to(gate.dtype)
+        # Delegates to ops.gated_rmsnorm (single source of truth; the CPU test compares it against HF
+        # MambaRMSNormGated / rms_norm_ref). group_size = mamba_intermediate / n_groups = 512.
+        return gated_rmsnorm(y, gate, self.norm_weight, self.intermediate_size // self.n_groups,
+                             self.norm_eps)
 
     def _in_proj(self, hidden_states):
         # hidden_states: [b, l, hidden]; in_proj_weight: [hidden, proj_out_pr]

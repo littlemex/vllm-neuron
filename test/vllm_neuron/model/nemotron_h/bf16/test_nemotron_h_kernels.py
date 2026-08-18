@@ -1,17 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU numerical-equivalence tests for the NemotronH-specific kernels.
 
-These validate the two non-trivial numerical reformulations the Neuron serving implementation
-relies on, using plain PyTorch on CPU (no Neuron device / no HF weights required):
+These validate the NemotronH-specific numerical reformulations on CPU (no Neuron device / no HF
+weights required), using plain PyTorch:
 
-1. The vectorized SSD (quadratic / attention-form) Mamba2 prefill scan is mathematically
-   equivalent to the sequential 1-step recurrence, and its "mask the decay exponent to -inf on
-   the strict upper triangle BEFORE exp()" is required to avoid inf*0 = NaN on real-scale dt.
-2. The DGE-free dense MoE router selects exactly the same experts (with the same lowest-index
-   tie-break) and produces the same weights as a scatter-based argmax top-k router.
+1. chunked SSD == the sequential 1-step recurrence (chunk boundaries, long seq, small chunks, prefix
+   state, fp32 stress); mask-before-exp is required to avoid inf*0 = NaN.
+2. segmented / continuation prefill == single-shot (SSM + conv1d state carry, first-segment mask,
+   segments shorter than the conv kernel), and bucket-padding does not change the state
+   (test_prefill_pad_invariance) — with negative tests that a missing mask diverges.
+3. The DGE-free dense MoE router and the grouped gated RMSNorm match the ACTUAL Hugging Face
+   reference (NemotronHTopkRouter / MambaRMSNormGated rms_norm_ref), not just a self-authored oracle.
 
-Full-model / HF-parity correctness is covered by on-device verification (see the model README);
-these tests pin the numerics that a refactor could silently break.
+Full-model greedy correctness and the segmented long-context path are additionally covered by
+on-device verification (see the model README); these tests pin the numerics a refactor could break.
 """
 import torch
 import torch.nn.functional as F
@@ -31,6 +33,11 @@ _spec = importlib.util.spec_from_file_location("nemotron_ssd", _cand)
 _ssd = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_ssd)
 chunked_ssd_scan = _ssd.chunked_ssd_scan
 segmented_causal_conv1d = _ssd.segmented_causal_conv1d
+_ops_spec = importlib.util.spec_from_file_location(
+    "nemotron_ops", _os.path.join(_os.path.dirname(_cand), "ops.py"))
+_ops = importlib.util.module_from_spec(_ops_spec); _ops_spec.loader.exec_module(_ops)
+gated_rmsnorm = _ops.gated_rmsnorm
+dense_moe_gate = _ops.dense_moe_gate
 
 
 def _sequential_ssd(x, B, C, dt, A, D, state0=None):
@@ -447,3 +454,95 @@ if __name__ == "__main__":
     test_dense_router_matches_scatter_router()
     test_dense_router_tiebreak_prefers_lowest_index()
     print("all NemotronH kernel equivalence tests passed")
+
+
+# ============================================================
+# HF-reference parity: compare ops.py against the ACTUAL Hugging Face NemotronH algorithms
+# (equivalence-skill Stage-2 rule: check the target against the real reference, not a self-authored
+# oracle). The two HF functions below are copied VERBATIM from the reference so the test has no
+# mamba_ssm / transformers-internal import dependency:
+#   - _hf_rms_norm_ref: mamba_ssm layernorm_gated.rms_norm_ref (what HF MambaRMSNormGated calls),
+#     einops.rearrange replaced by an equivalent reshape.
+#   - _hf_topk_router_gate: transformers modeling_nemotron_h.NemotronHTopkRouter.get_topk_indices +
+#     forward, scattered into a dense [T, E] gate for comparison.
+# ============================================================
+
+def _hf_rms_norm_ref(x, weight, bias, z=None, eps=1e-6, group_size=None, norm_before_gate=True, upcast=True):
+    # verbatim from mamba_ssm/ops/triton/layernorm_gated.py::rms_norm_ref (rearrange -> reshape)
+    dtype = x.dtype
+    weight = weight.float()
+    bias = bias.float() if bias is not None else None
+    if upcast:
+        x = x.float()
+        z = z.float() if z is not None else z
+    if z is not None and not norm_before_gate:
+        x = x * F.silu(z)
+    if group_size is None:
+        rstd = 1 / torch.sqrt((x.square()).mean(dim=-1, keepdim=True) + eps)
+        out = (x * rstd * weight) + bias if bias is not None else (x * rstd * weight)
+    else:
+        x_group = x.reshape(*x.shape[:-1], -1, group_size)
+        rstd = 1 / torch.sqrt((x_group.square()).mean(dim=-1, keepdim=True) + eps)
+        out = (x_group * rstd).reshape(*x.shape) * weight
+        if bias is not None:
+            out = out + bias
+    if z is not None and norm_before_gate:
+        out *= F.silu(z)
+    return out.to(dtype)
+
+
+def test_gated_rmsnorm_matches_hf_reference():
+    """ops.gated_rmsnorm == HF MambaRMSNormGated (rms_norm_ref, norm_before_gate=False) — the actual
+    reference, not a re-derivation. fp64 exact; bf16 within a rounding tolerance."""
+    for inner, group_size, dt in [(4096, 512, torch.float64), (1024, 512, torch.float64),
+                                  (2048, 256, torch.float64), (4096, 512, torch.bfloat16)]:
+        torch.manual_seed(inner + group_size + int(dt == torch.bfloat16))
+        T = 7
+        y = torch.randn(1, T, inner, dtype=dt)
+        gate = torch.randn(1, T, inner, dtype=dt)
+        weight = torch.randn(inner, dtype=dt)
+        eps = 1e-5
+        ours = gated_rmsnorm(y, gate, weight, group_size, eps)
+        hf = _hf_rms_norm_ref(y, weight, bias=None, z=gate, eps=eps, group_size=group_size,
+                              norm_before_gate=False, upcast=True)
+        atol = 1e-10 if dt == torch.float64 else 3e-2
+        assert torch.allclose(ours, hf, atol=atol), (inner, group_size, dt, (ours.float() - hf.float()).abs().max())
+
+
+def _hf_topk_router_gate(scores, bias, top_k, n_group, topk_group, norm_topk_prob, rsf):
+    # verbatim from transformers modeling_nemotron_h.py::NemotronHTopkRouter (get_topk_indices +
+    # forward's weight path), then scattered into a dense [T, E] gate for comparison.
+    n_routed = scores.shape[-1]
+    scores_for_choice = scores + bias.unsqueeze(0)
+    group_scores = (scores_for_choice.view(-1, n_group, n_routed // n_group)
+                    .topk(2, dim=-1)[0].sum(dim=-1))
+    group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False)[1]
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1)
+    score_mask = (group_mask.unsqueeze(-1).expand(-1, n_group, n_routed // n_group)
+                  .reshape(-1, n_routed))
+    scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
+    topk_indices = torch.topk(scores_for_choice, k=top_k, dim=-1, sorted=False)[1]
+    topk_weights = scores.gather(1, topk_indices)
+    if norm_topk_prob:
+        topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
+    topk_weights = topk_weights * rsf
+    dense = torch.zeros_like(scores)
+    dense.scatter_(1, topk_indices, topk_weights)
+    return dense
+
+
+def test_dense_moe_gate_matches_hf_router():
+    """ops.dense_moe_gate == HF NemotronHTopkRouter (n_group=1, NemotronH's config). Random logits
+    (no exact ties) so the DGE-free lowest-index selection and HF's torch.topk pick the same experts;
+    weights/normalization/scaling then match exactly."""
+    for E, k, norm, rsf in [(128, 6, True, 2.5), (128, 6, False, 2.5), (32, 4, True, 1.0), (16, 2, True, 3.0)]:
+        torch.manual_seed(E * 3 + k)
+        T = 5
+        logits = torch.randn(T, E, dtype=torch.float64)
+        scores = logits.sigmoid()
+        bias = torch.randn(E, dtype=torch.float64) * 0.1
+        ours = dense_moe_gate(scores, bias, k, norm, rsf)
+        hf = _hf_topk_router_gate(scores, bias, top_k=k, n_group=1, topk_group=1,
+                                  norm_topk_prob=norm, rsf=rsf)
+        assert torch.allclose(ours, hf, atol=1e-12), (E, k, norm, (ours - hf).abs().max())
