@@ -34,12 +34,15 @@ def segmented_causal_conv1d(xBC_t, conv_weight, conv_bias, kernel_size, groups,
     keeps the simple `last K-1` behaviour (CPU tests that build exact-length segments).
     """
     K = kernel_size
+    # fp32 conv: the depthwise causal conv1d mixes the last few tokens and carries the local order
+    # that the NoPE model relies on. Accumulate the K-tap conv in fp32, then cast back.
+    cw = conv_weight.float(); cb = conv_bias.float()
     if conv_state is None:
         hist = torch.zeros(*xBC_t.shape[:-1], K - 1, dtype=xBC_t.dtype, device=xBC_t.device)
-        out = F.conv1d(xBC_t, conv_weight, conv_bias, padding=K - 1, groups=groups)[..., :xBC_t.shape[-1]]
+        out = F.conv1d(xBC_t.float(), cw, cb, padding=K - 1, groups=groups)[..., :xBC_t.shape[-1]].to(xBC_t.dtype)
     else:
         hist = conv_state.to(xBC_t.dtype) * is_continuation.to(xBC_t.dtype)
-        out = F.conv1d(torch.cat([hist, xBC_t], dim=-1), conv_weight, conv_bias, groups=groups)
+        out = F.conv1d(torch.cat([hist, xBC_t], dim=-1).float(), cw, cb, groups=groups).to(xBC_t.dtype)
     full = torch.cat([hist, xBC_t], dim=-1)                            # [b, conv_dim, (K-1)+seq]
     if valid_len is None:
         new_conv_state = full[..., -(K - 1):]                          # always [b, conv_dim, K-1]
@@ -69,6 +72,14 @@ def chunked_ssd_scan(x, B, C, dt, A, D, chunk_size, ssm_state0=None):
     cs = chunk_size
     if l <= 0:   # ValueError (not assert): survives `python -O`, which strips asserts.
         raise ValueError("chunked_ssd_scan requires a non-empty sequence")
+    # fp32 scan: the SSD reductions (cumsum, exp of the decay, and the B/C/x einsums) carry the
+    # NoPE position/order information through the sequence. In bf16 those reductions accumulate
+    # enough error on the Neuron device to degrade multi-step reasoning while short completions
+    # survive. Run the scan in fp32 (the recurrent state is fp32 anyway) and cast y back at the end.
+    in_dtype = x.dtype
+    x = x.float(); B = B.float(); C = C.float(); dt = dt.float(); A = A.float(); D = D.float()
+    if ssm_state0 is not None:
+        ssm_state0 = ssm_state0.float()
     Lp = ((l + cs - 1) // cs) * cs
     T = Lp // cs
     pad = Lp - l
@@ -118,4 +129,4 @@ def chunked_ssd_scan(x, B, C, dt, A, D, chunk_size, ssm_state0=None):
     y = (y_diag + y_off).reshape(b, Lp, H, P)[:, :l] + x * D[..., None]
     # final SSM state for the following decode steps: carry through the last chunk once more
     h = torch.exp(log_gamma[:, -1])[..., None, None] * state_in[:, -1] + states[:, -1]
-    return y, h
+    return y.to(in_dtype), h

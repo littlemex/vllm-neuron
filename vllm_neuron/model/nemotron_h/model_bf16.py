@@ -465,7 +465,7 @@ class NemotronHMoE(nn.Module):
     def _expert_mlp(self, x_e, e):
         # <-- MODEL-SPECIFIC: relu^2 expert activation: down(relu(up(x))^2)
         h = F.linear(x_e, self.up[e])          # [n, mi_per_rank]
-        h = F.relu(h).pow(2)
+        h = F.relu(h.float()).pow(2).to(h.dtype)   # square in fp32: relu^2 amplifies bf16 error
         return F.linear(h, self.down[e])       # [n, d]
 
     def forward(self, hidden_states, is_prefill=False):
@@ -480,15 +480,19 @@ class NemotronHMoE(nn.Module):
         # control flow either — required for torch.compile / Neuron tracing. Heavier than a gather
         # loop but static-shape and correctness-first (fast NF.moe path is future work).
         gate = self._gate_dense(x)                      # [T, E], weight in each selected column
-        out = torch.zeros_like(x)
+        # fp32 accumulate: the dense combine sums top-k of 128 expert outputs plus the shared expert.
+        # On the Neuron device a bf16 accumulator loses precision across the many expert terms and
+        # across the stacked MoE layers, which degrades multi-step numeric reasoning while short
+        # completions survive. Accumulate in fp32 and cast back to the module dtype at the SP boundary.
+        out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         for e in range(self.E):
-            w_e = gate[:, e:e + 1]                       # [T, 1]
-            out = out + self._expert_mlp(x, e) * w_e
+            w_e = gate[:, e:e + 1].float()               # [T, 1]
+            out = out + self._expert_mlp(x, e).float() * w_e
         # shared expert (relu^2), always on
         sh = F.linear(x, self.shared_up)
         sh = F.relu(sh).pow(2)
-        out = out + F.linear(sh, self.shared_down)
-        out = out.reshape(orig_shape)
+        out = out + F.linear(sh, self.shared_down).float()
+        out = out.to(self.dtype).reshape(orig_shape)
         # >>> PARALLELISM: experts/shared computed on sharded intermediate → sum partials across
         # ranks (reduce-scatter on prefill, all-reduce on decode) <<<
         if self.world_size > 1:
@@ -735,13 +739,13 @@ class NemotronHMamba2Mixer(nn.Module):
                 xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr,
                 conv_state=self.conv_state, is_continuation=is_continuation, valid_len=valid_len)
             ssm_state0 = self.ssm_state * is_continuation.to(self.ssm_state.dtype)   # zeroed on first segment
-        xBC = self.act(xBC_c.transpose(1, 2))
+        xBC = self.act(xBC_c.transpose(1, 2).float()).to(dtype)   # SiLU in fp32 (x*sigmoid(x))
 
         gn = self.groups_pr * self.ssm_state_size
         im = self.im_pr
         x = xBC[..., :im]; B = xBC[..., im:im + gn]; C = xBC[..., im + gn:im + 2 * gn]
         A = -torch.exp(self.A_log.float())
-        dt = F.softplus(dt + self.dt_bias)
+        dt = F.softplus(dt.float() + self.dt_bias.float())   # softplus in fp32 (small-dt sensitive)
         if valid_mask is not None:
             # Zero dt on pad positions so they are identity recurrence steps (dA=1, dBx=0) — the final
             # SSM state then equals the state at the last real token (softplus(dt_bias) is nonzero, so
