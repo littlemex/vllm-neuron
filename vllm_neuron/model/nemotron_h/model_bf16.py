@@ -242,14 +242,16 @@ class NemotronHAttention(nn.Module):
                 sliding_window=None, sink=None, fp8_packed=False,
             )  # [Nh, Dh, T]
         else:
-            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
+            # Plain fp32 causal SDPA instead of NF.flash_attention: the flash kernel is the last
+            # device-only difference from the CPU reference, which answers these prompts correctly.
+            # q[Nh,T,Dh], k/v[Nkv,T,Dh]. Real tokens precede the right-padding, so a causal mask keeps
+            # the pad out of every real token's attention.
+            k = k.repeat_interleave(self.num_key_value_groups, dim=0)   # [Nh,T,Dh]
             v = v.repeat_interleave(self.num_key_value_groups, dim=0)
-            q_flash = q.transpose(1, 2)   # [Nh, Dh, T]
-            k_flash = k.transpose(1, 2)
-            v_flash = v                    # [Nh, T, Dh]
-            attn_output = NF.flash_attention(
-                q_flash, k_flash, v_flash, scale=self.scaling, causal_mask=True, tp_q=False, tp_out=True,
-            )  # [Nh, Dh, T]
+            scores = (q.float() @ k.float().transpose(-1, -2)) * self.scaling   # [Nh,T,T]
+            cm = torch.full((tokens, tokens), float("-inf"), device=q.device).triu(1)
+            attn = torch.softmax(scores + cm, dim=-1) @ v.float()              # [Nh,T,Dh]
+            attn_output = attn.transpose(1, 2).to(self.dtype)                  # [Nh,Dh,T]
         attn_output = attn_output.unsqueeze(0)
         attn_output = NF.o_proj(attn_output, self.o_proj_weight, None).squeeze(0)  # [T, H]
         if self.world_size > 1:
