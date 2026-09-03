@@ -14,6 +14,12 @@ from vllm import LLM, SamplingParams
 os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
 
 
+def _text_architecture(config):
+    """Point the architecture at the text class, which is what this plugin registers."""
+    config.architectures = ["Qwen3_5MoeForCausalLM"]
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -35,6 +41,17 @@ def main():
     # would continue from the wrong recurrent state); the model's factory refuses both.
     llm = LLM(
         model=args.model_checkpoint,
+        # Serving the text backbone of a multimodal checkpoint needs two things.
+        #
+        # 1. `architectures` must name the text class, since that is what the plugin registers.
+        # 2. The vision path must be neutralised rather than removed. The runner decides a model is
+        #    multimodal by `hasattr(hf_config, "vision_config")`, which is true for this config class
+        #    even when the JSON omits it — and it cannot simply be deleted, because vLLM's own config
+        #    for this model_type requires it. Changing `model_type` does not work either: vLLM
+        #    resolves its own config class from it and rejects the text variant. So instead the vision
+        #    token buckets are given values that pass validation against the prefill buckets. Nothing
+        #    ever runs through them, because no image or video input is accepted.
+        hf_overrides=_text_architecture,
         enable_prefix_caching=False,
         max_model_len=args.max_model_len,
         max_num_seqs=1,
@@ -45,7 +62,12 @@ def main():
         additional_config={
             "neuron_config": {
                 "num_batched_tokens_buckets": [args.max_model_len],
-            }
+            },
+            "vision_neuron_config": {
+                # Neutralised, not used: see the note above.
+                "num_vision_tokens_buckets": [args.max_model_len],
+                "vision_attention_block_size": args.max_model_len,
+            },
         },
     )
 

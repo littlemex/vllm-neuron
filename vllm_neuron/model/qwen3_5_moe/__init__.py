@@ -5,6 +5,6 @@ See README.md in this directory for the architecture, the supported feature matr
 limitations (batch=1, no prefix caching, no speculative decoding, text-only).
 """
 from .config import Qwen3_5MoeConfig
-from .factory import Qwen3_5MoeForConditionalGeneration
+from .factory import Qwen3_5MoeForCausalLM
 
-__all__ = ["Qwen3_5MoeConfig", "Qwen3_5MoeForConditionalGeneration"]
+__all__ = ["Qwen3_5MoeConfig", "Qwen3_5MoeForCausalLM"]

@@ -14,13 +14,17 @@ from transformers import PretrainedConfig
 from vllm_neuron.model.neuron_config import NeuronConfig
 
 
-class Qwen3_5MoeForConditionalGeneration(nn.Module):
+class Qwen3_5MoeForCausalLM(nn.Module):
     """Validates the config and selects the Qwen3.5-MoE implementation.
 
-    Registered under the checkpoint's own ``architectures`` entry
-    (``Qwen3_5MoeForConditionalGeneration``) so the published multimodal checkpoint resolves without an
-    edit to its config, while serving text-only requests. Image and video inputs are rejected by the
-    runner because no multimodal interface is declared on the model.
+    Registered as ``Qwen3_5MoeForCausalLM`` — the TEXT architecture name, matching what this is.
+
+    The published checkpoint declares ``Qwen3_5MoeForConditionalGeneration``, and registering under
+    that name is wrong even though it resolves: the runner keys its multimodal path off the
+    architecture, so it would build a vision NeuronConfig, validate vision token buckets against the
+    prefill buckets, and expect an encoder to feed. Serving the published checkpoint therefore needs
+    the architecture overridden to the text name (``hf_overrides``), which is also an honest statement
+    that the vision tower is not being served.
     """
 
     def __init__(self, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None) -> None:
@@ -49,11 +53,11 @@ class Qwen3_5MoeForConditionalGeneration(nn.Module):
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None = None,
                      text_neuron_config: NeuronConfig | None = None,
                      vision_neuron_config=None, **kwargs) -> nn.Module:
-        if vision_neuron_config is not None:
-            raise ValueError(
-                "Qwen3.5-MoE on Neuron implements the text backbone only; the vision tower is out "
-                "of scope. Received a vision_neuron_config — serve text-only requests instead."
-            )
+        # The checkpoint's architecture name is a *ConditionalGeneration one, so the runner builds
+        # both a text and a vision NeuronConfig and hands over both. That is structural, not a
+        # statement that the deployment wants images: `vision_neuron_config` is accepted and ignored.
+        # What keeps image and video input out is that this model declares no multimodal interface,
+        # so the runner has nothing to feed encoder output into.
         neuron = neuron_config if neuron_config is not None else text_neuron_config
         return cls._select_implementation(hf_config, neuron)
 

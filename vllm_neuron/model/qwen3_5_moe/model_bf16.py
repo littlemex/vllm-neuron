@@ -165,6 +165,10 @@ class Qwen3_5MoeAttention(nn.Module):
                 f"tensor_parallel_size={self.world_size} is incompatible with "
                 f"num_key_value_heads={self.num_key_value_heads}: one must divide the other."
             )
+        # NOTE for anyone switching the decode path to NF.attention_decode: that megakernel also
+        # requires (num_attention_heads / tp_size) to be EVEN, and its bias tensors to be 2-D
+        # [1, size]. Neither constraint applies to the pure-PyTorch decode used here, so neither is
+        # checked — a TP size that passes construction today may not pass with the megakernel.
         self.num_attention_heads_per_rank = self.num_attention_heads // self.world_size
         if self.world_size >= self.num_key_value_heads:
             self.num_key_value_heads_per_rank = 1
@@ -444,7 +448,13 @@ class Qwen3_5MoeMoE(nn.Module):
                 "a multiple of 128 for the MoE kernels."
             )
 
-        # Router: replicated (small), fp32 compute inside the kernels.
+        # Router: replicated (small). Kept in the model dtype rather than promoted to fp32.
+        # DECISION, not an oversight: the general advice for MoE ports is to hold the router weight in
+        # fp32, because a bf16 rounding difference in a softmax over many experts can select a
+        # different expert. The reference computes the logits from a bf16 weight, and this port's
+        # acceptance test is agreement with the reference, so matching it wins over being more stable
+        # than it. The prefill router still accumulates in fp32 (``computation_dtype``). Promoting the
+        # parameter would be a deliberate divergence from the reference, not a free fix.
         self.router_weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_size,
                                                       dtype=self.dtype))
         # The kernels want gate/up fused as [E, hidden, 2, intermediate] and down as
@@ -755,11 +765,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     def _reduce(self, output):
         """>>> PARALLELISM: sum the row-parallel out_proj partials across ranks <<<
 
-        ``out_proj`` is sharded over its INPUT dimension, so each rank produces a partial sum. TRAP:
-        dropping this collective is invisible in a TP=1 run and in every single-rank test — at TP=4
-        each of the 30 Gated DeltaNet layers would put 1/4 of its output into the residual and the
-        model would emit fluent-looking nonsense. The result is captured rather than assumed to be
-        mutated in place, which is correct under either convention.
+        ``out_proj`` is sharded over its INPUT dimension, so each rank computes a partial sum over its
+        own value heads and the true output is the sum of those partials. TRAP: dropping this
+        collective is invisible in a TP=1 run and in every single-rank test — each of the 30 Gated
+        DeltaNet layers would put one rank's partial into the residual instead of the sum, which is
+        not a scaled version of the right answer but a different vector, and the model would emit
+        fluent-looking nonsense. The result is captured rather than assumed to be mutated in place,
+        which is correct under either convention.
         """
         if self.world_size > 1:
             output = self.tp_group.all_reduce(output)
@@ -989,17 +1001,32 @@ class Qwen3_5MoeForCausalLM(nn.Module):
     @classmethod
     def from_configs(cls, hf_config, neuron_config=None, text_neuron_config=None,
                      vision_neuron_config=None, **kwargs):
-        # The multimodal runner passes text_/vision_neuron_config. This is the text backbone only, so
-        # a vision config means the deployment expects image support that is not implemented; fail
-        # rather than silently serving text-only.
-        if vision_neuron_config is not None:
-            raise ValueError(
-                "Qwen3.5-MoE here is the text backbone only; the vision tower is out of scope. "
-                "Received a vision_neuron_config — serve text-only requests, or use a model that "
-                "implements the vision path."
-            )
+        # The runner passes text_ and vision_neuron_config for a *ConditionalGeneration architecture
+        # whether or not the deployment wants images, so the vision config is accepted and ignored
+        # (see the factory). Image and video input are kept out by declaring no multimodal interface.
         neuron = neuron_config if neuron_config is not None else text_neuron_config
         return cls(Qwen3_5MoeConfig.from_configs(hf_config, neuron))
+
+    def get_mrope_input_positions(self, input_tokens, mm_features):
+        """The text-only degenerate case of MRoPE: all three axes carry the same position.
+
+        The runner sets ``uses_mrope`` from the config (which declares ``mrope_section``) and then
+        requires this protocol. Implementing it here rather than pretending the model is not MRoPE
+        makes the collapse explicit: for a text prompt the t/h/w axes are identical, which is exactly
+        what lets the single-axis rotary table be exact (see ``ops.rotary_tables``).
+
+        A request carrying multimodal features breaks that equality, so it is refused rather than
+        served with positions that are wrong for the image spans.
+        """
+        if mm_features:
+            raise NotImplementedError(
+                "Qwen3.5-MoE on Neuron serves the text backbone only; multimodal features would give "
+                "the three MRoPE axes different positions, which the single-axis rotary table here "
+                "cannot represent."
+            )
+        length = len(input_tokens)
+        positions = torch.arange(length, dtype=torch.int64).unsqueeze(0).expand(3, length).contiguous()
+        return positions, 0
 
     def get_kv_spec(self):
         """Only the full_attention layers declare KV. The Gated DeltaNet state is not paged and is
@@ -1042,6 +1069,12 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             raise NotImplementedError(
                 "Qwen3.5-MoE on Neuron does not merge prompt embeddings; it embeds input_ids only."
             )
+        if positions.dim() == 2 and positions.shape[0] == 3:
+            # MRoPE positions arrive as [3, T]. For text the three axes are identical (see
+            # get_mrope_input_positions), so collapsing to the first is exact rather than an
+            # approximation. A multimodal request never reaches here: get_mrope_input_positions
+            # refuses it while the positions are being built.
+            positions = positions[0]
         positions = positions.to(torch.int32)
         hidden_states = self.model(input_ids, positions, attn_metadata)
         sampled = torch.index_select(hidden_states, 0, sampling_positions)

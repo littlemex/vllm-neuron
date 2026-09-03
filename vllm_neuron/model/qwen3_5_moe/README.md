@@ -136,7 +136,9 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
   therefore pointed at a slot that is guaranteed to be real and given that row's value, so every
   duplicate writes the same thing and the result does not depend on which write wins
   (`ops.redirect_padded_slots`, pinned by the padded-cache-write tests including the case where the
-  sequence ends in the final slot).
+  sequence ends in the final slot). This assumes duplicate scatter destinations are merely unordered,
+  not faulting — which is why the duplicated values are made identical rather than relying on an
+  ordering.
 - **Precision.** bf16 only. The config rejects a checkpoint whose declared dtype is not bfloat16 —
   the quantization field does not reveal it, and an fp32 checkpoint would roughly double the footprint.
 - **An untied checkpoint with no `lm_head.weight` is refused** rather than served with the embedding
@@ -225,6 +227,48 @@ what on-device verification covers.
 CPU equivalence is complete (see Testing above), and `ruff` with the repository's configuration passes
 clean on these files.
 
-On-device verification — compile at TP=4 on a `trn2.3xlarge` and greedy-token agreement with the HF
-reference on the real checkpoint — is recorded here once it has run; until then this section is the
-honest statement that it has not.
+**On device: verified on a `trn2.3xlarge` at TP=4** (1 Trainium2 device, 4 NeuronCores, 96 GB, LNC=2),
+plugin 0.21.0.1.0.0 / vLLM 0.21.0 / Neuron SDK 2.31, `max_model_len` 128, `max_num_seqs` 1.
+
+*Compilation and state persistence*, on a reduced checkpoint with the same architectural shape (8
+layers of the same `layer_types` period, the same head counts and dims, 32 experts, random weights):
+compiles, generates without exception, and the recurrent state does not leak between requests — the
+same prompt run three times with a different prompt interleaved gives byte-identical output. A
+one-token prompt also completes, which is the case that would otherwise continue from the previous
+request's state.
+
+*Greedy agreement with the HuggingFace reference* on the real `Qwen/Qwen3.6-35B-A3B` weights (72 GB
+loaded at TP=4), against `Qwen3_5MoeForCausalLM` run on CPU in the same container, comparing token IDs
+for 8 greedy steps:
+
+| Prompt | First token | Greedy prefix |
+|---|---|---|
+| `The capital of France is` | match | 8/8 |
+| `2 + 2 =` | match | 8/8 |
+| `日本の首都は` | match | 8/8 |
+| `The largest planet in the solar system is` | match | 8/8 |
+| `水の沸点は` | match | 6/8 (diverges at step 6) |
+
+First token matches on 5/5 prompts; 38/40 tokens agree. The single divergence is at step 6 of one
+prompt, which is the expected bf16 near-tie behaviour amplified over a 40-layer stack — and this port
+deliberately keeps the residual in fp32, so exact end-to-end token equality is not the criterion (see
+Deliberate deviations).
+
+**Not verified:** longer contexts (only `max_model_len` 128 was compiled), segmented prefill,
+throughput or latency of any kind, and the vision and MTP paths (out of scope). `mypy` is not clean on
+these files, nor anywhere in this repository.
+
+## Serving a multimodal checkpoint as the text backbone
+
+The published checkpoint declares `Qwen3_5MoeForConditionalGeneration`; this model is registered as
+`Qwen3_5MoeForCausalLM`, the text architecture. Two things therefore have to be arranged, and the
+example `run.py` does both:
+
+- **Override `architectures`** to the text name, since that is what is registered.
+- **Neutralise the vision buckets** rather than removing the vision config. The runner decides a model
+  is multimodal from `hasattr(hf_config, "vision_config")`, which is true for this config class even
+  when the checkpoint's JSON omits it; deleting the attribute breaks vLLM's own config for this
+  `model_type`, and changing `model_type` makes vLLM reject the config class. So
+  `vision_neuron_config` is given `num_vision_tokens_buckets` and `vision_attention_block_size` that
+  pass validation against the prefill buckets. Nothing runs through them: no image or video input is
+  accepted, and `get_mrope_input_positions` refuses a request carrying multimodal features.
