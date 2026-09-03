@@ -29,6 +29,7 @@ from nkilib.core.moe.moe_cte.moe_cte import (
 )
 from nkilib.core.utils.common_types import RouterActFnType
 from torch import nn
+from torch.distributed._functional_collectives import all_gather_tensor
 from vllm.distributed.parallel_state import get_tp_group
 
 import vllm_neuron.functional as NF
@@ -993,6 +994,15 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 num_shards=self.lm_head.tp_size, is_storage_transposed=False,
             ),
         )
+        # The runner expects the full-vocab logits back alongside the sampled token whenever a
+        # request wants logprobs, or when logits are being dumped for debugging. Under on-device
+        # sampling the lm_head returns only this rank's vocab shard, so the distribution exists only
+        # across ranks and has to be gathered here. TRAP: returning None instead does not refuse
+        # `logprobs=N` — it makes the field come back EMPTY, which reads as "this model has no
+        # logprobs" at the call site and as a successful request everywhere else.
+        neuron = config.neuron_config
+        self._gather_logits = bool(neuron is not None and (
+            neuron.max_logprobs != 0 or neuron.debug_logits_dir is not None))
         if self.on_device_sampling_config is not None:
             from vllm_neuron.nn.sampler import Sampler
             self.sampler = Sampler(self.on_device_sampling_config,
@@ -1080,8 +1090,16 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         sampled = torch.index_select(hidden_states, 0, sampling_positions)
         logits = self.lm_head(sampled)
         if self.on_device_sampling_config is None:
+            # gather_output was True, so these are already the full vocabulary.
             return logits
-        return self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank), None
+        gathered_logits = None
+        if self._gather_logits:
+            # >>> PARALLELISM: gather the vocabulary shards for logprobs <<<
+            # The gather uses the lm_head's OWN group and the same primitive the layer uses for
+            # gather_output, so it cannot disagree with how the vocabulary was sharded.
+            gathered_logits = all_gather_tensor(logits, 1, self.lm_head.tp_group)
+        return (self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank),
+                gathered_logits)
 
     def load_weights(self, checkpoint_path, device, cache_dir=None):
         """Map the HF checkpoint onto the per-rank parameters.

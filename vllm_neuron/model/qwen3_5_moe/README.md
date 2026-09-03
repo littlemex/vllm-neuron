@@ -254,9 +254,87 @@ prompt, which is the expected bf16 near-tie behaviour amplified over a 40-layer 
 deliberately keeps the residual in fp32, so exact end-to-end token equality is not the criterion (see
 Deliberate deviations).
 
-**Not verified:** longer contexts (only `max_model_len` 128 was compiled), segmented prefill,
-throughput or latency of any kind, and the vision and MTP paths (out of scope). `mypy` is not clean on
-these files, nor anywhere in this repository.
+*Bucket independence.* A prefill graph is compiled per bucket, so a verification taken at one bucket
+is a statement about that graph. The same five prompts were rerun with a single 2048-token prefill
+bucket: byte-identical output. With a single 1024-token bucket, one of the five differs at step 7. See
+Single-stream latency below for why that is the expected consequence of padding width changing the
+reduction order, and Margins for the measurement that bounds it.
+
+### Margins: what a token disagreement is worth
+
+Free-running generations stop being comparable once they diverge, since every later step is
+conditioned on a different prefix. Feeding the reference's own sequence back in makes each step an
+independent comparison at the same input. Doing that for the five prompts (8 steps each, top-20
+logprobs) gives 38/40 steps where the device and the reference pick the same token, and for the two
+that differ:
+
+| Step | Device top-2 margin | Reference top-2 margin |
+|---|---|---|
+| `The capital of France is` step 7 | 0.1250 | **0.0000** |
+| `水の沸点は` step 6 | **0.0000** | 0.0625 |
+
+Against a median margin of 1.3750 over the agreeing steps. Every observed margin is an integer
+multiple of 0.0625, which is one bf16 ULP at logit magnitudes of 8–16 — so a margin of 0.0000 means
+the reference's own bf16 logits do not separate the two candidates at all. **The disagreements are
+confined to steps where the reference cannot distinguish the tokens either.** That is the bound worth
+having, because exact token equality is not achievable here by construction (see Deliberate
+deviations).
+
+As a numerical floor for comparison, one Gated DeltaNet layer with the real weights, fp32 against
+fp64, gives max_abs 1.8e-08 and rel_p99 2.6e-05 (cosine 1 - 9e-14). The attention layer's floor was
+not measured — its `forward` needs precomputed position embeddings and a mask, which this harness does
+not build.
+
+## Single-stream latency
+
+`max_num_seqs` is 1 by construction, so there is no batching dimension and these are not serving
+throughput numbers. Measured on the same `trn2.3xlarge` at TP=4, bf16, best of three, with nothing
+else running on the node.
+
+| Prefill bucket | Prompt lengths landing in it | TTFT | per token |
+|---|---|---|---|
+| 128 | 100, 128 | 0.159 s | 1.24 ms |
+| 512 | 130, 300, 512 | 0.509 s | 0.99 ms |
+| 1024 | 520, 700, 1024 | 1.119 s | 1.09 ms |
+| 2048 | 1030, 1500, 1900 | 0.377 s | 0.18 ms |
+
+Two things follow. **TTFT tracks the bucket, not the prompt**: the steps fall exactly on the bucket
+boundaries, and actual length costs nothing within a bucket. And **cost is not monotonic in bucket
+width**: the 2048 bucket is 3x faster than the 1024 bucket and 5.5x more efficient per token. That is
+not a "last bucket is special" effect — recompiling with `max_model_len` 1024, so that 1024 is the
+last bucket, still gives 1.119 s. Only the 2048 shape lands on the efficient kernel.
+
+The practical consequence is that a fine ladder of prefill buckets is not automatically better here:
+short requests do get cheaper (128 costs 42% of 2048), but anything landing in 512 or 1024 is slower
+than it would have been in a single 2048-wide bucket.
+
+Decode is 8.1-9.2 ms per token (109-124 tok/s). Narrowing the decode context buckets to the actual
+context is worth about 8% (8.1-8.8 ms against 9.1-9.2 ms with a single `max_model_len`-wide bucket),
+so the KV gather does track the bucket, but weight reading dominates.
+
+Adding the logprobs gather (see below) changed neither number: 0.375 s / 9.2 ms against 0.376 s /
+9.2 ms without it.
+
+Compilation and loading, for planning device time: loading the 72 GB checkpoint from the shared
+filesystem cold takes about 16 minutes; compiling one 2048 prefill bucket about 12 minutes; four
+prefill buckets plus three decode context buckets about 20 minutes. With a warm compile cache a
+rebuild is 2-5 minutes. The cache lives under `~/.cache/vllm/neuron`, not at
+`NEURON_COMPILE_CACHE_URL`, so it does not survive a container that keeps only that path.
+
+## Logprobs
+
+Under on-device sampling the LM head returns this rank's vocabulary shard, so the full distribution
+only exists across ranks. The model gathers it and returns `(sampled_tokens, gathered_logits)` when
+`neuron_config.max_logprobs` is non-zero or logits are being dumped, matching the other models in this
+repository. Returning `None` there does not refuse `logprobs=N` — it makes the field come back
+**empty**, which reads as "this model has no logprobs" while the request reports success.
+
+One caveat is outside this model: the runner's async-scheduling path returns the sampler output
+without logprobs regardless. `async_scheduling=False` is required to actually receive them.
+
+**Not verified:** contexts beyond 2048 (nothing wider was compiled), segmented prefill, any
+concurrency (there is none to have), and the vision and MTP paths (out of scope). `mypy` is not clean
+on these files, nor anywhere in this repository.
 
 ## Serving a multimodal checkpoint as the text backbone
 
