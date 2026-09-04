@@ -58,6 +58,7 @@ recurrent_gated_delta_rule = _gdn.recurrent_gated_delta_rule
 segmented_causal_conv1d = _gdn.segmented_causal_conv1d
 gated_delta_net_prefill = _gdn.gated_delta_net_prefill
 gated_delta_net_decode = _gdn.gated_delta_net_decode
+gated_delta_net_verify = _gdn.gated_delta_net_verify
 
 rmsnorm = _ops.rmsnorm
 gated_rmsnorm = _ops.gated_rmsnorm
@@ -837,6 +838,89 @@ def test_prefill_then_decode_matches_hf_single_shot():
             conv_state=conv_state, recurrent_state=state)
     assert torch.allclose(prefill_out, reference[:, :prefill_len], atol=1e-4)
     assert torch.allclose(decode_out, reference[:, prefill_len:], atol=1e-4)
+
+
+@requires_hf_modules
+@pytest.mark.parametrize("accepted", [0, 1, 2, 3])
+def test_verify_commits_the_state_of_exactly_the_accepted_prefix(accepted):
+    """Speculative decoding needs a state that matches the ACCEPTED prefix, not the proposed one.
+
+    A verify step advances past tokens that may be rejected, so the committed state has to be the one
+    that would have resulted from stepping only the accepted prefix. This walks the same tokens one at a
+    time to build that expectation, and asserts the verify step's committed state equals it — including
+    accepted=0, which must leave both states untouched.
+
+    Without this, a rejected suffix leaves the recurrent state ahead of the sequence and every later
+    token is conditioned on tokens the model never emitted. There is no error; the output is fluent.
+    """
+    module, config = _hf_gated_delta_net(seed=14)
+    torch.manual_seed(15)
+    prefill_len, proposed = 32, 3
+    hidden = torch.randn(1, prefill_len + proposed, _TEST_HIDDEN)
+    weights = _weights_from_hf(module)
+    with torch.no_grad():
+        _, state, conv_state = gated_delta_net_prefill(
+            hidden[:, :prefill_len], weights, _TEST_DIMS, config.rms_norm_eps,
+            chunk_size=DEFAULT_CHUNK_SIZE)
+
+        expected_state, expected_conv = state, conv_state
+        for step in range(accepted):
+            token = hidden[:, prefill_len + step:prefill_len + step + 1]
+            _, expected_state, expected_conv = gated_delta_net_decode(
+                token, weights, _TEST_DIMS, config.rms_norm_eps,
+                conv_state=expected_conv, recurrent_state=expected_state)
+
+        outputs, committed_state, committed_conv = gated_delta_net_verify(
+            hidden[:, prefill_len:], weights, _TEST_DIMS, config.rms_norm_eps,
+            conv_state=conv_state, recurrent_state=state,
+            accepted=torch.tensor(accepted, dtype=torch.int64))
+
+    assert outputs.shape[1] == proposed, outputs.shape
+    assert torch.equal(committed_state, expected_state), \
+        (committed_state - expected_state).abs().max()
+    assert torch.equal(committed_conv, expected_conv), \
+        (committed_conv - expected_conv).abs().max()
+
+
+@requires_hf_modules
+def test_verify_outputs_match_the_reference_for_every_proposed_token():
+    """Every proposed token needs its own output, because that is what the acceptance test compares.
+
+    Committing the right state is not enough: the verifier decides how many tokens to accept from these
+    outputs, so an output that is right only for the first proposed token would make the acceptance
+    decision itself wrong.
+    """
+    module, config = _hf_gated_delta_net(seed=16)
+    torch.manual_seed(17)
+    prefill_len, proposed = 32, 4
+    hidden = torch.randn(1, prefill_len + proposed, _TEST_HIDDEN)
+    weights = _weights_from_hf(module)
+    with torch.no_grad():
+        reference = module(hidden_states=hidden, cache_params=None, attention_mask=None)
+        _, state, conv_state = gated_delta_net_prefill(
+            hidden[:, :prefill_len], weights, _TEST_DIMS, config.rms_norm_eps,
+            chunk_size=DEFAULT_CHUNK_SIZE)
+        outputs, _, _ = gated_delta_net_verify(
+            hidden[:, prefill_len:], weights, _TEST_DIMS, config.rms_norm_eps,
+            conv_state=conv_state, recurrent_state=state,
+            accepted=torch.tensor(proposed, dtype=torch.int64))
+    assert torch.allclose(outputs, reference[:, prefill_len:], atol=1e-4), \
+        (outputs - reference[:, prefill_len:]).abs().max()
+
+
+def test_verify_selection_stays_graph_static():
+    """The acceptance count is a tensor, so the selection must not become a branch or an index.
+
+    ``fullgraph=True`` is the plugin's setting, so a graph break here is a failure rather than a
+    fallback. Compiling with two different acceptance counts and checking both results also confirms the
+    same traced graph serves every count — which is the point of using masks.
+    """
+    torch.manual_seed(18)
+    candidates = [torch.randn(2, 3) for _ in range(4)]
+    select = torch.compile(_gdn._select_candidate, fullgraph=True)
+    for index in range(4):
+        picked = select(candidates, torch.tensor(index, dtype=torch.int64))
+        assert torch.equal(picked, candidates[index]), index
 
 
 @requires_hf_modules

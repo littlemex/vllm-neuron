@@ -352,6 +352,76 @@ def gated_delta_net_decode(hidden_states, weights, dims, eps, conv_state, recurr
     return normed @ weights["out_proj"], state, new_conv_state
 
 
+def gated_delta_net_verify(hidden_states, weights, dims, eps, conv_state, recurrent_state,
+                           accepted, is_continuation=None):
+    """Advance the state by a VARIABLE number of tokens, chosen at runtime.
+
+    This is what speculative decoding needs and what the one-token step cannot give. A verify step is
+    handed ``k`` proposed tokens, computes an output for every one of them, and then learns how many
+    were accepted — a number that is only known after the outputs have been compared, i.e. after the
+    state has already been advanced past the rejected ones.
+
+    The way out is that the intermediate states are already being computed. Stepping the ``k`` tokens
+    produces ``k`` successive states; keeping all of them, together with the incoming state as the
+    zero-accepted case, gives ``k + 1`` candidates. ``accepted`` then selects one.
+
+    Two properties make the selection safe in a compiled graph:
+
+    - ``k`` is a Python integer taken from the tensor's static shape, so the loop unrolls at trace time
+    - ``accepted`` is a TENSOR, and it is applied as a sum of ``{0, 1}`` masks rather than as an index.
+      Indexing by a runtime value would either split the graph or read out of bounds
+
+    Args:
+        hidden_states: ``[1, k, hidden]`` — the proposed tokens, in order.
+        accepted: scalar tensor in ``[0, k]``. ``0`` leaves both states exactly as they came in.
+        is_continuation: as in ``gated_delta_net_decode``; zeroes the carried states for the first
+            token of a sequence.
+
+    Returns ``(outputs, recurrent_state, conv_state)`` with outputs ``[1, k, hidden]`` for every
+    proposed token — the caller needs all of them to decide what to accept.
+    """
+    tokens = hidden_states.shape[1]
+    if tokens < 1:
+        raise ValueError(f"a verify step needs at least one proposed token; got {tokens}.")
+
+    if is_continuation is not None:
+        # Once, before the first token. Tensor arithmetic, not a Python branch (see the decode step).
+        conv_state = conv_state * is_continuation.to(conv_state.dtype)
+        recurrent_state = recurrent_state * is_continuation.to(recurrent_state.dtype)
+
+    # Candidate j is the state after accepting j tokens. Candidate 0 is what came in.
+    recurrent_candidates = [recurrent_state]
+    conv_candidates = [conv_state]
+    outputs = []
+    for index in range(tokens):
+        step_out, next_recurrent, next_conv = gated_delta_net_decode(
+            hidden_states[:, index:index + 1], weights, dims, eps,
+            conv_candidates[-1], recurrent_candidates[-1], is_continuation=None)
+        outputs.append(step_out)
+        recurrent_candidates.append(next_recurrent)
+        conv_candidates.append(next_conv)
+
+    committed_recurrent = _select_candidate(recurrent_candidates, accepted)
+    committed_conv = _select_candidate(conv_candidates, accepted)
+    return torch.cat(outputs, dim=1), committed_recurrent, committed_conv
+
+
+def _select_candidate(candidates, accepted):
+    """Pick ``candidates[accepted]`` with arithmetic, where ``accepted`` is a tensor.
+
+    A weighted sum over one-hot masks. The masks are exclusive and sum to one, so exactly one candidate
+    survives; no branch and no data-dependent index appears in the graph. The comparison is done in
+    int64 and the mask cast to each candidate's dtype, so a bf16 state is not routed through a float
+    comparison.
+    """
+    total = None
+    for index, candidate in enumerate(candidates):
+        keep = (accepted == index).to(candidate.dtype)
+        term = candidate * keep
+        total = term if total is None else total + term
+    return total
+
+
 def _split_and_expand(conv_out, tokens, dims, key_dim, value_dim):
     """Split the post-conv projection into per-head q/k/v and expand q/k to the value head count.
 
