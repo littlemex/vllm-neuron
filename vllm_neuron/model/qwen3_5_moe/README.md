@@ -151,7 +151,7 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
 
 | Variable | Default | Effect |
 |---|---|---|
-| `QWEN3_5_MOE_GDN_CHUNK` | 64 | Chunk width for the Gated DeltaNet prefill scan. A tiling choice only — the result is independent of it (pinned by `test_chunk_size_does_not_change_the_result`), so it can be retuned for compile time. |
+| `QWEN3_5_MOE_GDN_CHUNK` | 64 | Chunk width for the Gated DeltaNet prefill scan. A tiling choice only — the result is independent of it (pinned by `test_chunk_size_does_not_change_the_result`). **Measured: there is nothing to gain here.** At a 2048 prefill bucket, 32 gives TTFT 0.394 s against 0.376 s at the default 64, and 128 and 256 do not compile at all (`neuronx-cc compilation failed with 70`). The default sits just under the compiler's ceiling. |
 
 On a `trn2.3xlarge` (a single EFA card) set `NEURON_SKIP_EFA_AFFINITY=1`: the Neuron EFA-affinity
 probe expects a co-located EFA under each NeuronCore's PCI path, which only holds on multi-card
@@ -304,22 +304,52 @@ width**: the 2048 bucket is 3x faster than the 1024 bucket and 5.5x more efficie
 not a "last bucket is special" effect — recompiling with `max_model_len` 1024, so that 1024 is the
 last bucket, still gives 1.119 s. Only the 2048 shape lands on the efficient kernel.
 
-The practical consequence is that a fine ladder of prefill buckets is not automatically better here:
-short requests do get cheaper (128 costs 42% of 2048), but anything landing in 512 or 1024 is slower
-than it would have been in a single 2048-wide bucket.
+Read that as advice and it says something specific: **the 512 and 1024 buckets are worse than the
+2048 bucket they exist to avoid.** A request landing in them pays more than if it had been padded all
+the way. So the bucket set to use is the ladder with that middle removed.
 
-Decode is 8.1-9.2 ms per token (109-124 tok/s). Narrowing the decode context buckets to the actual
-context is worth about 8% (8.1-8.8 ms against 9.1-9.2 ms with a single `max_model_len`-wide bucket),
-so the KV gather does track the bucket, but weight reading dominates.
+| Prompt | `[128, 512, 1024, 2048]` | `[128, 2048]` | |
+|---|---|---|---|
+| 100 | 0.157 s | 0.157 s | unchanged |
+| 512 | 0.507 s | 0.373 s | **1.36x** |
+| 1024 | 1.115 s | 0.374 s | **2.98x** |
+
+TPOT is 9.2 ms in every cell, so this is TTFT only and costs nothing elsewhere. Back to back at a
+512-token prompt and 32 output tokens, that carries through to throughput: **1.512 requests/s against
+1.258, and 48.4 output tok/s against 40.2 — 20% either way.** The serving path is not what limits
+this: measured request throughput is within 0.6-1.1 ms per request of the ideal implied by TTFT and
+TPOT, so scheduling, detokenisation and the Python round trip are together under 0.2% of a request.
+
+Two cautions on the prefill tok/s figure. It differs by 4x depending on what is counted: at a
+512-token prompt in a 2048 bucket it is 5461 tok/s counting the bucket and 1365 tok/s counting the
+prompt. And there is no batched throughput here at all, since `max_num_seqs` is 1 by construction —
+these are single-stream numbers and multiplying them by a concurrency is wrong.
+
+Decode is 9.2 ms per token (about 109 tok/s). **Narrowing the decode context buckets is not worth
+anything measurable**: with the prefill bucket, prompt and generation length all held fixed, a
+`[128, 512, 1024]` context ladder gives 9.1 ms against 9.2 ms for the single `max_model_len`-wide
+bucket. An earlier reading of "about 8%" here was an artefact of comparing runs with different
+generation lengths, which biases TPOT because it is derived as `(total - TTFT) / (n - 1)`. Weight
+reading dominates decode, and the KV gather is not where the time goes.
 
 Adding the logprobs gather (see below) changed neither number: 0.375 s / 9.2 ms against 0.376 s /
 9.2 ms without it.
+
+The example's default bucket set follows from this: `[128, 2048]`, not a power-of-two ladder.
 
 Compilation and loading, for planning device time: loading the 72 GB checkpoint from the shared
 filesystem cold takes about 16 minutes; compiling one 2048 prefill bucket about 12 minutes; four
 prefill buckets plus three decode context buckets about 20 minutes. With a warm compile cache a
 rebuild is 2-5 minutes. The cache lives under `~/.cache/vllm/neuron`, not at
 `NEURON_COMPILE_CACHE_URL`, so it does not survive a container that keeps only that path.
+
+**A failed compile poisons that cache.** After `QWEN3_5_MOE_GDN_CHUNK=128` failed with
+`[NCC_ITRF901] TritiumFusion assertion error: Unexpected remat axes`, every subsequent configuration
+failed the same way — including ones that had compiled and run minutes earlier, and including a
+`max_model_len` of 512 whose graph is unrelated in size. Removing `~/.cache/vllm/neuron` restored it,
+and the reconstructed measurement matched the pre-poisoning one (0.510 s against 0.509 s at a 512
+bucket). So: if a configuration that worked stops compiling, suspect the cache before the model, and
+run limit-finding experiments after the measurements you actually want.
 
 ## Logprobs
 
