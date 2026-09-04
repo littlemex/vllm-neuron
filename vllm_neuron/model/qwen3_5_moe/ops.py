@@ -101,15 +101,26 @@ def mrope_tables(positions, rotary_dim, theta, mrope_section, dtype=torch.float3
 
 
 def temporal_axis(positions):
-    """The one monotone position per token, whether positions arrive as ``[3, T]`` or ``[T]``.
+    """The temporal axis of the MRoPE positions, whether they arrive as ``[3, T]`` or ``[T]``.
 
-    MRoPE positions carry three axes. Only the FIRST is monotone: height and width run over an image's
-    grid and go backwards at the start of each row. The KV cache slot, the attention mask and the
-    recurrent layers' fresh-request test all need a monotone position, so they take this one — using
-    height or width for any of them would place tokens out of order without any error.
+    This is the axis to take when one position per token is wanted, but **it is not a monotone token
+    index and must not be used as one.** Within an image span the reference position builder emits
+    ``np.indices((1, h, w))``, so the temporal axis is CONSTANT across the whole image while height and
+    width vary. Height then repeats per row and width goes backwards at each new row, so no axis is a
+    per-token index inside an image; the three only advance together again after the span.
 
-    Returned as int32 because that is what the attention metadata and the cache indexing expect; the
-    rotary takes the un-narrowed positions separately.
+    What consumes this in this model is narrow enough for that to be safe, and the narrowness is the
+    reason rather than a coincidence:
+
+    * prefill does not read it at all -- the attention's prefill path takes the rotary tables and the
+      attention metadata, and the KV slot comes from ``slot_mapping``, not from a position
+    * decode reads it for one token, in the causal mask (``context_index <= position``), and a decode
+      step is always past the image, where the three axes have advanced together
+    * the recurrent layers' fresh-request test reads only whether the FIRST position is zero
+
+    Anything new that needs a monotone per-token index has to derive it elsewhere. Returned as int32
+    because that is what the attention metadata and the cache indexing expect; the rotary takes the
+    un-narrowed positions separately.
     """
     if positions.dim() == 2 and positions.shape[0] == 3:  # lint-port: ok dim and shape are graph-static, not tensor contents
         positions = positions[0]

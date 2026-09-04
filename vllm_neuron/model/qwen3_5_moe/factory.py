@@ -205,6 +205,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
     def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None = None,
                      text_neuron_config: NeuronConfig | None = None,
                      vision_neuron_config=None, **kwargs) -> nn.Module:
+        # The runner spells the text NeuronConfig either way depending on how it reached here, so the
+        # precedence is resolved HERE and nowhere else: the model's own from_configs would otherwise
+        # decide it a second time, and two places that pick between the same two arguments will
+        # eventually pick differently.
         neuron = neuron_config if neuron_config is not None else text_neuron_config
         return cls._select_multimodal(hf_config, neuron, vision_neuron_config)
 
@@ -256,12 +260,39 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
                 f"spatial_merge_size**2 ({merge}**2 = {merge ** 2}), so a block cannot be filled by "
                 "whole merge groups."
             )
+        # The packer refuses an item larger than one block, and the runner budgets in PIXELS. Nothing
+        # connects the two, so an image the front end admits can be killed at encode time. Reconcile
+        # them here: the factory is where deployment choices meet checkpoint facts.
+        max_pixels = cls._configured_max_pixels(hf_config)
+        if max_pixels is not None:
+            per_item = cls.get_max_pixels_token_count(hf_config, max_pixels)
+            if per_item > block_size:
+                raise ValueError(
+                    f"mm_processor_kwargs max_pixels={max_pixels} admits {per_item} patches per image, "
+                    f"but vision_attention_block_size={block_size} is the per-item ceiling (an item "
+                    "must fit in one block so its attention is complete). Lower max_pixels or raise "
+                    "the block size; leaving them inconsistent fails at the first large image instead."
+                )
         if any(bucket % block_size for bucket in buckets):
             raise ValueError(
                 f"every vision token bucket must be a multiple of the block size {block_size}; got "
                 f"{[b for b in buckets if b % block_size]}. A partial block at the end has no cache "
                 "block to be written into."
             )
+
+    @classmethod
+    def _configured_max_pixels(cls, hf_config: PretrainedConfig) -> int | None:
+        """The deployment's per-image pixel cap, if it set one.
+
+        Read through the vLLM config rather than from ``hf_config``: the cap is a serving choice that
+        arrives in ``mm_processor_kwargs``, not a property of the checkpoint.
+        """
+        from vllm.config import get_current_vllm_config
+
+        vllm_config = get_current_vllm_config()
+        multimodal = getattr(vllm_config.model_config, "multimodal_config", None)  # lint-port: ok absent on a text-only deployment, and its absence means no cap
+        kwargs = multimodal.mm_processor_kwargs if multimodal else None
+        return kwargs.get("max_pixels") if kwargs else None
 
     @classmethod
     def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:

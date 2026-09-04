@@ -98,10 +98,29 @@ def vision_blocks(grid_thw: torch.Tensor, block_size: int, buckets: list[int],
     """
     per_item = grid_thw.prod(dim=1).tolist()
     blocks_needed = sum(-(-int(tokens) // block_size) for tokens in per_item)
-    _bucket, num_blocks = select_vision_bucket(
+    bucket, _num_blocks = select_vision_bucket(
         max(int(sum(per_item)), blocks_needed * block_size), buckets, block_size, dp_size=dp_size
     )
-    return int(num_blocks)
+    return blocks_for_bucket(bucket, block_size, dp_size)
+
+
+def blocks_for_bucket(bucket: int, block_size: int, dp_size: int = 1) -> int:
+    """Blocks in the graph warmed for ``bucket``.
+
+    One conversion, used by both callers. The warmup is HANDED a bucket by the runner and must not
+    re-select one, and the serving path selects a bucket and must convert it the same way -- if the two
+    disagree the warmed graph has a shape the real path never produces, and the mismatch surfaces as a
+    load-time rejection at the first image, after the compile has been paid for.
+
+    The rounding up to a multiple of ``dp_size`` is the encoder's: it scatters whole blocks across its
+    data-parallel ranks and asserts divisibility.
+    """
+    if block_size <= 0:
+        raise ValueError(f"block_size must be positive; got {block_size}")
+    if dp_size <= 0:
+        raise ValueError(f"dp_size must be positive; got {dp_size}")
+    blocks = -(-bucket // block_size)
+    return -(-blocks // dp_size) * dp_size
 
 
 def build_vision_inputs(pixel_values: torch.Tensor, grid_thw: torch.Tensor, vision_config,
@@ -172,14 +191,30 @@ def cache_write_destinations(cache_block_map: list[list[int]], num_blocks: int,
     """Map each encoder output block to the cache block it writes into.
 
     Items own contiguous runs of encoder blocks in item order, so flattening the per-item cache block
-    ids in that order gives the 1:1 mapping. Encoder blocks beyond the real ones are aimed at the
-    scratch block: they must land *somewhere*, and a scratch destination is what keeps a padded block
-    from overwriting a live cache entry.
+    ids in that order gives the 1:1 mapping. That is not an assumption about the packer's output order:
+    ``_pack_one_item_per_block`` assigns blocks sequentially in item input order and says so, precisely
+    so this flattening works. (The First-Fit-*Decreasing* sort in ``ffd_pack_images`` applies only to the
+    shared-block path, which this port never takes.)
+
+    Encoder blocks beyond the real ones are aimed at the scratch block: they must land *somewhere*, and a
+    scratch destination is what keeps a padded block from overwriting a live cache entry.
+
+    The dtype is int64 because the encoder indexes its cache with it. This builder is the only place the
+    tensor is constructed for the real path; the runner builds its own for warmup, so if that one ever
+    disagrees the mismatch shows up at load rather than silently.
     """
     flat = [block for blocks in cache_block_map for block in blocks]
     if len(flat) > num_blocks:
         raise ValueError(
             f"the cache allocated {len(flat)} blocks but the graph takes {num_blocks}; the extra "
             "blocks would be dropped and their tokens read back as whatever the cache held."
+        )
+    if scratch_block_id in flat:
+        # A real destination equal to the scratch block would put a padded encoder block and a live one
+        # in the same place. Which of the two lands last is not defined, so the image would be encoded
+        # correctly and then partly overwritten with zeros -- readable output, wrong content.
+        raise ValueError(
+            f"the cache allocated block {scratch_block_id}, which is also the scratch block; a padded "
+            "encoder block and a real one would write to the same place."
         )
     return torch.tensor(flat + [scratch_block_id] * (num_blocks - len(flat)), dtype=torch.int64)

@@ -30,9 +30,10 @@ from vllm_neuron.model.qwen3_vl.vision_encoder_bf16 import Qwen3VLVisionModel
 
 from .config import Qwen3_5MoeMultimodalConfig
 from .layout import vision_checkpoint_mappings
-from .model_bf16 import Qwen3_5MoeForCausalLM
+from .model_bf16 import Qwen3_5MoeForCausalLM, resolve_text_neuron_config
 from .ops import temporal_axis
 from .vision_inputs import (
+    blocks_for_bucket,
     build_vision_inputs,
     cache_write_destinations,
     patch_dim,
@@ -55,9 +56,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
     @classmethod
     def from_configs(cls, hf_config, neuron_config=None, text_neuron_config=None,
                      vision_neuron_config=None, **kwargs):
-        neuron = neuron_config if neuron_config is not None else text_neuron_config
+        """Build both halves. The text NeuronConfig's two spellings are resolved by the shared helper,
+        which refuses a disagreement rather than ranking the two."""
         return cls(Qwen3_5MoeMultimodalConfig.from_configs(
-            hf_config, neuron, vision_neuron_config=vision_neuron_config))
+            hf_config, resolve_text_neuron_config(neuron_config, text_neuron_config),
+            vision_neuron_config=vision_neuron_config))
 
     # ------------------------------------------------------------------
     # Positions
@@ -90,6 +93,23 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
         would be a second source of truth, and the failure mode is a load-time rejection after the
         compile has already been paid for.
         """
+        # The runner's object is the authority and the attached one must agree with it. Picking one
+        # silently would let the warmup compile for a block size the serving path never uses, and the
+        # mismatch would surface as a load-time rejection at the first image.
+        attached = self.vision_config.neuron_config
+        if attached is not None and (
+                attached.vision_attention_block_size
+                != vision_neuron_config.vision_attention_block_size
+                or list(attached.num_vision_tokens_buckets or [])
+                != list(vision_neuron_config.num_vision_tokens_buckets or [])):
+            raise ValueError(
+                "the VisionNeuronConfig attached at construction disagrees with the one the runner "
+                f"passed for warmup: block size {attached.vision_attention_block_size} vs "
+                f"{vision_neuron_config.vision_attention_block_size}, buckets "
+                f"{attached.num_vision_tokens_buckets} vs "
+                f"{vision_neuron_config.num_vision_tokens_buckets}. The graph would be warmed for one "
+                "and fed by the other."
+            )
         block_size = vision_neuron_config.vision_attention_block_size
         merge = self.vision_config.spatial_merge_size
         # Synthetic items that fill the bucket, each exactly one block. The bucket is expressed as
@@ -100,12 +120,12 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
         # so `merge` by `block_size // merge` is a legal grid whenever block_size is divisible by
         # merge**2 — which the factory checks at construction, where the other block-size constraints
         # live. Searching for a legal side here would report a config error as a warmup failure.
-        items = max(1, -(-bucket // block_size))
+        # The bucket is the RUNNER's fact. Converting it is the only step here; re-selecting one from a
+        # synthetic token count would let this warm a different graph than the serving path builds for.
+        num_blocks = blocks_for_bucket(bucket, block_size, vision_neuron_config.dp_size)
+        items = num_blocks
         grid = torch.tensor([[1, merge, block_size // merge]] * items)
         pixels = torch.zeros(items * block_size, patch_dim(self.vision_config), dtype=torch.bfloat16)
-        num_blocks = vision_blocks(
-            grid, block_size, list(vision_neuron_config.num_vision_tokens_buckets),
-            dp_size=vision_neuron_config.dp_size)
         built = build_vision_inputs(pixels, grid, self.vision_config, block_size, num_blocks)
         return {name: tensor.to(device) for name, tensor in built.items()}
 
@@ -202,16 +222,27 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
         two-line override rather than a second forward: everything else — the embedding merge, the
         layers, the head, the sampler — is shared.
 
-        The temporal axis is the sequential one because it is the only monotone axis. Height and width
-        run over an image's grid and go backwards at each new row, so using either for the KV cache or
-        for the recurrent layers' fresh-request test would place tokens out of order.
+        The temporal axis is the sequential one because it is the only axis that is monotone OUTSIDE an
+        image span; inside one it is constant while height and width vary. That is safe here only because
+        of what reads it — see ``ops.temporal_axis``, which names the three consumers and why none of
+        them needs a per-token index.
 
         A one-dimensional ``positions`` still means text, and it takes the text path: the runner sends
         the collapsed form when no multimodal features are present, and asking for three axes here would
         turn a text request into a shape error.
         """
-        three_axis = positions.dim() == 2 and positions.shape[0] == 3  # lint-port: ok dim and shape are graph-static, not tensor contents
-        return temporal_axis(positions), (positions if three_axis else None)
+        if positions.dim() == 1:  # lint-port: ok dim is graph-static, not tensor contents
+            # The runner's text convention. Taken as text rather than inferred as such.
+            return temporal_axis(positions), None
+        if positions.dim() != 2 or positions.shape[0] != 3:  # lint-port: ok dim and shape are graph-static, not tensor contents
+            # Refusing beats falling back to text. Treating an unrecognised shape as text is the
+            # dangerous direction: MRoPE positions read as a single axis place an image's tokens at
+            # positions that belong to the surrounding prose, which is not an error.
+            raise ValueError(
+                f"positions has shape {tuple(positions.shape)}; expected [T] for text or [3, T] for "
+                "MRoPE. An unrecognised shape is refused rather than read as text."
+            )
+        return temporal_axis(positions), positions
 
     def checkpoint_mappings(self, source, checkpoint_keys):
         """The text map plus the vision tower's, in one dict.

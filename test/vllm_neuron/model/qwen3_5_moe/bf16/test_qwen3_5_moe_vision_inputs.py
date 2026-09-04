@@ -346,3 +346,48 @@ def test_several_bucket_sized_items_get_one_block_each():
     high = built["bound_max"].reshape(num_blocks, -1)
     occupied = sum(1 for block in range(num_blocks) if (high[block] > low[block]).any())
     assert occupied == 3
+
+
+def test_cache_write_destinations_refuses_the_scratch_block_as_a_real_destination():
+    """A real destination equal to the scratch block puts a padded encoder block and a live one in the
+    same place; which lands last is undefined, so the image would be partly overwritten with zeros."""
+    with pytest.raises(ValueError, match="scratch block"):
+        vision_inputs.cache_write_destinations([[1, 0]], num_blocks=4, scratch_block_id=0)
+
+
+# ---------------------------------------------------------------------------
+# blocks_for_bucket: one conversion for the warmup and the serving path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bucket,block_size,dp,expected", [
+    (128, 128, 1, 1),
+    (1024, 128, 1, 8),
+    (1024, 1024, 1, 1),
+    (100, 128, 1, 1),      # a bucket smaller than a block still needs one
+    (1024, 128, 4, 8),     # already divisible by dp
+    (384, 128, 4, 4),      # 3 blocks rounded up to a multiple of dp
+])
+def test_blocks_for_bucket(bucket, block_size, dp, expected):
+    """The warmup is handed a bucket and must convert it; the serving path selects one and must convert
+    it the same way. A second conversion is how the warmed graph ends up with a shape the real path never
+    produces -- which surfaces as a load-time rejection at the first image, after the compile is paid."""
+    assert vision_inputs.blocks_for_bucket(bucket, block_size, dp) == expected
+
+
+def test_blocks_for_bucket_refuses_nonsense_divisors():
+    for block_size, dp in ((0, 1), (-1, 1), (128, 0)):
+        with pytest.raises(ValueError):
+            vision_inputs.blocks_for_bucket(1024, block_size, dp)
+
+
+def test_the_serving_path_and_the_bucket_conversion_agree():
+    """vision_blocks selects a bucket and converts it; converting the same bucket directly must give the
+    same count, or the two callers disagree about the graph's shape."""
+    merge = VISION_CONFIG.spatial_merge_size
+    grid = torch.tensor([[1, merge, BLOCK_SIZE // merge]] * 3)
+    buckets = [BLOCK_SIZE, BLOCK_SIZE * 2, BLOCK_SIZE * 4, BLOCK_SIZE * 8]
+    got = vision_inputs.vision_blocks(grid, BLOCK_SIZE, buckets)
+    # The bucket the selection lands on, converted directly.
+    chosen = next(b for b in buckets if b >= 3 * BLOCK_SIZE)
+    assert got == vision_inputs.blocks_for_bucket(chosen, BLOCK_SIZE, 1)

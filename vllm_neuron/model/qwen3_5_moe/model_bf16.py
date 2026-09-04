@@ -108,6 +108,27 @@ def _gdn_chunk_size():
     return chunk
 
 
+def resolve_text_neuron_config(neuron_config, text_neuron_config):
+    """The one text NeuronConfig, from the two spellings the runner may use.
+
+    Both names reach the model depending on how the architecture was entered, and the factory normally
+    resolves which applies before getting here. This exists so the choice has ONE implementation: two
+    places picking between the same two arguments is how they end up picking differently, and the symptom
+    would be a model built with the wrong bucket lists rather than an error.
+
+    Both supplied and disagreeing is refused rather than ranked. A precedence is a guess about which
+    caller was right, and the wrong guess produces a served model with someone else's configuration.
+    """
+    if (neuron_config is not None and text_neuron_config is not None
+            and neuron_config is not text_neuron_config):
+        raise ValueError(
+            "neuron_config and text_neuron_config were both supplied and are different objects; "
+            "which one applies is the caller's to decide, and ranking them here would serve a model "
+            "configured by the loser."
+        )
+    return neuron_config if neuron_config is not None else text_neuron_config
+
+
 class Qwen3_5MoeRMSNorm(nn.Module):
     """HF ``Qwen3_5MoeRMSNorm``: scales by ``1 + weight``, with weight stored as an offset from unity.
 
@@ -1129,10 +1150,10 @@ class Qwen3_5MoeForCausalLM(nn.Module):
     def from_configs(cls, hf_config, neuron_config=None, text_neuron_config=None,
                      vision_neuron_config=None, **kwargs):
         # The runner passes text_ and vision_neuron_config for a *ConditionalGeneration architecture
-        # whether or not the deployment wants images, so the vision config is accepted and ignored
+        # whether or not the deployment wants images, so the vision config is accepted and ignored here
         # (see the factory). Image and video input are kept out by declaring no multimodal interface.
-        neuron = neuron_config if neuron_config is not None else text_neuron_config
-        return cls(Qwen3_5MoeConfig.from_configs(hf_config, neuron))
+        return cls(Qwen3_5MoeConfig.from_configs(
+            hf_config, resolve_text_neuron_config(neuron_config, text_neuron_config)))
 
     def get_mrope_input_positions(self, input_tokens, mm_features):
         """The text-only degenerate case of MRoPE: all three axes carry the same position.
@@ -1190,7 +1211,10 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         For the text architecture the three agree (see ``get_mrope_input_positions``), so the first axis
         serves as the sequential one and the rotary needs no separate ids — returning None for them
         selects the cheaper table lookup. The multimodal subclass overrides this, because there the axes
-        differ and only the temporal one is monotone.
+        differ once an image is present.
+
+        The returned sequential axis is NOT a monotone per-token index when an image is present; see
+        ``ops.temporal_axis`` for why the two consumers in this model are unaffected.
         """
         return temporal_axis(positions), None
 

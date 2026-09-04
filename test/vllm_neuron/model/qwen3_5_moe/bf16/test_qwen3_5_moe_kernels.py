@@ -1617,16 +1617,28 @@ def test_temporal_axis_is_taken_and_narrowed():
     assert _ops.temporal_axis(torch.arange(4)).tolist() == [0, 1, 2, 3]
 
 
-def test_the_height_axis_is_not_monotone_so_it_cannot_be_the_sequential_one():
-    """States the reason the temporal axis is the one taken, rather than asserting the choice twice.
+def test_no_mrope_axis_is_a_per_token_index_inside_an_image():
+    """Pins the fact that makes ``temporal_axis``'s contract narrow, so the docstring cannot drift.
 
-    A 2x3 image's height axis is [0,0,0,1,1,1]: it repeats, so it cannot index a KV slot, and its width
-    axis [0,1,2,0,1,2] goes backwards at each row.
+    For an image the reference builder emits ``np.indices((1, h, w))``, so across a 2x3 image:
+
+        temporal [0,0,0,0,0,0]   constant
+        height   [0,0,0,1,1,1]   repeats
+        width    [0,1,2,0,1,2]   goes backwards at each row
+
+    **None of the three is a per-token index.** The temporal axis is still the right one to take, because
+    it is the only one that is monotone outside the span and because prefill never reads it -- but a
+    future consumer that needs a monotone index must not take it from here.
     """
-    height = torch.tensor([0, 0, 0, 1, 1, 1])
-    width = torch.tensor([0, 1, 2, 0, 1, 2])
-    assert not bool((height[1:] > height[:-1]).all())
-    assert not bool((width[1:] > width[:-1]).all())
+    temporal, height, width = (torch.tensor(a) for a in (
+        [0, 0, 0, 0, 0, 0], [0, 0, 0, 1, 1, 1], [0, 1, 2, 0, 1, 2]))
+    for axis, name in ((temporal, "temporal"), (height, "height"), (width, "width")):
+        assert not bool((axis[1:] > axis[:-1]).all()), f"{name} unexpectedly strictly increasing"
+    # The temporal axis is the only one that does not go BACKWARDS, which is why it survives being
+    # carried across the span boundary where all three resume together.
+    assert bool((temporal[1:] >= temporal[:-1]).all())
+    assert bool((height[1:] >= height[:-1]).all())
+    assert not bool((width[1:] >= width[:-1]).all())
 
 
 def test_three_axis_rotary_matches_the_table_when_the_axes_agree():
@@ -1723,3 +1735,27 @@ def test_no_text_weight_claims_the_vision_namespace():
     sources = [key for value in text.values()
                for key in ([value] if isinstance(value, str) else value)]
     assert not [key for key in sources if key.startswith("model.visual.")]
+
+
+def test_the_two_neuron_config_spellings_resolve_to_one_and_refuse_disagreement():
+    """Both names reach the model depending on how the architecture was entered. Ranking them would
+    serve a model configured by the loser, so a real disagreement is refused instead."""
+    model_bf16_source = os.path.join(_model_dir, "model_bf16.py")
+    with open(model_bf16_source) as handle:
+        source = handle.read()
+    # The module cannot be imported without the plugin, so the function is compiled on its own. That is
+    # enough: it takes two arguments and returns one, and touches nothing else.
+    namespace: dict = {}
+    start = source.index("def resolve_text_neuron_config(")
+    end = source.index("\nclass ", start)
+    exec(compile(source[start:end], model_bf16_source, "exec"), namespace)  # noqa: S102
+    resolve = namespace["resolve_text_neuron_config"]
+
+    sentinel = object()
+    assert resolve(sentinel, None) is sentinel
+    assert resolve(None, sentinel) is sentinel
+    assert resolve(None, None) is None
+    # The same object under both names is not a disagreement.
+    assert resolve(sentinel, sentinel) is sentinel
+    with pytest.raises(ValueError, match="both supplied"):
+        resolve(sentinel, object())
