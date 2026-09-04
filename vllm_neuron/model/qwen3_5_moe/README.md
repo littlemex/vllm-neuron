@@ -365,6 +365,70 @@ and the reconstructed measurement matched the pre-poisoning one (0.510 s against
 bucket). So: if a configuration that worked stops compiling, suspect the cache before the model, and
 run limit-finding experiments after the measurements you actually want.
 
+## Serving through the OpenAI-compatible server
+
+Verified on the same node, not just the offline `LLM` API:
+
+```
+vllm serve <checkpoint> --served-model-name qwen36 \
+  --tensor-parallel-size 4 --dtype bfloat16 --max-model-len 2048 \
+  --max-num-seqs 1 --max-num-batched-tokens 2048 --no-enable-prefix-caching \
+  --hf-overrides '{"architectures": ["Qwen3_5MoeForCausalLM"]}' \
+  --additional-config '{"neuron_config": {"num_batched_tokens_buckets": [128, 2048]},
+                        "vision_neuron_config": {"num_vision_tokens_buckets": [2048],
+                                                 "vision_attention_block_size": 2048}}'
+```
+
+`/v1/models`, `/v1/completions`, `/v1/chat/completions` (the checkpoint's chat template is picked up)
+and streaming all work. `--max-num-seqs 1` is not a tuning choice here — the factory refuses anything
+else, so a server started without it fails at construction rather than at the first concurrent request.
+
+## Multi-token verification (the groundwork for MTP)
+
+`gated_delta_net_verify` advances the recurrent and convolution state by a number of tokens that is only
+known at runtime. Speculative decoding needs this: the target is handed k proposed tokens, produces an
+output for each, and learns the accepted count only after those outputs have been compared — by which
+point a one-token-at-a-time state has already passed the rejected ones.
+
+The states it needs are already being computed. Stepping k tokens yields k successive states; with the
+incoming state as the zero-accepted case that is k + 1 candidates, and the accepted count selects one as
+a sum of `{0, 1}` masks. `k` comes from the tensor's static shape so the loop unrolls at trace time, and
+the count stays a tensor, so one traced graph serves every outcome.
+
+Tested for each accepted count from 0 to 3 against the state reached by stepping only that prefix, byte
+for byte, with 0 leaving both states untouched; for every proposed token's output against the reference;
+and for graph-staticness under `fullgraph=True`.
+
+**Speculative decoding is still refused.** This removes the reason it had to be, not the refusal: the
+draft head is not implemented, and it needs its own KV cache entry, its own attention metadata and the
+runner's draft calling convention. The failure this guards against is silent — a rejected suffix leaves
+the state ahead of the sequence and every later token is conditioned on tokens the model never emitted,
+with fluent output throughout.
+
+## Interleaved MRoPE
+
+The rotary path now has both forms. `rotary_tables` builds the single-axis table, exact for text because
+a text prompt makes the three MRoPE axes carry the same position. `mrope_tables` builds the real
+three-axis form for when they do not, with slot i taking height at `i % 3 == 1` and width at `i % 3 == 2`
+inside each axis's section (`[11, 11, 10]`, the default the reference applies when the config omits it,
+as this checkpoint does) and time everywhere else.
+
+The test that matters is that the two agree **bit for bit** where the axes agree. Without it, adding
+vision would put a second possible cause behind every text disagreement.
+
+## Vision: what is mapped and what is not
+
+`vision_checkpoint_mappings` covers all 333 `model.visual.*` keys, diffed against the real checkpoint
+index in both directions, and `Qwen3_5MoeVisionConfig` reads the tower's dimensions. With the decoder and
+the tower both mapped, the only unmapped source prefix left is `mtp` — 19 keys — which a test asserts.
+
+The tower itself is **not wired in and nothing multimodal runs.** The checkpoint's vision keys are
+identical to this repository's Qwen3-VL reference, so the encoder drops in unchanged; what remains is the
+runner's vision contract — the six host-side preprocessing tensors its `forward` takes (blocked
+`pixel_values`, bilinear position-embedding indices and weights, the vision rotary tables, per-block
+bounds) plus an `input_output_alias`ed encoder cache and the write-block mapping. The project's
+`docs/DESIGN-vision-mtp.md` has the details and the order to do them in.
+
 ## Logprobs
 
 Under on-device sampling the LM head returns this rank's vocabulary shard, so the full distribution
