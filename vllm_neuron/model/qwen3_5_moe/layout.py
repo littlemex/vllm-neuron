@@ -125,32 +125,30 @@ def shard_heads(tensor, rank, world_size):
 
 
 def vision_checkpoint_mappings(depth, source="model.visual"):
-    """Map the vision tower's parameters to their checkpoint keys.
+    """The vision tower's weight map, from the reference encoder's own generator.
 
-    The key names are identical to the plugin's Qwen3-VL reference implementation, which is why the
-    tower can reuse that encoder rather than needing a new one; only the dimensions differ. Kept
-    separate from ``checkpoint_mappings`` so a text-only deployment neither declares nor loads these.
+    This used to be written out here, and the destinations were wrong: the reference encoder declares
+    flat parameters (``blocks.0.attn.qkv_weight``) while the hand-written version named submodule paths
+    (``blocks.0.attn.qkv.weight``). The source keys matched the checkpoint exactly in both cases, so a
+    source-side diff could not see it — the same class of mistake the MTP map hit, and the reason its
+    test checks destinations too.
 
-    Every tensor here carries a bias, unlike the text side where only the norms have weights: the vision
-    blocks come from a ViT lineage that keeps biases on the projections.
+    Calling the generator removes the possibility. The encoder is reused unchanged, so its idea of its
+    own parameter names is the only one that can be right, and a rename upstream reaches this map
+    instead of silently loading nothing.
+
+    ``source`` is accepted for symmetry with the other maps but the reference generator fixes the
+    checkpoint prefix at ``model.visual``; a different prefix would need the map rewritten anyway.
     """
-    mappings: dict = {}
-    mappings["visual.patch_embed.proj.weight"] = f"{source}.patch_embed.proj.weight"
-    mappings["visual.patch_embed.proj.bias"] = f"{source}.patch_embed.proj.bias"
-    mappings["visual.pos_embed.weight"] = f"{source}.pos_embed.weight"
-    for index in range(depth):
-        src = f"{source}.blocks.{index}"
-        dst = f"visual.blocks.{index}"
-        for norm in ("norm1", "norm2"):
-            mappings[f"{dst}.{norm}.weight"] = f"{src}.{norm}.weight"
-            mappings[f"{dst}.{norm}.bias"] = f"{src}.{norm}.bias"
-        for projection in ("attn.qkv", "attn.proj", "mlp.linear_fc1", "mlp.linear_fc2"):
-            mappings[f"{dst}.{projection}.weight"] = f"{src}.{projection}.weight"
-            mappings[f"{dst}.{projection}.bias"] = f"{src}.{projection}.bias"
-    for part in ("norm", "linear_fc1", "linear_fc2"):
-        mappings[f"visual.merger.{part}.weight"] = f"{source}.merger.{part}.weight"
-        mappings[f"visual.merger.{part}.bias"] = f"{source}.merger.{part}.bias"
-    return mappings
+    if source != "model.visual":
+        raise ValueError(
+            f"the reference generator fixes the checkpoint prefix at model.visual; got {source!r}"
+        )
+    from vllm_neuron.model.qwen3_vl.vision_encoder_bf16 import Qwen3VLVisionModel
+
+    # Empty deepstack indexes: this checkpoint does not use per-layer visual injection, and the config
+    # class raises if a checkpoint asks for it.
+    return Qwen3VLVisionModel.build_weight_mappings(depth, [])
 
 
 def mtp_checkpoint_mappings(source="mtp"):

@@ -271,3 +271,30 @@ def test_mtp_head_fuses_three_attention_sources_into_one_destination():
     fused = mappings["self_attn.qkvg_proj_weight"]
     assert isinstance(fused, list) and len(fused) == 3
     assert [key.rsplit(".", 2)[-2] for key in fused] == ["q_proj", "k_proj", "v_proj"]
+
+def test_vision_destinations_are_the_reference_encoder_parameters():
+    """The direction that a source-side diff cannot see, for the vision tower.
+
+    The hand-written version of this map named submodule paths (``blocks.0.attn.qkv.weight``) where the
+    reference encoder declares flat parameters (``blocks.0.attn.qkv_weight``). Every source key matched
+    the checkpoint, so the source diff passed and nothing would have loaded. The map now comes from the
+    encoder's own generator, and this asserts that it does — that the destinations are exactly the
+    parameters the module registers.
+
+    Needs the plugin importable, so it skips where the encoder is not present.
+    """
+    try:
+        from vllm_neuron.model.qwen3_vl.vision_encoder_bf16 import Qwen3VLVisionModel
+    except Exception:
+        pytest.skip("the Qwen3-VL reference encoder is not importable here")
+
+    mappings = _layout.vision_checkpoint_mappings(27)
+    expected = set(Qwen3VLVisionModel.build_weight_mappings(27, []))
+    assert set(mappings) == expected, sorted(set(mappings) ^ expected)[:8]
+
+
+def test_vision_mappings_reject_a_different_checkpoint_prefix():
+    """The generator fixes the prefix, so asking for another one must fail loudly rather than return a
+    map that silently points at the wrong keys."""
+    with pytest.raises(ValueError, match="model.visual"):
+        _layout.vision_checkpoint_mappings(27, source="model.vision_tower")
