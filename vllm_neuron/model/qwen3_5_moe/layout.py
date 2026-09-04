@@ -124,6 +124,35 @@ def shard_heads(tensor, rank, world_size):
     return tensor[local_rank * width:(local_rank + 1) * width].contiguous()
 
 
+def vision_checkpoint_mappings(depth, source="model.visual"):
+    """Map the vision tower's parameters to their checkpoint keys.
+
+    The key names are identical to the plugin's Qwen3-VL reference implementation, which is why the
+    tower can reuse that encoder rather than needing a new one; only the dimensions differ. Kept
+    separate from ``checkpoint_mappings`` so a text-only deployment neither declares nor loads these.
+
+    Every tensor here carries a bias, unlike the text side where only the norms have weights: the vision
+    blocks come from a ViT lineage that keeps biases on the projections.
+    """
+    mappings: dict = {}
+    mappings["visual.patch_embed.proj.weight"] = f"{source}.patch_embed.proj.weight"
+    mappings["visual.patch_embed.proj.bias"] = f"{source}.patch_embed.proj.bias"
+    mappings["visual.pos_embed.weight"] = f"{source}.pos_embed.weight"
+    for index in range(depth):
+        src = f"{source}.blocks.{index}"
+        dst = f"visual.blocks.{index}"
+        for norm in ("norm1", "norm2"):
+            mappings[f"{dst}.{norm}.weight"] = f"{src}.{norm}.weight"
+            mappings[f"{dst}.{norm}.bias"] = f"{src}.{norm}.bias"
+        for projection in ("attn.qkv", "attn.proj", "mlp.linear_fc1", "mlp.linear_fc2"):
+            mappings[f"{dst}.{projection}.weight"] = f"{src}.{projection}.weight"
+            mappings[f"{dst}.{projection}.bias"] = f"{src}.{projection}.bias"
+    for part in ("norm", "linear_fc1", "linear_fc2"):
+        mappings[f"visual.merger.{part}.weight"] = f"{source}.merger.{part}.weight"
+        mappings[f"visual.merger.{part}.bias"] = f"{source}.merger.{part}.bias"
+    return mappings
+
+
 def checkpoint_mappings(layer_types, source, has_lm_head, tie_word_embeddings):
     """Map every parameter this implementation declares to its checkpoint key(s).
 

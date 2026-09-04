@@ -26,6 +26,50 @@ FULL_ATTENTION = "full_attention"
 
 
 @dataclass
+class Qwen3_5MoeVisionConfig:
+    """Configuration for the vision tower, read from the checkpoint's ``vision_config``.
+
+    Only the fields the tower needs are here. The defaults are the published
+    ``Qwen/Qwen3.6-35B-A3B`` values, and ``out_hidden_size`` matching the text ``hidden_size`` is what
+    lets the patch merger's output enter the token embedding stream directly, with no extra projection.
+    """
+
+    depth: int = 27
+    hidden_size: int = 1152
+    num_heads: int = 16
+    intermediate_size: int = 4304
+    in_channels: int = 3
+    patch_size: int = 16
+    spatial_merge_size: int = 2
+    temporal_patch_size: int = 2
+    out_hidden_size: int = 2048
+    num_position_embeddings: int = 2304
+    hidden_act: str = "gelu_pytorch_tanh"
+    # Empty in this checkpoint, which removes the reference implementation's per-layer injection path.
+    # A non-empty list means intermediate vision layers feed the text layers and would need that path.
+    deepstack_visual_indexes: list[int] = field(default_factory=list)
+    torch_dtype: torch.dtype = torch.bfloat16
+
+    @property
+    def head_dim(self) -> int:
+        return self.hidden_size // self.num_heads
+
+    def __post_init__(self) -> None:
+        if self.hidden_size % self.num_heads:
+            raise ValueError(
+                f"vision hidden_size={self.hidden_size} is not divisible by "
+                f"num_heads={self.num_heads}"
+            )
+        if self.deepstack_visual_indexes:
+            raise NotImplementedError(
+                "Qwen3.5-MoE on Neuron does not implement deepstack visual injection; this "
+                f"checkpoint asks for layers {self.deepstack_visual_indexes}. The published "
+                "Qwen3.6-35B-A3B checkpoint has an empty list, so this is a different checkpoint "
+                "than the one this implementation was written against."
+            )
+
+
+@dataclass
 class Qwen3_5MoeConfig:
     """Configuration for the Qwen3.5-MoE text backbone."""
 

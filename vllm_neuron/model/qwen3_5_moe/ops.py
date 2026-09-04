@@ -40,21 +40,63 @@ def gated_rmsnorm(x, gate, weight, eps, out_dtype):
     return (normed * F.silu(gate.float())).to(out_dtype)
 
 
-def rotary_tables(rotary_dim, max_position, theta, device=None, dtype=torch.float32):
-    """cos/sin tables for the PARTIAL rotary embedding, shape ``[max_position, rotary_dim]``.
+def rotary_inv_freq(rotary_dim, theta, device=None):
+    """The inverse frequencies for the PARTIAL rotary embedding, shape ``[rotary_dim // 2]``.
 
     ``rotary_dim`` is ``head_dim * partial_rotary_factor`` (64 of 256 here), so only the leading
     ``rotary_dim`` channels of q/k rotate.
+    """
+    return 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, device=device,
+                                         dtype=torch.float32) / rotary_dim))
+
+
+def rotary_tables(rotary_dim, max_position, theta, device=None, dtype=torch.float32):
+    """cos/sin tables for a SINGLE positional axis, shape ``[max_position, rotary_dim]``.
 
     A single axis is exact for text and only for text: the reference interleaves three positional axes,
     which for a text prompt all carry the same position, so the interleave reduces to this table. Image
-    or video input breaks that equality — it is not an approximation there, it is wrong.
+    or video input breaks that equality — it is not an approximation there, it is wrong. Use
+    ``mrope_tables`` when the three axes can differ.
     """
-    inv_freq = 1.0 / (theta ** (torch.arange(0, rotary_dim, 2, device=device,
-                                            dtype=torch.float32) / rotary_dim))
+    inv_freq = rotary_inv_freq(rotary_dim, theta, device=device)
     positions = torch.arange(max_position, device=device, dtype=torch.float32)
     freqs = torch.outer(positions, inv_freq)                     # [max_position, rotary_dim // 2]
     emb = torch.cat((freqs, freqs), dim=-1)                      # [max_position, rotary_dim]
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+
+
+def interleave_mrope(freqs, mrope_section):
+    """Interleave the three positional axes into one frequency vector.
+
+    ``freqs`` is ``[3, ..., rotary_dim // 2]`` (one plane per axis: time, height, width) and the result
+    is ``[..., rotary_dim // 2]``. Slot ``i`` takes the height axis when ``i % 3 == 1`` and the width
+    axis when ``i % 3 == 2``, in each case only while ``i`` is inside that axis's section
+    (``mrope_section[axis] * 3`` slots). Every other slot keeps the time axis, which is why a text
+    prompt — where all three axes carry the same position — collapses back to the single-axis table.
+
+    Written with ``torch.where`` rather than slice assignment: an in-place write into a traced tensor is
+    a mutation the graph has to model, and the mask form is what the reference uses for the same reason.
+    """
+    slots = freqs.shape[-1]
+    index = torch.arange(slots, device=freqs.device, dtype=torch.int64)
+    out = freqs[0]
+    for axis, offset in ((1, 1), (2, 2)):
+        inside = (index % 3 == offset) & (index < mrope_section[axis] * 3)
+        out = torch.where(inside, freqs[axis], out)
+    return out
+
+
+def mrope_tables(positions, rotary_dim, theta, mrope_section, dtype=torch.float32):
+    """cos/sin for THREE positional axes, from ``positions`` of shape ``[3, tokens]``.
+
+    Returns ``[tokens, rotary_dim]`` tables, ready for ``apply_partial_rotary``. The frequencies are
+    built in fp32 and cast at the end, matching the reference: the outer product of a position index
+    with an inverse frequency loses too much in bf16 at long positions.
+    """
+    inv_freq = rotary_inv_freq(rotary_dim, theta, device=positions.device)
+    freqs = positions.to(torch.float32).unsqueeze(-1) * inv_freq   # [3, tokens, rotary_dim // 2]
+    interleaved = interleave_mrope(freqs, mrope_section)           # [tokens, rotary_dim // 2]
+    emb = torch.cat((interleaved, interleaved), dim=-1)            # [tokens, rotary_dim]
     return emb.cos().to(dtype), emb.sin().to(dtype)
 
 

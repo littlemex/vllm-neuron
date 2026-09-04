@@ -62,6 +62,8 @@ gated_delta_net_decode = _gdn.gated_delta_net_decode
 rmsnorm = _ops.rmsnorm
 gated_rmsnorm = _ops.gated_rmsnorm
 rotary_tables = _ops.rotary_tables
+mrope_tables = _ops.mrope_tables
+interleave_mrope = _ops.interleave_mrope
 apply_partial_rotary = _ops.apply_partial_rotary
 gated_delta_projections = _ops.gated_delta_projections
 redirect_padded_slots = _ops.redirect_padded_slots
@@ -74,6 +76,7 @@ shard_rows_transposed = _layout.shard_rows_transposed
 shard_columns_transposed = _layout.shard_columns_transposed
 shard_heads = _layout.shard_heads
 checkpoint_mappings = _layout.checkpoint_mappings
+vision_checkpoint_mappings = _layout.vision_checkpoint_mappings
 Qwen3_5MoeConfig = _config.Qwen3_5MoeConfig
 
 
@@ -611,6 +614,140 @@ def test_rotary_tables_match_hf_for_text_only_positions():
     assert ref_cos.shape[-1] == rotary_dim, (ref_cos.shape, rotary_dim)
     assert torch.allclose(picked_cos, ref_cos.reshape(-1, rotary_dim), atol=1e-6)
     assert torch.allclose(picked_sin, ref_sin.reshape(-1, rotary_dim), atol=1e-6)
+
+
+def test_vision_mappings_cover_the_visual_tower_exactly():
+    """Both directions against the real checkpoint index, for the vision tower.
+
+    A key this implementation declares but the checkpoint lacks loads nothing; a key the checkpoint has
+    but this implementation does not declare is a tensor left at its initial value. Neither shows up as
+    an error — the first shows up as garbage, the second as a subtly wrong image embedding — so both
+    directions are asserted.
+
+    Opt-in like the text-side diff: set QWEN3_5_MOE_CHECKPOINT_INDEX to a real
+    model.safetensors.index.json.
+    """
+    index_path = os.environ.get("QWEN3_5_MOE_CHECKPOINT_INDEX")
+    if not index_path:
+        pytest.skip("set QWEN3_5_MOE_CHECKPOINT_INDEX to a model.safetensors.index.json")
+    with open(index_path) as handle:
+        keys = set(json.load(handle)["weight_map"])
+    visual = {key for key in keys if key.startswith("model.visual")}
+    if not visual:
+        pytest.skip("this checkpoint has no vision tower")
+
+    declared = set(vision_checkpoint_mappings(27).values())
+    assert not declared - visual, sorted(declared - visual)[:8]
+    assert not visual - declared, sorted(visual - declared)[:8]
+
+
+def test_only_the_mtp_head_is_left_unmapped_once_vision_is_added():
+    """The whole checkpoint, accounted for.
+
+    With the decoder and the vision tower both mapped, the only source keys left should be the
+    multi-token prediction head. This is the test that turns "out of scope" into a list of exactly one
+    thing, so that adding MTP later is a bounded job rather than a search.
+    """
+    index_path = os.environ.get("QWEN3_5_MOE_CHECKPOINT_INDEX")
+    if not index_path:
+        pytest.skip("set QWEN3_5_MOE_CHECKPOINT_INDEX to a model.safetensors.index.json")
+    with open(index_path) as handle:
+        keys = set(json.load(handle)["weight_map"])
+    if not any(key.startswith("model.visual") for key in keys):
+        pytest.skip("this checkpoint has no vision tower")
+
+    prefix = "model.language_model" if any(k.startswith("model.language_model") for k in keys) else "model"
+    layer_types = ["linear_attention" if (i + 1) % 4 else "full_attention" for i in range(40)]
+    text = checkpoint_mappings(layer_types, prefix, has_lm_head=True, tie_word_embeddings=False)
+    consumed = set()
+    for value in list(text.values()) + list(vision_checkpoint_mappings(27).values()):
+        consumed.update(value if isinstance(value, list) else [value])
+
+    leftover = {key.split(".")[0] for key in keys - consumed}
+    assert leftover == {"mtp"}, sorted(keys - consumed)[:10]
+
+
+@requires_hf_modules
+def test_mrope_tables_reduce_to_the_single_axis_table_when_the_axes_agree():
+    """The regression condition for adding vision: text must not move by one bit.
+
+    The single-axis table is what the text-only path has been verified with on device. Introducing the
+    three-axis path is only safe if, for positions where the three axes carry the same value, it produces
+    the SAME tensor rather than a close one — otherwise every later text disagreement has two possible
+    causes.
+    """
+    config = _hf_text_config()
+    rotary_dim = int(config.head_dim * config.rope_parameters["partial_rotary_factor"])
+    theta = config.rope_parameters["rope_theta"]
+    section = config.rope_parameters.get("mrope_section", [11, 11, 10])
+
+    tokens = torch.arange(37, dtype=torch.int64)
+    single_cos, single_sin = rotary_tables(rotary_dim, 64, theta)
+    picked_cos = single_cos.index_select(0, tokens)
+    picked_sin = single_sin.index_select(0, tokens)
+
+    three_axes = tokens.unsqueeze(0).expand(3, tokens.shape[0])
+    mrope_cos, mrope_sin = mrope_tables(three_axes, rotary_dim, theta, section)
+
+    assert torch.equal(mrope_cos, picked_cos), (mrope_cos - picked_cos).abs().max()
+    assert torch.equal(mrope_sin, picked_sin), (mrope_sin - picked_sin).abs().max()
+
+
+@requires_hf_modules
+def test_mrope_tables_match_hf_when_the_axes_differ():
+    """The three-axis case, against the reference, with axes that actually disagree.
+
+    Equal axes cannot distinguish a correct interleave from one that ignores height and width, so the
+    positions here are deliberately different per axis — the shape an image span produces.
+    """
+    config = _hf_text_config()
+    reference = HF_MODELING.Qwen3_5MoeTextRotaryEmbedding(config)
+    rotary_dim = int(config.head_dim * config.rope_parameters["partial_rotary_factor"])
+    theta = config.rope_parameters["rope_theta"]
+    section = config.rope_parameters.get("mrope_section", [11, 11, 10])
+
+    length = 19
+    positions = torch.stack([
+        torch.arange(length),                    # time
+        torch.arange(length) // 4,               # height, as a 4-wide row would give
+        torch.arange(length) % 4,                # width
+    ]).to(torch.int64)
+
+    dummy = torch.zeros(1, length, config.hidden_size)
+    ref_cos, ref_sin = reference(dummy, positions.unsqueeze(1))
+    cos, sin = mrope_tables(positions, rotary_dim, theta, section)
+
+    assert ref_cos.shape[-1] == rotary_dim, (ref_cos.shape, rotary_dim)
+    assert torch.allclose(cos, ref_cos.reshape(-1, rotary_dim), atol=1e-6), \
+        (cos - ref_cos.reshape(-1, rotary_dim)).abs().max()
+    assert torch.allclose(sin, ref_sin.reshape(-1, rotary_dim), atol=1e-6), \
+        (sin - ref_sin.reshape(-1, rotary_dim)).abs().max()
+
+
+def test_interleave_mrope_puts_each_axis_where_the_section_says():
+    """The mask itself, independent of any frequency arithmetic.
+
+    Feeding one constant per axis makes the selection visible: slot i must hold the height constant when
+    i % 3 == 1 and i is inside height's section, the width constant under the same rule with offset 2,
+    and the time constant everywhere else.
+    """
+    section = [11, 11, 10]
+    slots = 128
+    freqs = torch.stack([
+        torch.full((slots,), 100.0),
+        torch.full((slots,), 200.0),
+        torch.full((slots,), 300.0),
+    ])
+    out = interleave_mrope(freqs, section)
+
+    for index in range(slots):
+        if index % 3 == 1 and index < section[1] * 3:
+            expected = 200.0
+        elif index % 3 == 2 and index < section[2] * 3:
+            expected = 300.0
+        else:
+            expected = 100.0
+        assert out[index].item() == expected, (index, out[index].item(), expected)
 
 
 @requires_hf_modules
