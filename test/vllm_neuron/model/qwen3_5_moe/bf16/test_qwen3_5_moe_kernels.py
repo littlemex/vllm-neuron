@@ -1884,3 +1884,67 @@ def test_two_slots_carry_two_independent_recurrences():
             assert torch.equal(want, got), (
                 f"sequence {sequence} step {step_index} differs once the two share the state; "
                 "one request is reading the other's history")
+
+
+# ---------------------------------------------------------------------------
+# The shared state-layer spec
+# ---------------------------------------------------------------------------
+
+
+def _kv_cache_module():
+    """``vllm_neuron/model/kv_cache.py``, loaded by path: it imports only torch, so the plugin (and a
+    device with it) stays out."""
+    import importlib.util as _util
+    # _model_dir is .../vllm_neuron/model/qwen3_5_moe; kv_cache.py sits one level up.
+    path = os.path.join(os.path.dirname(_model_dir), "kv_cache.py")
+    spec = _util.spec_from_file_location("_kv_cache_under_test", path)
+    module = _util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_state_layer_spec_refuses_a_shape_without_a_dtype():
+    """Each state tensor needs both; a mismatch allocates the wrong number of bytes, and the symptom is
+    a state that overlaps its neighbour rather than an error."""
+    kv_cache = _kv_cache_module()
+    with pytest.raises(ValueError, match="dtype"):
+        kv_cache.StateLayerSpec(name="a", shapes=((4, 3), (2,)), dtypes=(torch.float32,),
+                                state_kind="GDN_ATTN")
+
+
+def test_state_layer_spec_refuses_declaring_nothing():
+    kv_cache = _kv_cache_module()
+    with pytest.raises(ValueError, match="no state tensors"):
+        kv_cache.StateLayerSpec(name="a", shapes=(), dtypes=(), state_kind="GDN_ATTN")
+
+
+def test_state_layer_spec_refuses_a_degenerate_dimension():
+    kv_cache = _kv_cache_module()
+    with pytest.raises(ValueError, match="non-positive"):
+        kv_cache.StateLayerSpec(name="a", shapes=((4, 0),), dtypes=(torch.float32,),
+                                state_kind="GDN_ATTN")
+
+
+def test_kv_spec_refuses_a_name_claimed_twice():
+    """The cache is keyed by name across both kinds of layer, so a collision lets one entry shadow the
+    other -- a layer would then read another layer's state with no error."""
+    kv_cache = _kv_cache_module()
+    attention = kv_cache.LayerSpec(name="layers.0.x", num_kv_heads=2, head_size=8,
+                                   dtype=torch.bfloat16)
+    state = kv_cache.StateLayerSpec(name="layers.0.x", shapes=((4,),), dtypes=(torch.float32,),
+                                    state_kind="GDN_ATTN")
+    with pytest.raises(ValueError, match="duplicate layer name"):
+        kv_cache.KVSpec(layers=[attention], state_layers=[state])
+    # And the two kinds coexist happily under distinct names.
+    state = kv_cache.StateLayerSpec(name="layers.0.y", shapes=((4,),), dtypes=(torch.float32,),
+                                    state_kind="GDN_ATTN")
+    assert kv_cache.KVSpec(layers=[attention], state_layers=[state]).state_layers[0].name
+
+
+def test_kv_spec_still_works_for_a_model_that_declares_no_state():
+    """Every other model in the repository constructs KVSpec positionally with attention layers only."""
+    kv_cache = _kv_cache_module()
+    spec = kv_cache.KVSpec(layers=[
+        kv_cache.LayerSpec(name="layers.0.self_attn", num_kv_heads=2, head_size=8,
+                           dtype=torch.bfloat16)])
+    assert spec.state_layers == []

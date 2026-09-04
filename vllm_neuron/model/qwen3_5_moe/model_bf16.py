@@ -92,6 +92,27 @@ def attention_metadata_key(layer_idx: int) -> str:
     return f"layers.{layer_idx}.self_attn"
 
 
+def state_metadata_key(layer_idx: int) -> str:
+    """The name a Gated DeltaNet layer is known by when its state is pooled by the runner.
+
+    Distinct from the attention key for the same reason that one is defined once: the cache is keyed by
+    name, so a collision would let one layer's entry shadow another's.
+    """
+    return f"layers.{layer_idx}.linear_attn"
+
+
+def state_pool_requested(vllm_config) -> bool:
+    """Whether to ask the runner for a pooled state instead of carrying it in module buffers.
+
+    Opt-in, and deliberately not derived from ``max_num_seqs``. The runner's spec conversion and cache
+    allocation understand a state layer, but the metadata builders do not yet hand out a per-request
+    slot (see the project's docs/DESIGN-concurrency.md), so a deployment that asked for concurrency and
+    got a pool would run with every sequence writing slot 0. Until that is finished the pool has to be
+    something a caller asks for on purpose, so the verified single-sequence path stays the default.
+    """
+    return bool(os.environ.get("QWEN3_5_MOE_STATE_POOL") == "1" and vllm_config is not None)
+
+
 def _gdn_chunk_size():
     """Prefill chunk width, overridable for experiments via ``QWEN3_5_MOE_GDN_CHUNK``.
 
@@ -1171,6 +1192,11 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             from vllm_neuron.nn.sampler import Sampler
             self.sampler = Sampler(self.on_device_sampling_config,
                                    process_group=self.tp_group.device_group)
+        # Resolved once, at construction: get_kv_spec and bind_kv_cache have to agree about whether a
+        # pool exists, and reading the environment in both would let them disagree if it changed between
+        # the two calls.
+        from vllm.config import get_current_vllm_config
+        self._state_pool = state_pool_requested(get_current_vllm_config())
 
     @classmethod
     def from_configs(cls, hf_config, neuron_config=None, text_neuron_config=None,
@@ -1202,10 +1228,83 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         positions = torch.arange(length, dtype=torch.int64).unsqueeze(0).expand(3, length).contiguous()
         return positions, 0
 
+    def state_layer_specs(self):
+        """The Gated DeltaNet layers' state, for the runner to pool.
+
+        Two tensors per layer, in this order, and the order is the contract: the runner allocates them
+        from one page in the order given and hands them back as a list, so ``bind_state_cache`` checks
+        the shapes it receives rather than trusting the position.
+
+        Empty unless the pool was asked for, which keeps the verified single-sequence path unchanged.
+        """
+        from vllm_neuron.model.kv_cache import StateLayerSpec
+
+        specs = []
+        for index, layer in enumerate(self.model.decoder_layers):
+            if layer.layer_type != LINEAR_ATTENTION:
+                continue
+            mixer = layer.linear_attn
+            specs.append(StateLayerSpec(
+                name=state_metadata_key(index),
+                shapes=(
+                    (mixer.conv_dim_pr, mixer.conv_kernel_size - 1),
+                    (mixer.v_heads_pr, mixer.head_k_dim, mixer.head_v_dim),
+                ),
+                dtypes=(mixer.dtype, torch.float32),
+                # Gated DeltaNet, not Mamba2. Nothing on this platform resolves the name to a backend
+                # class, which is exactly why it must not be left at a default that happens to parse.
+                state_kind="GDN_ATTN",
+                # No speculative blocks: the decode path raises on a multi-token step, so there is never
+                # a draft whose state has to be held and rolled back.
+                num_speculative_blocks=0,
+            ))
+        return specs
+
+    def bind_state_cache(self, kv_caches):
+        """Point each mixer's state at the runner's pooled tensors.
+
+        The shapes are checked rather than the order trusted. Two tensors of different rank arriving the
+        wrong way round would fail loudly here; two of the same rank would not, and the conv and
+        recurrent states differ in rank, so this catches the realistic mistake.
+        """
+        for index, layer in enumerate(self.model.decoder_layers):
+            if layer.layer_type != LINEAR_ATTENTION:
+                continue
+            name = state_metadata_key(index)
+            if name not in kv_caches:
+                raise RuntimeError(f"state cache for {name} not initialized")
+            tensors = kv_caches[name]
+            if len(tensors) != 2:
+                raise RuntimeError(
+                    f"{name}: expected the conv and recurrent state, got {len(tensors)} tensor(s)"
+                )
+            mixer = layer.linear_attn
+            conv, recurrent = tensors
+            expected = (
+                (conv, 3, mixer.conv_state.shape[1:], "conv"),
+                (recurrent, 4, mixer.recurrent_state.shape[1:], "recurrent"),
+            )
+            for tensor, rank, tail, label in expected:
+                if tensor.dim() != rank or tuple(tensor.shape[1:]) != tuple(tail):
+                    raise RuntimeError(
+                        f"{name}: the {label} state arrived as {tuple(tensor.shape)}; expected "
+                        f"(slots, *{tuple(tail)}). The two states have different ranks, so this is what "
+                        "catches them arriving in the wrong order."
+                    )
+            if conv.shape[0] != recurrent.shape[0]:
+                raise RuntimeError(
+                    f"{name}: the two states were allocated {conv.shape[0]} and {recurrent.shape[0]} "
+                    "slots; they index by the same slot so the counts must agree."
+                )
+            mixer.conv_state = conv
+            mixer.recurrent_state = recurrent
+            mixer.num_slots = conv.shape[0]
+
     def get_kv_spec(self):
-        """Only the full_attention layers declare KV. The Gated DeltaNet state is not paged and is
-        deliberately absent here: the runner's LayerSpec has no representation for a recurrent state,
-        which is why it lives in module buffers instead."""
+        """The full_attention layers' KV, plus the Gated DeltaNet state when a pool was asked for.
+
+        Without the pool the recurrent state stays in module buffers, carried between graph calls by the
+        aliasing pass, and the deployment is capped at one sequence."""
         layers = []
         for i, layer in enumerate(self.model.decoder_layers):
             if layer.layer_type != FULL_ATTENTION:
@@ -1217,7 +1316,8 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 head_size=attention.head_dim, dtype=attention.dtype,
                 sliding_window_size=attention.window_size, chunk_size=None,
             ))
-        return KVSpec(layers=layers)
+        state_layers = self.state_layer_specs() if self._state_pool else []
+        return KVSpec(layers=layers, state_layers=state_layers)
 
     def bind_kv_cache(self, kv_caches):
         for i, layer in enumerate(self.model.decoder_layers):
@@ -1227,6 +1327,10 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             if name not in kv_caches:
                 raise RuntimeError(f"KV cache for {name} not initialized")
             layer.self_attn.bind_caches(kv_caches[name][0], kv_caches[name][1])
+        if self._state_pool:
+            # Only when the pool was declared. Binding unconditionally would raise for every deployment
+            # that never asked for it, since the runner would have allocated nothing.
+            self.bind_state_cache(kv_caches)
 
     def _positions(self, positions):
         """Split the runner's positions into the sequential axis and the rotary's position ids.

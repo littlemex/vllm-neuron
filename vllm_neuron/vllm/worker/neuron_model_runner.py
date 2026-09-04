@@ -29,10 +29,12 @@ from vllm.sampling_params import SamplingType
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm_neuron.utils.dtype_utils import kv_cache_dtype_str_to_dtype
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -7774,6 +7776,41 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            elif isinstance(kv_cache_spec, MambaSpec):
+                # One tensor per declared state, all carved out of the same raw buffer so a slot's
+                # states sit in one page. The strides follow upstream's GPU runner rather than being
+                # derived here: the page stride is the whole page, not the tensor's own first stride,
+                # because the next slot's copy of THIS state begins one page later, after the other
+                # states belonging to the same slot.
+                from vllm.utils.torch_utils import get_dtype_size
+
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                    num_slots = raw_tensor.numel() // kv_cache_spec.page_size_bytes
+
+                    state_tensors = []
+                    offset_bytes = 0
+                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                        dtype_size = get_dtype_size(dtype)
+                        elements_per_page = kv_cache_spec.page_size_bytes // dtype_size
+                        target_shape = (num_slots, *shape)
+                        inner_stride = torch.empty(target_shape).stride()
+                        assert offset_bytes % dtype_size == 0
+                        state_tensors.append(torch.as_strided(
+                            raw_tensor.view(dtype),
+                            size=target_shape,
+                            stride=(elements_per_page, *inner_stride[1:]),
+                            storage_offset=offset_bytes // dtype_size,
+                        ))
+                        offset_bytes += inner_stride[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+                    logger.info(
+                        "state cache for %s: %d slot(s), shapes %s",
+                        layer_name, num_slots, [tuple(t.shape) for t in state_tensors],
+                    )
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
@@ -7849,6 +7886,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        # Recurrent-state layers (Mamba, Gated DeltaNet, ...) are described by shapes rather than by a
+        # head count, so they get a MambaSpec. Without this the state has no pool and the model has to
+        # carry it in module buffers, which caps the deployment at one sequence.
+        #
+        # block_size is the state's page: one block per sequence. The hybrid KV cache manager hands each
+        # request a single block from this group (plus num_speculative_blocks when a draft is in flight),
+        # so the request's row in this group's block table IS the slot the model writes.
+        for state_layer in getattr(target_kv_spec, "state_layers", ()):  # lint-port: ok older models return a KVSpec without the field
+            all_kv_cache_specs[state_layer.name] = MambaSpec(
+                shapes=state_layer.shapes,
+                dtypes=state_layer.dtypes,
+                block_size=self.max_model_len,
+                # Looked up by name so a model declaring an unknown state family fails here rather
+                # than carrying a wrong label that nothing on this platform would resolve.
+                mamba_type=MambaAttentionBackendEnum[state_layer.state_kind],
+                mamba_cache_mode=self.vllm_config.cache_config.mamba_cache_mode,
+                num_speculative_blocks=state_layer.num_speculative_blocks,
+            )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
