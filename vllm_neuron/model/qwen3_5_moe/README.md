@@ -376,9 +376,13 @@ repository. Returning `None` there does not refuse `logprobs=N` — it makes the
 One caveat is outside this model: the runner's async-scheduling path returns the sampler output
 without logprobs regardless. `async_scheduling=False` is required to actually receive them.
 
-**Not verified:** contexts beyond 2048 (nothing wider was compiled), segmented prefill, any
-concurrency (there is none to have), and the vision and MTP paths (out of scope). `mypy` is not clean
-on these files, nor anywhere in this repository.
+The example was run at `max_model_len` 4096 with the bucket set this rule produces,
+`[128, 2048, 4096]`, and generates the same output as at 2048 — so the shipped configuration is the one
+that was measured, not an extrapolation from it.
+
+**Not verified:** contexts beyond 4096 (nothing wider was compiled), segmented prefill, any concurrency
+(there is none to have), and the vision and MTP paths (out of scope). `mypy` is not clean on these
+files, nor anywhere in this repository.
 
 ## Serving a multimodal checkpoint as the text backbone
 
