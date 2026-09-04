@@ -96,7 +96,7 @@ def _right_pad(t: torch.Tensor, pad: int, dim: int) -> torch.Tensor:
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=DEFAULT_CHUNK_SIZE,
-                           initial_state=None):
+                           initial_state=None, chunk_carry=None, return_chunk_states=False):
     """Chunked gated delta rule for prefill. Numerically equivalent to
     ``recurrent_gated_delta_rule`` and to HF ``torch_chunk_gated_delta_rule`` (fp32).
 
@@ -104,7 +104,15 @@ def chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=DEFAULT_CHUNK_
         query, key: ``[b, l, H, Dk]``   value: ``[b, l, H, Dv]``
         g, beta:    ``[b, l, H]``       g is the log decay (<= 0)
         initial_state: ``[b, H, Dk, Dv]`` or None
-    Returns ``(out[b, l, H, Dv], final_state[b, H, Dk, Dv])``, both fp32.
+    Returns ``(out[b, l, H, Dv], final_state[b, H, Dk, Dv])``, both fp32. With
+    ``return_chunk_states`` the third element is ``[b, T, H, Dk, Dv]``: the state after each chunk.
+
+    ``chunk_carry`` is ``[b, T]`` in {0, 1} and is what makes several requests packed into one row
+    correct: 0 says "this chunk begins a new request, so drop the state carried into it". A request
+    boundary that fell INSIDE a chunk could not be expressed this way -- the within-chunk coupling
+    (``pairwise_decay``) would still mix the two -- so boundaries must land on chunk edges, and the
+    caller is responsible for that. This is why the boundaries are given per chunk rather than per
+    token: a per-token form would look as though mid-chunk boundaries were supported.
 
     ``use_qk_l2norm_in_kernel=True`` is hardcoded: Qwen3.5-MoE always calls the kernels with it.
     """
@@ -164,17 +172,33 @@ def chunk_gated_delta_rule(query, key, value, g, beta, chunk_size=DEFAULT_CHUNK_
     else:
         state = initial_state.to(torch.float32)
 
+    if chunk_carry is not None:
+        # [b, T] -> [b, 1, 1, 1] per chunk when indexed, so it scales the whole carried state.
+        carry = chunk_carry.to(torch.float32).reshape(b, t_chunks)
+    else:
+        carry = None
+
     # Sequential pass over the T chunks. T = ceil(l / C) is small (l=512, C=64 -> T=8); this is a
     # loop over CHUNKS, not over the sequence, so it unrolls to a bounded graph.
     outputs = []
+    chunk_states: list[torch.Tensor] | None = [] if return_chunk_states else None
     for i in range(t_chunks):
+        if carry is not None:
+            # Dropped BEFORE the chunk reads it, so a chunk that starts a new request neither predicts
+            # from the previous request's state nor subtracts it out. Multiplying by a runtime {0,1}
+            # keeps this graph-static, the same reason `is_continuation` is arithmetic.
+            state = state * carry[:, i].reshape(b, 1, 1, 1)
         # The part of the chunk's target values the incoming state already predicts is subtracted
         # out, so only the correction is written to the state. This is the delta rule.
         v_new = new_values[:, :, i] - k_cumdecay[:, :, i] @ state          # [b, H, C, Dv]
         outputs.append(query[:, :, i] @ state + intra_chunk_attn[:, :, i] @ v_new)
         state = state * chunk_decay[:, :, i, None, None] + key[:, :, i].transpose(-1, -2) @ v_new
+        if chunk_states is not None:
+            chunk_states.append(state)
 
     out = torch.stack(outputs, dim=2).reshape(b, h, total, dv)[:, :, :l]
+    if chunk_states is not None:
+        return out.transpose(1, 2), state, torch.stack(chunk_states, dim=1)
     return out.transpose(1, 2), state
 
 
@@ -204,6 +228,7 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=None):
     else:
         state = initial_state.to(torch.float32)
 
+
     state = state * decay.exp()[..., None, None]
     kv_mem = (state * k[..., None]).sum(dim=-2)                             # [b, H, Dv]
     delta = (v - kv_mem) * bt[..., None]
@@ -212,9 +237,44 @@ def recurrent_gated_delta_rule(query, key, value, g, beta, initial_state=None):
     return out.unsqueeze(1), state
 
 
+def _masked_tap_conv1d(x_t, conv_weight, kernel_size, hist, segment_id):
+    """Depthwise causal conv as an explicit sum of taps, each masked to the token's own request.
+
+    Used only when several requests share the row. ``F.conv1d`` cannot express it: with a packed row it
+    reads across the boundary, and measurement puts the damage at exactly ``kernel_size - 1`` positions
+    of each following request -- wrong by order 1, not by rounding.
+
+    **This is NOT bit-identical to the F.conv1d path** (measured 4.8e-7 in fp32, from the accumulation
+    order). That is why the unsegmented path keeps ``F.conv1d``: its agreement with the reference is
+    pinned to the bit, and there is no such claim to preserve for the multi-request path.
+
+    ``segment_id`` is ``[seq]``, one request index per token. The left history belongs to no request, so
+    it is given a sentinel that matches nothing -- which is also what makes the first request's leading
+    positions see zeros rather than the carried state when there is no continuation.
+    """
+    k = kernel_size
+    seq = x_t.shape[-1]
+    padded = torch.cat([hist, x_t], dim=-1)
+    seg = segment_id.to(torch.float32).reshape(-1)
+    seg_padded = torch.cat([torch.full((k - 1,), -1.0, device=seg.device, dtype=seg.dtype), seg])
+    taps = conv_weight.reshape(-1, k)
+    out = torch.zeros_like(x_t)
+    for j in range(k):
+        window = padded[..., j:j + seq]
+        same = (seg_padded[j:j + seq] == seg).to(x_t.dtype)
+        out = out + taps[:, j].reshape(1, -1, 1) * window * same
+    return out
+
+
 def segmented_causal_conv1d(x_t, conv_weight, kernel_size, groups,
-                            conv_state=None, is_continuation=None, valid_len=None):
+                            conv_state=None, is_continuation=None, valid_len=None,
+                            segment_id=None):
     """Depthwise causal conv1d for (segmented) GDN prefill, with the history carry.
+
+    ``segment_id`` is ``[seq]`` and is a DIFFERENT axis from the "segmented" in this function's name:
+    the name means one sequence split across prefill steps, this means several requests packed into one
+    row. When it is given the convolution switches to a masked tap sum (see ``_masked_tap_conv1d``),
+    because ``F.conv1d`` reads across a request boundary.
 
     ``x_t`` is ``[b, conv_dim, seq]``; returns ``(out[b, conv_dim, seq], new_conv_state[b, conv_dim,
     kernel_size-1])``, the carried state being the last ``kernel_size-1`` RAW (pre-activation) inputs.
@@ -231,9 +291,13 @@ def segmented_causal_conv1d(x_t, conv_weight, kernel_size, groups,
     k = kernel_size
     if conv_state is None:
         hist = torch.zeros(*x_t.shape[:-1], k - 1, dtype=x_t.dtype, device=x_t.device)
-        out = F.conv1d(x_t, conv_weight, None, padding=k - 1, groups=groups)[..., :x_t.shape[-1]]
     else:
         hist = conv_state.to(x_t.dtype) * is_continuation.to(x_t.dtype)
+    if segment_id is not None:
+        out = _masked_tap_conv1d(x_t, conv_weight, k, hist, segment_id)
+    elif conv_state is None:
+        out = F.conv1d(x_t, conv_weight, None, padding=k - 1, groups=groups)[..., :x_t.shape[-1]]
+    else:
         out = F.conv1d(torch.cat([hist, x_t], dim=-1), conv_weight, None, groups=groups)
     full = torch.cat([hist, x_t], dim=-1)                                   # [b, conv_dim, K-1+seq]
     if valid_len is None:

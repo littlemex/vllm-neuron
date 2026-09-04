@@ -2106,3 +2106,117 @@ def test_several_requests_decoding_from_a_shared_pool_match_their_solo_runs():
     unused = ({0, 1, 2, 3} - {int(s) for s in holders}).pop()
     assert float(recurrent[unused].abs().sum()) == 0.0
     assert float(conv[unused].abs().sum()) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Stage B: several requests packed into one prefill row
+# ---------------------------------------------------------------------------
+
+
+def _scan_inputs(length, heads=4, dk=16, dv=16, seed=0):
+    generator = torch.Generator().manual_seed(seed)
+    return (torch.randn(1, length, heads, dk, generator=generator),
+            torch.randn(1, length, heads, dk, generator=generator),
+            torch.randn(1, length, heads, dv, generator=generator),
+            -torch.rand(1, length, heads, generator=generator) * 0.3,
+            torch.rand(1, length, heads, generator=generator))
+
+
+def test_the_prefill_scan_is_batch_general_over_the_request_axis():
+    """The counterpart of the decode measurement, and the reason stage B is a mask rather than a
+    rewrite: the scan already carries an independent state per row."""
+    rows = [_scan_inputs(48, seed=s) for s in (1, 2, 3)]
+    packed = [torch.cat(parts, dim=0) for parts in zip(*rows)]
+    with torch.no_grad():
+        out, state = chunk_gated_delta_rule(*packed, chunk_size=16)
+        for index, row in enumerate(rows):
+            out_1, state_1 = chunk_gated_delta_rule(*row, chunk_size=16)
+            assert torch.equal(out[index:index + 1], out_1), f"row {index} output differs when batched"
+            assert torch.equal(state[index:index + 1], state_1), f"row {index} state differs"
+
+
+def test_a_chunk_carry_of_all_ones_is_the_identity():
+    """The mask must not change anything when nothing is segmented, or every existing agreement with
+    the reference is at risk."""
+    parts = _scan_inputs(48, seed=5)
+    with torch.no_grad():
+        plain = chunk_gated_delta_rule(*parts, chunk_size=16)
+        masked = chunk_gated_delta_rule(*parts, chunk_size=16, chunk_carry=torch.ones(1, 3))
+    for got, want in zip(masked, plain):
+        assert torch.equal(got, want)
+
+
+def test_two_chunk_aligned_requests_packed_in_one_row_match_their_solo_runs():
+    """Stage B for the scan. Both requests are multiples of the chunk size, so the boundary lands on a
+    chunk edge and a per-chunk carry mask is enough -- a boundary inside a chunk could not be expressed
+    this way, because the within-chunk coupling would still mix the two."""
+    chunk = 16
+    first, second = 32, 16
+    a = _scan_inputs(first, seed=7)
+    b = _scan_inputs(second, seed=11)
+    packed = [torch.cat([x, y], dim=1) for x, y in zip(a, b)]
+    chunks = (first + second) // chunk
+    carry = torch.ones(1, chunks)
+    carry[0, first // chunk] = 0.0          # the second request starts here
+
+    with torch.no_grad():
+        out_a, state_a = chunk_gated_delta_rule(*a, chunk_size=chunk)
+        out_b, state_b = chunk_gated_delta_rule(*b, chunk_size=chunk)
+        out_p, state_p, per_chunk = chunk_gated_delta_rule(
+            *packed, chunk_size=chunk, chunk_carry=carry, return_chunk_states=True)
+
+    assert torch.equal(out_p[:, :first], out_a), "the first request's output changed"
+    assert torch.equal(out_p[:, first:], out_b), "the second request read the first one's state"
+    # Each request's final state is the per-chunk state at its last chunk.
+    assert torch.equal(per_chunk[:, first // chunk - 1], state_a)
+    assert torch.equal(state_p, state_b)
+    assert per_chunk.shape[1] == chunks
+
+
+def test_the_conv_reads_across_a_packed_boundary_and_the_masked_form_does_not():
+    """Both halves of the claim, because only the second is a fix and only the first justifies it.
+
+    F.conv1d over a packed row is wrong on exactly kernel_size - 1 positions of each following request,
+    and wrong by order 1 rather than by rounding. The masked tap sum agrees with the solo runs to the
+    accumulation-order difference and no more.
+    """
+    torch.manual_seed(17)
+    channels, kernel, first, second = 32, 4, 12, 12
+    weight = torch.randn(channels, 1, kernel)
+    packed = torch.randn(1, channels, first + second)
+    segment = torch.cat([torch.zeros(first), torch.ones(second)])
+
+    with torch.no_grad():
+        solo_a, _ = segmented_causal_conv1d(packed[..., :first], weight, kernel, channels)
+        solo_b, _ = segmented_causal_conv1d(packed[..., first:], weight, kernel, channels)
+        unmasked, _ = segmented_causal_conv1d(packed, weight, kernel, channels)
+        masked, _ = segmented_causal_conv1d(packed, weight, kernel, channels, segment_id=segment)
+
+    assert torch.equal(unmasked[..., :first], solo_a), "the first request should already be right"
+    damaged = ((unmasked[..., first:] - solo_b).abs().amax(dim=1) > 1e-6).sum().item()
+    assert damaged == kernel - 1, (
+        f"expected exactly {kernel - 1} damaged positions, got {damaged}; if this changes, the "
+        "reasoning about which positions need the mask no longer holds")
+    assert (unmasked[..., first:] - solo_b).abs().max() > 1.0, "the damage should be order 1"
+
+    # The masked form agrees with both solo runs. NOT bit-identical: the tap sum accumulates in a
+    # different order from F.conv1d, which is why the unsegmented path keeps F.conv1d.
+    assert (masked[..., :first] - solo_a).abs().max() < 1e-5
+    assert (masked[..., first:] - solo_b).abs().max() < 1e-5
+
+
+def test_the_masked_conv_is_not_claimed_to_be_bit_identical():
+    """Pins the caveat itself. If the tap sum ever became bit-identical the unsegmented path could be
+    dropped, and this test failing is how that would be noticed."""
+    torch.manual_seed(19)
+    channels, kernel, seq = 16, 4, 20
+    weight = torch.randn(channels, 1, kernel)
+    x = torch.randn(1, channels, seq)
+    one_request = torch.zeros(seq)
+    with torch.no_grad():
+        plain, _ = segmented_causal_conv1d(x, weight, kernel, channels)
+        tapped, _ = segmented_causal_conv1d(x, weight, kernel, channels, segment_id=one_request)
+    assert (plain - tapped).abs().max() < 1e-5, "the two forms must agree numerically"
+    assert not torch.equal(plain, tapped), (
+        "the two forms are now bit-identical; the unsegmented F.conv1d path exists only because they "
+        "were not, so it can be removed -- and this test should be replaced by that")
