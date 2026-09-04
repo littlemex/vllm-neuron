@@ -216,8 +216,18 @@ def slot_mask(slot, state: torch.Tensor, num_slots: int):
         raise ValueError(f"num_slots must be at least 1; got {num_slots}")
     if num_slots == 1:
         return None
+    wanted = torch.as_tensor(slot, device=state.device)
+    if wanted.numel() != 1:
+        # The runner supplies one slot per request in the step. A step carrying several requests needs
+        # the scan segmented per request, which is not implemented -- so this refuses rather than taking
+        # the first slot, which would run every request through one sequence's state and produce fluent
+        # output with the wrong history.
+        raise NotImplementedError(
+            f"got {wanted.numel()} slots for one step; the Gated DeltaNet scan handles one sequence at "
+            "a time, so a multi-request step is not supported yet (see docs/DESIGN-concurrency.md)."
+        )
     index = torch.arange(num_slots, device=state.device)
-    mask = (index == torch.as_tensor(slot, device=state.device).reshape(()).to(index.dtype))
+    mask = (index == wanted.reshape(()).to(index.dtype))
     return mask.to(state.dtype).reshape((num_slots,) + (1,) * (state.dim() - 1))
 
 
@@ -241,3 +251,45 @@ def write_state_slot(state: torch.Tensor, updated: torch.Tensor, slot, num_slots
         state.copy_(updated.to(state.dtype))
         return
     state.copy_(state * (1 - mask) + updated.to(state.dtype) * mask)
+
+
+def slots_onehot(slots, num_slots: int, dtype: torch.dtype, device) -> torch.Tensor:
+    """``[requests, num_slots]``, one row per request with a single 1 at its slot.
+
+    The batched counterpart of ``slot_mask``, and the same reason for existing: a gather by a runtime
+    index does not reliably trace, so the gather is written as a matrix product.
+    """
+    if num_slots < 1:
+        raise ValueError(f"num_slots must be at least 1; got {num_slots}")
+    wanted = torch.as_tensor(slots, device=device).reshape(-1)
+    index = torch.arange(num_slots, device=device)
+    return (wanted.unsqueeze(1).to(index.dtype) == index.unsqueeze(0)).to(dtype)
+
+
+def read_state_slots(state: torch.Tensor, slots, num_slots: int) -> torch.Tensor:
+    """The rows of ``state`` named by ``slots``, as ``[requests, *state.shape[1:]]``.
+
+    Written as ``onehot @ flattened`` rather than ``state[slots]``. Same trade as the single-slot form:
+    a matrix product against a one-hot costs ``requests x num_slots`` multiplies and traces, where the
+    index does not.
+    """
+    onehot = slots_onehot(slots, num_slots, state.dtype, state.device)
+    gathered = onehot @ state.reshape(num_slots, -1)
+    return gathered.reshape((onehot.shape[0],) + tuple(state.shape[1:]))
+
+
+def write_state_slots(state: torch.Tensor, updated: torch.Tensor, slots, num_slots: int) -> None:
+    """Write one row of ``updated`` into each slot named by ``slots``, in place.
+
+    Slots not named keep their value, by arithmetic rather than by writing less -- the ``copy_`` target
+    stays the whole buffer so the aliasing pass sees what it sees for the single-slot form.
+
+    **The slots must be distinct.** The scatter is a transposed one-hot product, so a slot named twice
+    receives the SUM of both rows rather than the last one. The runner allocates one block per request
+    from this group, so duplicates cannot arise there; checking it here would need a data-dependent
+    comparison, which is the thing this whole construction avoids.
+    """
+    onehot = slots_onehot(slots, num_slots, state.dtype, state.device)
+    written = (onehot.t() @ updated.reshape(onehot.shape[0], -1)).reshape(state.shape)
+    touched = onehot.sum(dim=0).reshape((num_slots,) + (1,) * (state.dim() - 1))
+    state.copy_(state * (1 - touched) + written)

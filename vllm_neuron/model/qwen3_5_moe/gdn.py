@@ -305,7 +305,8 @@ def gated_delta_net_decode(hidden_states, weights, dims, eps, conv_state, recurr
                            is_continuation=None):
     """The one-token Gated DeltaNet step. Same contract as ``gated_delta_net_prefill``.
 
-    ``is_continuation`` is a runtime {0,1} scalar, zero when this token is the FIRST of its sequence,
+    ``is_continuation`` is a runtime {0,1} value -- a scalar for a single request, or one entry per
+    request for a batched step -- zero when that request's token is the FIRST of its sequence,
     in which case both carried states are zeroed. TRAP: a one-token prompt has ``max_query_len == 1``
     and so cannot be told apart from a decode step by token count, and without this mask it would
     continue from the previous request's state and every layer would return plausible nonsense. It
@@ -335,8 +336,19 @@ def gated_delta_net_decode(hidden_states, weights, dims, eps, conv_state, recurr
 
     if is_continuation is not None:
         # Tensor arithmetic, not a Python branch on a runtime value: this must stay graph-static.
-        conv_state = conv_state * is_continuation.to(conv_state.dtype)
-        recurrent_state = recurrent_state * is_continuation.to(recurrent_state.dtype)
+        #
+        # Reshaped to lead rather than broadcast from the right. A scalar broadcasts against anything,
+        # but a PER-REQUEST flag is [requests] and the states are [requests, ...]: aligning from the
+        # right would multiply the last axis by it, or fail, depending on the widths. Leading-axis
+        # broadcast is what "one flag per request" means, so it is written out.
+        def _per_request(flag, state):
+            flag = flag.to(state.dtype)
+            if flag.dim() == 0:
+                return flag
+            return flag.reshape((-1,) + (1,) * (state.dim() - 1))
+
+        conv_state = conv_state * _per_request(is_continuation, conv_state)
+        recurrent_state = recurrent_state * _per_request(is_continuation, recurrent_state)
     conv_in = torch.cat([conv_state.to(mixed.dtype), mixed], dim=-1)     # [1, conv_dim, K]
     new_conv_state = conv_in[..., -(kernel - 1):]
     conv_out = (conv_in * weights["conv1d"].squeeze(1)).sum(dim=-1, keepdim=True)

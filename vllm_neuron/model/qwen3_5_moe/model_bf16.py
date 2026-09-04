@@ -65,11 +65,13 @@ from .ops import (
     apply_partial_rotary,
     mrope_tables,
     read_state_slot,
+    read_state_slots,
     redirect_padded_slots,
     rmsnorm,
     rotary_tables,
     temporal_axis,
     write_state_slot,
+    write_state_slots,
 )
 
 # Chunk width for the gated-delta-rule prefill scan. 64 is the reference kernel's default; it is a
@@ -815,12 +817,22 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         self._setup_weight_loaders()
 
     def _read_state(self, state: torch.Tensor, slot) -> torch.Tensor:
-        """This slot's state as ``[1, ...]``. The arithmetic is in ``ops`` so the tests can reach it."""
-        return read_state_slot(state, slot, self.num_slots)
+        """The named slot(s)' state, as ``[requests, ...]``.
+
+        One slot and many slots take different code paths because the single-slot form has to stay the
+        identity when there is one slot -- that is what keeps the shipped configuration's graph
+        unchanged. The arithmetic is in ``ops`` so the tests can reach it without a TP group.
+        """
+        if slot is None or torch.as_tensor(slot).numel() == 1:
+            return read_state_slot(state, slot, self.num_slots)
+        return read_state_slots(state, slot, self.num_slots)
 
     def _write_state(self, state: torch.Tensor, updated: torch.Tensor, slot) -> None:
-        """Write this slot, leaving the others untouched."""
-        write_state_slot(state, updated, slot, self.num_slots)
+        """Write the named slot(s), leaving the others untouched."""
+        if slot is None or torch.as_tensor(slot).numel() == 1:
+            write_state_slot(state, updated, slot, self.num_slots)
+            return
+        write_state_slots(state, updated, slot, self.num_slots)
 
     def _setup_weight_loaders(self):
         """>>> PARALLELISM: slice every projection by head <<<
@@ -938,6 +950,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             raise NotImplementedError(
                 "Qwen3.5-MoE Gated DeltaNet decode advances the recurrent state by exactly one "
                 f"token; got {tokens}. Speculative decoding is not supported."
+            )
+        requests = hidden_states.shape[0]
+        if slot is not None and torch.as_tensor(slot).numel() != requests:
+            raise ValueError(
+                f"got {torch.as_tensor(slot).numel()} slot(s) for {requests} request(s); each request "
+                "advances its own state, so the counts must agree."
             )
         output, state, new_conv_state = gated_delta_net_decode(
             hidden_states.to(self.dtype), self._weights(), self._dims(), self.eps,
@@ -1069,6 +1087,20 @@ class Qwen3_5MoeModel(nn.Module):
             return metadata.get("cached_seq_len")
         return None
 
+    def _state_slot(self, attn_metadata, layer_idx):
+        """Which slot this layer's recurrent state lives in, or None when there is no pool.
+
+        The runner puts one entry per state layer into the metadata carrying that request's slot, taken
+        from the layer's own KV cache group. None means the state is in module buffers and there is a
+        single slot, which is what every configuration without the pool gets.
+
+        Read per layer rather than once for the model: the metadata is keyed by layer name, and reading
+        one layer's entry for all of them would silently work today (all layers get the same slot) and
+        break the moment the runner groups them differently.
+        """
+        entry = attn_metadata.get(state_metadata_key(layer_idx))
+        return None if entry is None else entry["state_slots"]
+
     def _prefill_valid_mask(self, attn_metadata):
         """Per-token real/pad mask, taken from the attention slot mapping.
 
@@ -1107,10 +1139,15 @@ class Qwen3_5MoeModel(nn.Module):
 
         # A one-token prompt has max_query_len == 1 and so cannot be told apart from a decode step by
         # token count; the phase decision below will call it decode. This mask is what makes that
-        # harmless: it is 0 when the step's first token sits at absolute position 0, which zeroes the
-        # carried recurrent and conv state so a fresh request starts from zero. It is tensor
-        # arithmetic, so no Python branch on a runtime value enters the graph.
-        is_continuation = (positions.reshape(-1)[:1] > 0).reshape(())
+        # harmless: it is 0 when a token sits at absolute position 0, which zeroes the carried recurrent
+        # and conv state so a fresh request starts from zero. It is tensor arithmetic, so no Python
+        # branch on a runtime value enters the graph.
+        #
+        # ONE FLAG PER REQUEST at decode, where each position belongs to a different request. With a
+        # single request that is a length-one vector rather than a scalar, which multiplies the state
+        # identically -- so this is not a change to the shipped configuration's numbers.
+        is_continuation = (positions.reshape(-1) > 0) if not is_prefill else (
+            positions.reshape(-1)[:1] > 0).reshape(())
         cos, sin = self._rotary(positions, rotary_position_ids)
 
         model_dtype = self.config.torch_dtype
@@ -1138,16 +1175,26 @@ class Qwen3_5MoeModel(nn.Module):
                     "inject into the decoder layers."
                 )
         hidden_states = embedded.to(torch.float32)
-        for layer in self.decoder_layers:
+        for layer_index, layer in enumerate(self.decoder_layers):
             normed = layer.input_layernorm(hidden_states).to(model_dtype)
             if layer.layer_type == FULL_ATTENTION:
                 mixed = layer.self_attn(normed, positions, cos, sin, attn_metadata, is_prefill)
             else:
-                mixed = layer.linear_attn.forward_prefill(
-                    normed.unsqueeze(0), cached_seq_len=cached_seq_len, valid_mask=valid_mask,
-                ) if is_prefill else layer.linear_attn.forward_decode(
-                    normed.unsqueeze(0), is_continuation)
-                mixed = mixed.squeeze(0)
+                slot = self._state_slot(attn_metadata, layer_index)
+                if is_prefill:
+                    # One request per prefill step: the scan is a recurrence over a single sequence, and
+                    # a batch mixing two requests' tokens would carry one's tail into the other's head.
+                    # The token axis leads here.
+                    mixed = layer.linear_attn.forward_prefill(
+                        normed.unsqueeze(0), cached_seq_len=cached_seq_len, valid_mask=valid_mask,
+                        slot=slot).squeeze(0)
+                else:
+                    # Decode puts the REQUEST axis first: one token each, and the scan is batch-general
+                    # over that axis (measured bit-identical per row against single-request calls). With
+                    # one request this is the same shape as the prefill form, so the shipped
+                    # configuration traces the same graph.
+                    mixed = layer.linear_attn.forward_decode(
+                        normed.unsqueeze(1), is_continuation, slot=slot).squeeze(1)
             hidden_states = hidden_states + mixed.to(torch.float32)
             # The MoE block fuses its own pre-norm, so it takes the raw residual plus the norm weight.
             moe_out = layer.mlp(hidden_states, layer.post_attention_layernorm.weight, is_prefill,

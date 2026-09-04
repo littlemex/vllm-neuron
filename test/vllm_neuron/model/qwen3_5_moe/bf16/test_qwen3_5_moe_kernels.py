@@ -1948,3 +1948,161 @@ def test_kv_spec_still_works_for_a_model_that_declares_no_state():
         kv_cache.LayerSpec(name="layers.0.self_attn", num_kv_heads=2, head_size=8,
                            dtype=torch.bfloat16)])
     assert spec.state_layers == []
+
+
+def test_a_multi_request_step_is_refused_rather_than_taking_the_first_slot():
+    """The runner hands one slot per request. Until the scan is segmented per request, running a
+    multi-request step would put every request through one sequence's state -- fluent output with the
+    wrong history, which is the failure this whole mechanism exists to prevent."""
+    state = torch.zeros(4, 2, 3)
+    with pytest.raises(NotImplementedError, match="multi-request step"):
+        _ops.slot_mask(torch.tensor([0, 1, 2]), state, 4)
+    # One slot supplied as a length-one tensor is the normal case and must work.
+    assert _ops.slot_mask(torch.tensor([2]), state, 4) is not None
+
+
+def test_a_slot_outside_the_pool_selects_nothing_and_that_is_visible():
+    """An out-of-range slot produces an all-zero mask, so a read returns zeros and a write is dropped.
+    Worth pinning: the arithmetic cannot raise on it, so the value has to be trusted from the runner --
+    and this test records that the failure mode is a lost state, not a corrupted neighbour."""
+    state = torch.arange(4 * 6, dtype=torch.float32).reshape(4, 2, 3)
+    before = state.clone()
+    mask = _ops.slot_mask(torch.tensor(9), state, 4)
+    assert float(mask.abs().sum()) == 0.0
+    assert float(_ops.read_state_slot(state, torch.tensor(9), 4).abs().sum()) == 0.0
+    _ops.write_state_slot(state, torch.ones(1, 2, 3), torch.tensor(9), 4)
+    assert torch.equal(state, before), "an out-of-range write must not land on another slot"
+
+
+# ---------------------------------------------------------------------------
+# Stage A: several requests decoding in one step, out of a shared pool
+# ---------------------------------------------------------------------------
+
+
+def test_the_decode_step_is_batch_general_over_the_request_axis():
+    """Measured, not assumed. The kernel guards the TOKEN axis and says nothing about the request axis,
+    and stage A rests entirely on that axis being independent -- so each row of a batched call must be
+    bit-identical to the same request called alone."""
+    module, config = _hf_gated_delta_net(seed=41)
+    weights = _weights_from_hf(module)
+    eps = config.rms_norm_eps
+    torch.manual_seed(43)
+    requests = 3
+    tokens = torch.randn(requests, 1, _TEST_HIDDEN)
+    recurrent = torch.randn(requests, _TEST_DIMS["v_heads"], _TEST_DIMS["head_k_dim"],
+                            _TEST_DIMS["head_v_dim"]) * 0.1
+    conv_dim = (2 * _TEST_DIMS["k_heads"] * _TEST_DIMS["head_k_dim"]
+                + _TEST_DIMS["v_heads"] * _TEST_DIMS["head_v_dim"])
+    conv = torch.randn(requests, conv_dim, _TEST_DIMS["kernel"] - 1) * 0.1
+    continuing = torch.tensor(1.0)
+
+    with torch.no_grad():
+        batched = gated_delta_net_decode(
+            tokens, weights, _TEST_DIMS, eps, conv_state=conv, recurrent_state=recurrent,
+            is_continuation=continuing)
+        for request in range(requests):
+            alone = gated_delta_net_decode(
+                tokens[request:request + 1], weights, _TEST_DIMS, eps,
+                conv_state=conv[request:request + 1],
+                recurrent_state=recurrent[request:request + 1], is_continuation=continuing)
+            for got, want in zip(batched, alone):
+                assert torch.equal(got[request:request + 1], want), (
+                    f"request {request} differs when batched; the request axis is not independent")
+
+
+def test_a_per_request_continuation_flag_zeroes_only_that_request():
+    """A fresh request in a batched step must start from zero while its neighbours carry on. Without a
+    per-request flag, one request's first token would either reset everyone or continue from state it
+    has never seen."""
+    module, config = _hf_gated_delta_net(seed=45)
+    weights = _weights_from_hf(module)
+    eps = config.rms_norm_eps
+    torch.manual_seed(47)
+    conv_dim = (2 * _TEST_DIMS["k_heads"] * _TEST_DIMS["head_k_dim"]
+                + _TEST_DIMS["v_heads"] * _TEST_DIMS["head_v_dim"])
+    tokens = torch.randn(2, 1, _TEST_HIDDEN)
+    recurrent = torch.randn(2, _TEST_DIMS["v_heads"], _TEST_DIMS["head_k_dim"],
+                            _TEST_DIMS["head_v_dim"]) * 0.1
+    conv = torch.randn(2, conv_dim, _TEST_DIMS["kernel"] - 1) * 0.1
+
+    with torch.no_grad():
+        # Request 0 is fresh, request 1 continues.
+        mixed = gated_delta_net_decode(
+            tokens, weights, _TEST_DIMS, eps, conv_state=conv, recurrent_state=recurrent,
+            is_continuation=torch.tensor([0.0, 1.0]))
+        # The same two calls made separately, with the same flags.
+        fresh = gated_delta_net_decode(
+            tokens[:1], weights, _TEST_DIMS, eps, conv_state=conv[:1], recurrent_state=recurrent[:1],
+            is_continuation=torch.tensor(0.0))
+        carried = gated_delta_net_decode(
+            tokens[1:], weights, _TEST_DIMS, eps, conv_state=conv[1:], recurrent_state=recurrent[1:],
+            is_continuation=torch.tensor(1.0))
+
+    for got, want in zip(mixed, fresh):
+        assert torch.equal(got[:1], want), "the fresh request did not start from zero"
+    for got, want in zip(mixed, carried):
+        assert torch.equal(got[1:], want), "the continuing request was disturbed by its neighbour"
+
+
+def test_several_requests_decoding_from_a_shared_pool_match_their_solo_runs():
+    """Stage A end to end: a pool of four slots, three requests holding slots 2, 0 and 3, all advancing
+    in ONE call, with the gather and scatter written as one-hot products. Each request's output and
+    resulting state must match the same request run alone."""
+    module, config = _hf_gated_delta_net(seed=51)
+    weights = _weights_from_hf(module)
+    eps = config.rms_norm_eps
+    torch.manual_seed(53)
+    slots_total, steps = 4, 3
+    holders = torch.tensor([2, 0, 3])
+    requests = holders.numel()
+    conv_dim = (2 * _TEST_DIMS["k_heads"] * _TEST_DIMS["head_k_dim"]
+                + _TEST_DIMS["v_heads"] * _TEST_DIMS["head_v_dim"])
+    tokens = [torch.randn(requests, 1, _TEST_HIDDEN) for _ in range(steps)]
+    continuing = torch.ones(requests)
+
+    def blank(count):
+        return (torch.zeros(count, _TEST_DIMS["v_heads"], _TEST_DIMS["head_k_dim"],
+                            _TEST_DIMS["head_v_dim"]),
+                torch.zeros(count, conv_dim, _TEST_DIMS["kernel"] - 1))
+
+    with torch.no_grad():
+        # Solo: one state each, stepped independently.
+        solo = []
+        for request in range(requests):
+            recurrent, conv = blank(1)
+            outputs = []
+            for step in range(steps):
+                out, recurrent, conv = gated_delta_net_decode(
+                    tokens[step][request:request + 1], weights, _TEST_DIMS, eps,
+                    conv_state=conv, recurrent_state=recurrent,
+                    is_continuation=torch.tensor(1.0))
+                outputs.append(out.clone())
+            solo.append((outputs, recurrent, conv))
+
+        # Shared: one pool of four slots, three of them in use, all advanced together.
+        recurrent, conv = blank(slots_total)
+        shared = []
+        for step in range(steps):
+            out, new_recurrent, new_conv = gated_delta_net_decode(
+                tokens[step], weights, _TEST_DIMS, eps,
+                conv_state=_ops.read_state_slots(conv, holders, slots_total),
+                recurrent_state=_ops.read_state_slots(recurrent, holders, slots_total),
+                is_continuation=continuing)
+            _ops.write_state_slots(recurrent, new_recurrent, holders, slots_total)
+            _ops.write_state_slots(conv, new_conv, holders, slots_total)
+            shared.append(out.clone())
+
+    for request in range(requests):
+        outputs, want_recurrent, want_conv = solo[request]
+        for step in range(steps):
+            assert torch.equal(shared[step][request:request + 1], outputs[step]), (
+                f"request {request} step {step} differs when sharing the pool")
+        slot = int(holders[request])
+        assert torch.equal(recurrent[slot:slot + 1], want_recurrent), (
+            f"request {request}'s recurrent state did not land in slot {slot}")
+        assert torch.equal(conv[slot:slot + 1], want_conv)
+
+    # The unused slot must still be zero: nothing may spill into a slot no request holds.
+    unused = ({0, 1, 2, 3} - {int(s) for s in holders}).pop()
+    assert float(recurrent[unused].abs().sum()) == 0.0
+    assert float(conv[unused].abs().sum()) == 0.0

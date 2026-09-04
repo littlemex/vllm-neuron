@@ -3907,6 +3907,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             spec = kv_cache_group_spec.kv_cache_spec
             block_size = spec.block_size
             blk_table = self.input_batch.block_table[kv_cache_group_id]
+
+            if isinstance(spec, MambaSpec):
+                # A recurrent-state group owns one block per request, so the request's first (and only)
+                # block id IS the slot its state lives in. None of the attention machinery below applies
+                # -- there is no sliding window to trim, no slot mapping per token, no context bucket --
+                # and running it would produce a block table shaped for a sequence rather than a slot.
+                slots = blk_table.get_device_tensor(padded_num_reqs)[:, 0].to(torch.int32)
+                state_metadata = {"state_slots": slots}
+                for layer_name in kv_cache_group_spec.layer_names:
+                    attn_metadata[layer_name] = state_metadata
+                continue
+
             blk_table_tensor = blk_table.get_device_tensor(padded_num_reqs)
             # Clone so ``full_blk_table_tensor`` is a distinct tensor object
             # from ``blk_table_tensor``. Required because torch.compile's
@@ -4098,6 +4110,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             ctx_for_blocks = (
                 ctx_bucket if ctx_bucket is not None else self.max_model_len
             )
+            if isinstance(spec, MambaSpec):
+                # Warmup counterpart of the runtime branch: one slot per request, and each request gets
+                # a different one so the traced graph sees the general case rather than every request
+                # pointing at slot 0.
+                state_metadata = {
+                    "state_slots": torch.arange(num_reqs, dtype=torch.int32, device=device)
+                }
+                for layer_name in kv_cache_group_spec.layer_names:
+                    attn_metadata[layer_name] = state_metadata
+                continue
+
             dcp_block_size = block_size * max(self._dcp_size, 1)
             max_num_blocks_per_req = (
                 ctx_for_blocks + dcp_block_size - 1

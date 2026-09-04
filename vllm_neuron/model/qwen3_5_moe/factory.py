@@ -122,9 +122,12 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         if max_num_seqs != 1:
             raise ValueError(
-                f"Qwen3.5-MoE on Neuron supports max_num_seqs=1 only; got {max_num_seqs}. The Gated "
-                "DeltaNet conv and recurrent state are single per-layer buffers with no per-slot "
-                "pool, so concurrent sequences would read each other's state."
+                f"Qwen3.5-MoE on Neuron supports max_num_seqs=1 only; got {max_num_seqs}. The "
+                "remaining blocker is PREFILL, not the state pool: the Gated DeltaNet prefill scan is "
+                "a recurrence over one sequence, and a scheduled batch mixing two requests' tokens "
+                "would carry one's tail into the other's head. Decode is already batch-general over "
+                "the request axis and reads its slot from the pool; see the project's "
+                "docs/DESIGN-concurrency.md for what stage B needs."
             )
         if vllm_config.speculative_config is not None:
             # Refuse where the capability is selected, not where it first breaks. The Gated DeltaNet
