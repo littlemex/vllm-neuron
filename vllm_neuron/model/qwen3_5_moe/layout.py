@@ -153,6 +153,45 @@ def vision_checkpoint_mappings(depth, source="model.visual"):
     return mappings
 
 
+def mtp_checkpoint_mappings(source="mtp"):
+    """Map the head's parameters to their checkpoint keys.
+
+    The destination names are the ones the modules actually declare, which is not the same as the
+    checkpoint's layout: the attention fuses q, k and v into one parameter (q also carries the output
+    gate), so three source keys feed one destination — the same shape as the main model's mapping, and
+    the reason this is written out rather than derived from the checkpoint's names.
+
+    The head has no embedding and no LM head of its own; both are shared with the main model, which is
+    why neither appears here. The single layer is index 0 in the checkpoint whatever index the runner
+    gives it.
+    """
+    mappings: dict = {}
+    mappings["fc.weight"] = f"{source}.fc.weight"
+    mappings["norm.weight"] = f"{source}.norm.weight"
+    mappings["pre_fc_norm_embedding.weight"] = f"{source}.pre_fc_norm_embedding.weight"
+    mappings["pre_fc_norm_hidden.weight"] = f"{source}.pre_fc_norm_hidden.weight"
+
+    layer = f"{source}.layers.0"
+    mappings["input_layernorm.weight"] = f"{layer}.input_layernorm.weight"
+    mappings["post_attention_layernorm.weight"] = f"{layer}.post_attention_layernorm.weight"
+    mappings["self_attn.qkvg_proj_weight"] = [
+        f"{layer}.self_attn.q_proj.weight",
+        f"{layer}.self_attn.k_proj.weight",
+        f"{layer}.self_attn.v_proj.weight",
+    ]
+    mappings["self_attn.o_proj_weight"] = f"{layer}.self_attn.o_proj.weight"
+    mappings["self_attn.q_norm_weight"] = f"{layer}.self_attn.q_norm.weight"
+    mappings["self_attn.k_norm_weight"] = f"{layer}.self_attn.k_norm.weight"
+    mappings["mlp.router_weight"] = f"{layer}.mlp.gate.weight"
+    mappings["mlp.gate_up_proj_weight"] = f"{layer}.mlp.experts.gate_up_proj"
+    mappings["mlp.down_proj_weight"] = f"{layer}.mlp.experts.down_proj"
+    mappings["mlp.shared_gate_proj_weight"] = f"{layer}.mlp.shared_expert.gate_proj.weight"
+    mappings["mlp.shared_up_proj_weight"] = f"{layer}.mlp.shared_expert.up_proj.weight"
+    mappings["mlp.shared_down_proj_weight"] = f"{layer}.mlp.shared_expert.down_proj.weight"
+    mappings["mlp.shared_expert_gate_weight"] = f"{layer}.mlp.shared_expert_gate.weight"
+    return mappings
+
+
 def checkpoint_mappings(layer_types, source, has_lm_head, tie_word_embeddings):
     """Map every parameter this implementation declares to its checkpoint key(s).
 
