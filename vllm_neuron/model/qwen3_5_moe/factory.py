@@ -87,10 +87,15 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 f"Qwen3.5-MoE on Neuron supports bf16 only; got quantization={quantization!r}."
             )
 
+        # Every field below is read DIRECTLY rather than through getattr with a default. That is
+        # deliberate: a default turns a renamed or removed field into a guard that silently never
+        # fires, which is worse than no guard because the README claims the configuration is refused.
+        # Reading directly means a field that moves takes the guard down loudly, at construction.
+        #
         # Expert parallelism is expressed as a degree on NeuronConfig and as a flag on the vLLM
         # parallel config; either one being set means the deployment expects experts to be partitioned
         # across ranks, which this implementation does not do.
-        if neuron_config is not None and getattr(neuron_config, "ep_degree", 1) > 1:
+        if neuron_config is not None and neuron_config.ep_degree > 1:
             raise ValueError(
                 f"Qwen3.5-MoE on Neuron does not implement expert parallelism; got ep_degree="
                 f"{neuron_config.ep_degree}. Every rank holds all 256 experts and shards the expert "
@@ -119,7 +124,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "DeltaNet conv and recurrent state are single per-layer buffers with no per-slot "
                 "pool, so concurrent sequences would read each other's state."
             )
-        if getattr(vllm_config, "speculative_config", None) is not None:
+        if vllm_config.speculative_config is not None:
             # Refuse where the capability is selected, not where it first breaks. The Gated DeltaNet
             # decode advances the recurrent state by exactly one token, so a multi-token verify step
             # cannot be made consistent with the accepted tokens; the mixer does raise, but only after
@@ -129,7 +134,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "decode advances the recurrent state by exactly one token, so a multi-token verify "
                 "step would leave the state inconsistent with the accepted tokens."
             )
-        if neuron_config is not None and getattr(neuron_config, "apply_prefill_dcp", False):
+        if neuron_config is not None and neuron_config.apply_prefill_dcp:
             # With decode-context parallel prefill the runner hands each rank a slice of the prompt's
             # slot_mapping, while the recurrent layers need one mask entry per hidden-state token and a
             # state that spans the whole prefix. Refuse before construction rather than failing during
@@ -140,7 +145,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "carry their recurrent state, and derive their real/pad mask from an unsliced "
                 "slot_mapping."
             )
-        if getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1) > 1:
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
             # Decode DCP interleaves the context across ranks, so each rank's KV cache holds only its
             # share. This model's decode attention reads its local cache directly, with no cross-rank
             # gather or log-sum-exp reduction, and would attend over an incomplete context.
@@ -149,14 +154,14 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "(decode_context_parallel_size > 1): its decode attention reads the local KV cache "
                 "without the cross-rank gather that DCP requires."
             )
-        if getattr(vllm_config.model_config, "enable_prompt_embeds", False):
+        if vllm_config.model_config.enable_prompt_embeds:
             # The model embeds input_ids itself and never merges prompt embeddings, so rows that are
             # supposed to be embeddings would be read as their placeholder token IDs.
             raise ValueError(
                 "Qwen3.5-MoE on Neuron does not support prompt embeddings: it embeds input_ids and "
                 "never merges inputs_embeds, so embedding rows would be read as placeholder tokens."
             )
-        decode_buckets = getattr(neuron_config, "decode_batch_buckets", None) if neuron_config else None
+        decode_buckets = neuron_config.decode_batch_buckets if neuron_config else None
         if decode_buckets and max(decode_buckets) > 1:
             # The Gated DeltaNet decode advances the state by exactly one token and raises otherwise.
             # Refuse here so that failure happens at construction with a reason, rather than part-way

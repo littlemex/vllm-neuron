@@ -203,7 +203,7 @@ class Qwen3_5MoeConfig:
         # absent here and silently fall back to the dataclass default (the full 40-layer model).
         # Recover them from the config object, which resolves the alias.
         if isinstance(hf_config, PretrainedConfig):
-            source_config = getattr(hf_config, "text_config", None) or hf_config
+            source_config = getattr(hf_config, "text_config", None) or hf_config  # lint-port: ok HF config shape varies; a text-only checkpoint has no text_config
             for name in field_names:
                 if name in filtered:
                     continue

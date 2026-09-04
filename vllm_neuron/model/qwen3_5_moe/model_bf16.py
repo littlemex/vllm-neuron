@@ -1079,7 +1079,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             raise NotImplementedError(
                 "Qwen3.5-MoE on Neuron does not merge prompt embeddings; it embeds input_ids only."
             )
-        if positions.dim() == 2 and positions.shape[0] == 3:
+        if positions.dim() == 2 and positions.shape[0] == 3:  # lint-port: ok dim and shape are graph-static, not tensor contents
             # MRoPE positions arrive as [3, T]. For text the three axes are identical (see
             # get_mrope_input_positions), so collapsing to the first is exact rather than an
             # approximation. A multimodal request never reaches here: get_mrope_input_positions
