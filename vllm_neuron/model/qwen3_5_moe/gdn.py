@@ -310,7 +310,7 @@ def segmented_causal_conv1d(x_t, conv_weight, kernel_size, groups,
 
 def gated_delta_net_prefill(hidden_states, weights, dims, eps, chunk_size=DEFAULT_CHUNK_SIZE,
                             conv_state=None, is_continuation=None, valid_mask=None,
-                            initial_state=None):
+                            initial_state=None, packed=None):
     """The whole Gated DeltaNet prefill, from hidden states to the mixer output.
 
     ``hidden_states``: ``[1, T, hidden]`` in the model dtype.
@@ -323,7 +323,13 @@ def gated_delta_net_prefill(hidden_states, weights, dims, eps, chunk_size=DEFAUL
         form a PREFIX and the padding a contiguous suffix, because the conv history is gathered at
         ``valid_mask.sum()``. Neuron's bucket padding of a single sequence, the only producer, is.
 
-    Returns ``(output[1, T, hidden], recurrent_state, conv_state)``.
+    ``packed`` is an ``ops.AlignedLayout`` when several requests share the row, and None otherwise.
+    When given, the row is re-laid-out so every request starts on a chunk boundary, the convolution
+    switches to its masked form, and the returned states carry ONE ENTRY PER REQUEST instead of one for
+    the row -- each taken from that request's own last chunk and last real positions.
+
+    Returns ``(output[1, T, hidden], recurrent_state, conv_state)``. Without ``packed`` the states lead
+    with a length-one axis; with it they lead with the request count.
     """
     from .ops import (  # local: keeps this module import-light
         gated_delta_projections,
@@ -331,6 +337,13 @@ def gated_delta_net_prefill(hidden_states, weights, dims, eps, chunk_size=DEFAUL
     )
 
     out_dtype = hidden_states.dtype
+    packed_tokens = hidden_states.shape[1]
+    if packed is not None:
+        # Onto the aligned layout before anything reads a neighbour: the projections are per token and
+        # do not care, but the convolution and the scan both do.
+        hidden_states = torch.index_select(hidden_states, 1, packed.source)
+        hidden_states = hidden_states * packed.valid.reshape(1, -1, 1).to(hidden_states.dtype)
+        valid_mask = packed.valid
     tokens = hidden_states.shape[1]
     key_dim = dims["k_heads"] * dims["head_k_dim"]
     value_dim = dims["v_heads"] * dims["head_v_dim"]
@@ -342,10 +355,21 @@ def gated_delta_net_prefill(hidden_states, weights, dims, eps, chunk_size=DEFAUL
     b = hidden_states @ weights["in_proj_b"]
     a = hidden_states @ weights["in_proj_a"]
 
-    valid_len = None if valid_mask is None else valid_mask.sum()
+    # With several requests the conv history is per request, gathered below, so the single-tail
+    # extraction is switched off by passing valid_len=None.
+    valid_len = None if (valid_mask is None or packed is not None) else valid_mask.sum()
     conv_out, new_conv_state = segmented_causal_conv1d(
         mixed, weights["conv1d"], kernel, conv_dim,
-        conv_state=conv_state, is_continuation=is_continuation, valid_len=valid_len)
+        conv_state=conv_state, is_continuation=is_continuation, valid_len=valid_len,
+        segment_id=None if packed is None else packed.segment_id)
+    if packed is not None:
+        # ``mixed`` is the RAW pre-activation input, which is what the carried state is; each request's
+        # history is its own last kernel-1 real positions.
+        history = torch.cat([torch.zeros_like(mixed[..., :kernel - 1]), mixed], dim=-1)
+        new_conv_state = torch.index_select(
+            history, -1, (packed.conv_tails + kernel - 1).reshape(-1)
+        ).reshape(mixed.shape[0], conv_dim, packed.conv_tails.shape[0], kernel - 1)
+        new_conv_state = new_conv_state.permute(0, 2, 1, 3).reshape(-1, conv_dim, kernel - 1)
     # The reference applies the conv activation (SiLU) to the conv OUTPUT; the carried state is the
     # raw pre-activation input, which is what segmented_causal_conv1d returns.
     conv_out = F.silu(conv_out).transpose(1, 2)                          # [1, T, conv_dim]
@@ -357,12 +381,30 @@ def gated_delta_net_prefill(hidden_states, weights, dims, eps, chunk_size=DEFAUL
         g = g * keep.to(g.dtype)
         beta = beta * keep.to(beta.dtype)
 
-    core_attn_out, state = chunk_gated_delta_rule(
-        query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state)
+    if packed is None:
+        core_attn_out, state = chunk_gated_delta_rule(
+            query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state)
+    else:
+        core_attn_out, _row_state, chunk_states = chunk_gated_delta_rule(
+            query, key, value, g, beta, chunk_size=chunk_size, initial_state=initial_state,
+            chunk_carry=packed.carry.unsqueeze(0), return_chunk_states=True)
+        # Each request's state is the one after ITS last chunk, which is the chunk holding its last
+        # aligned position. Selected with a one-hot rather than an index, as everywhere else here.
+        # chunk_states is [1, T, H, Dk, Dv]; pick the chunk each request ended in, giving
+        # [requests, H, Dk, Dv].
+        last_chunk = packed.conv_tails[:, -1] // chunk_size
+        picker = (torch.arange(chunk_states.shape[1], device=chunk_states.device).unsqueeze(0)
+                  == last_chunk.unsqueeze(1)).to(chunk_states.dtype)
+        state = torch.einsum("rt,thkv->rhkv", picker, chunk_states[0])
     normed = gated_rmsnorm(core_attn_out.reshape(-1, dims["head_v_dim"]),
                            z.reshape(-1, dims["head_v_dim"]),
                            weights["norm"], eps, out_dtype).reshape(*z.shape[:2], value_dim)
-    return normed @ weights["out_proj"], state, new_conv_state
+    output = normed @ weights["out_proj"]
+    if packed is not None:
+        # Back to the caller's packed layout, which is what the rest of the model is shaped for.
+        output = torch.index_select(output, 1, packed.to_packed)
+        assert output.shape[1] == packed_tokens
+    return output, state, new_conv_state
 
 
 def gated_delta_net_decode(hidden_states, weights, dims, eps, conv_state, recurrent_state,

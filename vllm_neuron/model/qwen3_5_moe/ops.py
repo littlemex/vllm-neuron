@@ -11,6 +11,8 @@ Two norm conventions coexist in this architecture and mixing them is silent brea
 * ``gated_rmsnorm`` (HF ``Qwen3_5MoeRMSNormGated``, used only inside the Gated DeltaNet) scales by
   ``weight`` and its weight is initialised to ONE, and it applies the gate AFTER the norm.
 """
+from typing import NamedTuple
+
 import torch
 import torch.nn.functional as F
 
@@ -293,3 +295,95 @@ def write_state_slots(state: torch.Tensor, updated: torch.Tensor, slots, num_slo
     written = (onehot.t() @ updated.reshape(onehot.shape[0], -1)).reshape(state.shape)
     touched = onehot.sum(dim=0).reshape((num_slots,) + (1,) * (state.dim() - 1))
     state.copy_(state * (1 - touched) + written)
+
+
+# ---------------------------------------------------------------------------
+# Chunk-aligned packing for multi-request prefill
+# ---------------------------------------------------------------------------
+
+
+class AlignedLayout(NamedTuple):
+    """Everything the Gated DeltaNet needs to prefill several requests packed into one row.
+
+    Named rather than positional because six index tensors of similar shape are exactly the kind of
+    argument list this port has already been bitten by once, in the vision encoder's inputs.
+
+        source      ``[aligned]``            which packed token each aligned position holds
+        valid       ``[aligned]``            1 where the position holds a real token
+        carry       ``[aligned // chunk]``   0 where a chunk begins a request
+        segment_id  ``[aligned]``            which request owns each aligned position
+        to_packed   ``[packed]``             which aligned position each packed token ended up at
+        conv_tails  ``[requests, kernel-1]`` the aligned positions holding each request's conv history
+    """
+
+    source: torch.Tensor
+    valid: torch.Tensor
+    carry: torch.Tensor
+    segment_id: torch.Tensor
+    to_packed: torch.Tensor
+    conv_tails: torch.Tensor
+
+
+def chunk_aligned_layout(query_start_loc, chunk_size: int, aligned_len: int,
+                         kernel: int) -> AlignedLayout:
+    """Where each request's tokens go when every request must start on a chunk boundary.
+
+    The prefill scan can only be told about request boundaries per CHUNK, so a packed row has to be
+    re-laid-out with each request starting at a multiple of ``chunk_size``. This computes that layout.
+
+    ``query_start_loc`` is ``[requests + 1]``: the packed start offset of each request and the total,
+    which is how vLLM already describes a packed batch. ``aligned_len`` is the STATIC size of the aligned
+    buffer -- it has to be a compile-time constant because the graph is compiled for it, and it must be
+    at least ``tokens + requests * (chunk_size - 1)`` for the padding to fit.
+
+    No data-dependent control flow. The request each position belongs to is found by COUNTING how many
+    request starts lie at or before it, which is a comparison against a small static-shaped matrix --
+    the same trade as the one-hot slot select, and for the same reason.
+    """
+    if aligned_len % chunk_size:
+        raise ValueError(
+            f"aligned_len={aligned_len} must be a multiple of chunk_size={chunk_size}; the carry mask "
+            "is one entry per whole chunk."
+        )
+    starts = torch.as_tensor(query_start_loc).reshape(-1)
+    if starts.numel() < 2:
+        raise ValueError(
+            f"query_start_loc must hold at least one request plus the total; got {starts.numel()} entry"
+        )
+    device = starts.device
+    requests = starts.numel() - 1
+    lengths = starts[1:] - starts[:-1]                                  # [requests]
+    padded = -(-lengths // chunk_size) * chunk_size                     # each rounded up to a chunk
+    aligned_starts = torch.cumsum(padded, dim=0) - padded               # [requests]
+
+    position = torch.arange(aligned_len, device=device)
+    # How many request starts are at or before this position, minus one: the owning request. Positions
+    # past the last request's aligned span clamp to the last request and are excluded by `valid`.
+    owner = (position.unsqueeze(1) >= aligned_starts.unsqueeze(0)).sum(dim=1) - 1
+    owner = owner.clamp(min=0, max=requests - 1)
+
+    offset = position - aligned_starts[owner]
+    valid = ((offset >= 0) & (offset < lengths[owner])).to(torch.int32)
+    total = int(starts[-1])
+    source = ((starts[:-1][owner] + offset) * valid).clamp(min=0, max=max(total - 1, 0))
+
+    chunk_starts = torch.arange(0, aligned_len, chunk_size, device=device)
+    # A chunk continues the previous request unless it begins one. Chunk 0 always begins one.
+    carry = (chunk_starts.unsqueeze(1) != aligned_starts.unsqueeze(0)).all(dim=1).to(torch.int32)
+    carry[0] = 0
+
+    # The inverse map, for putting the output back where the caller expects it. Built the same way:
+    # a packed token's request is found by counting starts, and its aligned position follows.
+    packed_position = torch.arange(total, device=device)
+    packed_owner = (packed_position.unsqueeze(1) >= starts[:-1].unsqueeze(0)).sum(dim=1) - 1
+    packed_owner = packed_owner.clamp(min=0, max=requests - 1)
+    to_packed = aligned_starts[packed_owner] + (packed_position - starts[:-1][packed_owner])
+
+    # Each request's conv history: the last kernel-1 REAL positions of its aligned span. A request
+    # shorter than the window reaches back into its own padding, which is zero -- the same left pad a
+    # fresh single-request prefill gets.
+    tail_offsets = torch.arange(-(kernel - 1), 0, device=device)
+    conv_tails = (aligned_starts.unsqueeze(1) + lengths.unsqueeze(1) + tail_offsets.unsqueeze(0))
+    conv_tails = conv_tails.clamp(min=0, max=aligned_len - 1)
+    return AlignedLayout(source=source, valid=valid, carry=carry, segment_id=owner * valid,
+                         to_packed=to_packed, conv_tails=conv_tails)

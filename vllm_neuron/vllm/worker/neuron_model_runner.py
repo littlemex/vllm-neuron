@@ -2839,6 +2839,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
+            # Per-request token offsets. Only a recurrent-state group reads them, to lay a packed batch
+            # out on chunk boundaries; every attention group ignores them.
+            query_start_loc=np.concatenate(
+                ([0], np.cumsum(num_scheduled_tokens_padded))).astype(np.int32),
         )
 
         # Spec decoding
@@ -3879,6 +3883,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         max_num_draft_tokens: int,
         cached_seq_len: int = 0,
         max_decode_ctx_len: int = 0,
+        query_start_loc: "np.ndarray | None" = None,
     ) -> AttentionMetadata | None:
         """
         Build attention metadata for KV cache and attention computation.
@@ -3915,6 +3920,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 # and running it would produce a block table shaped for a sequence rather than a slot.
                 slots = blk_table.get_device_tensor(padded_num_reqs)[:, 0].to(torch.int32)
                 state_metadata = {"state_slots": slots}
+                if query_start_loc is not None:
+                    # A recurrent scan cannot be told about a request boundary that falls inside a
+                    # chunk, so the model re-lays the packed row out onto chunk boundaries and needs the
+                    # per-request offsets to do it. Passed through rather than interpreted here: the
+                    # chunk width is the model's, not the runner's.
+                    state_metadata["query_start_loc"] = torch.as_tensor(
+                        query_start_loc, dtype=torch.int32, device=self.device)
                 for layer_name in kv_cache_group_spec.layer_names:
                     attn_metadata[layer_name] = state_metadata
                 continue
@@ -4114,8 +4126,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                 # Warmup counterpart of the runtime branch: one slot per request, and each request gets
                 # a different one so the traced graph sees the general case rather than every request
                 # pointing at slot 0.
+                # Equal-length requests: warmup fixes the SHAPE, and the offsets are runtime values, so
+                # the split only has to be representative rather than the one that will arrive.
+                per_request = num_tokens // num_reqs
                 state_metadata = {
-                    "state_slots": torch.arange(num_reqs, dtype=torch.int32, device=device)
+                    "state_slots": torch.arange(num_reqs, dtype=torch.int32, device=device),
+                    "query_start_loc": torch.arange(
+                        0, per_request * (num_reqs + 1), per_request,
+                        dtype=torch.int32, device=device),
                 }
                 for layer_name in kv_cache_group_spec.layer_names:
                     attn_metadata[layer_name] = state_metadata

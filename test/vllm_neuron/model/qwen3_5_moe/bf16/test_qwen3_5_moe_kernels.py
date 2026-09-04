@@ -2220,3 +2220,137 @@ def test_the_masked_conv_is_not_claimed_to_be_bit_identical():
     assert not torch.equal(plain, tapped), (
         "the two forms are now bit-identical; the unsegmented F.conv1d path exists only because they "
         "were not, so it can be removed -- and this test should be replaced by that")
+
+
+def test_the_chunk_aligned_layout_places_each_request_on_a_chunk_boundary():
+    """The index math, checked against hand-computed offsets. Three requests of 20, 36 and 8 tokens at
+    chunk 16 occupy 32, 48 and 16 aligned positions, so they start at 0, 32 and 80."""
+    starts = torch.tensor([0, 20, 56, 64])
+    layout = _ops.chunk_aligned_layout(starts, chunk_size=16, aligned_len=112, kernel=4)
+    source, valid, carry = layout.source, layout.valid, layout.carry
+    assert carry.tolist() == [0, 1, 0, 1, 1, 0, 1], (
+        "a chunk that begins a request must carry nothing, and chunk 0 always begins one")
+    for aligned_at, length, packed_at in ((0, 20, 0), (32, 36, 20), (80, 8, 56)):
+        span = source[aligned_at:aligned_at + length].tolist()
+        assert span == list(range(packed_at, packed_at + length))
+        assert int(valid[aligned_at:aligned_at + length].sum()) == length
+    assert int(valid.sum()) == 20 + 36 + 8, "only real tokens may be marked valid"
+
+
+def test_the_layout_refuses_an_aligned_length_that_is_not_whole_chunks():
+    with pytest.raises(ValueError, match="multiple of chunk_size"):
+        _ops.chunk_aligned_layout(torch.tensor([0, 8]), chunk_size=16, aligned_len=100,
+                                  kernel=4)
+
+
+def test_three_unequal_requests_prefill_together_and_match_their_solo_runs():
+    """Stage B end to end, and the case the whole design exists for: requests of DIFFERENT lengths,
+    packed into one row, re-laid-out onto chunk boundaries, scanned once.
+
+    Each request's output must equal its solo run and its final state must land where its own last chunk
+    put it. Bit equality, not a tolerance: the aligned layout moves tokens but must not change any
+    arithmetic they take part in.
+    """
+    chunk = 16
+    lengths = [20, 36, 8]
+    aligned_len = sum(-(-length // chunk) * chunk for length in lengths)
+    starts = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)))
+    parts = [_scan_inputs(length, seed=100 + index) for index, length in enumerate(lengths)]
+    packed = [torch.cat(tensors, dim=1) for tensors in zip(*parts)]
+
+    layout = _ops.chunk_aligned_layout(starts, chunk, aligned_len, kernel=4)
+    source, valid, carry = layout.source, layout.valid, layout.carry
+
+    def to_aligned(tensor):
+        """Gather onto the aligned layout and zero the padding, which is what `valid` is for."""
+        gathered = torch.index_select(tensor, 1, source)
+        shape = (1, aligned_len) + (1,) * (tensor.dim() - 2)
+        return gathered * valid.reshape(shape).to(gathered.dtype)
+
+    with torch.no_grad():
+        solo = [chunk_gated_delta_rule(*part, chunk_size=chunk) for part in parts]
+        aligned = [to_aligned(tensor) for tensor in packed]
+        out, _final, per_chunk = chunk_gated_delta_rule(
+            *aligned, chunk_size=chunk, chunk_carry=carry.unsqueeze(0),
+            return_chunk_states=True)
+
+    aligned_starts = [0]
+    for length in lengths[:-1]:
+        aligned_starts.append(aligned_starts[-1] + -(-length // chunk) * chunk)
+
+    for index, (length, aligned_at) in enumerate(zip(lengths, aligned_starts)):
+        want_out, want_state = solo[index]
+        got_out = out[:, aligned_at:aligned_at + length]
+        assert torch.equal(got_out, want_out), (
+            f"request {index} (length {length}) differs when packed and aligned")
+        last_chunk = (aligned_at + -(-length // chunk) * chunk) // chunk - 1
+        assert torch.equal(per_chunk[:, last_chunk], want_state), (
+            f"request {index}'s final state is not at its last chunk")
+
+
+def test_the_whole_prefill_runs_three_unequal_requests_packed_in_one_row():
+    """Stage B through the FULL prefill, not just the scan: projections, the segmented convolution, the
+    carry-masked scan, the per-request state extraction and the scatter back.
+
+    Each request's output must match its solo prefill, and each request's returned states must match the
+    states its solo prefill ended with. The convolution is the masked tap form here and the solo runs use
+    F.conv1d, which are not bit-identical (4.8e-7 by measurement), so this compares numerically -- the
+    scan-only test above is the one that pins bit equality.
+    """
+    module, config = _hf_gated_delta_net(seed=61)
+    weights = _weights_from_hf(module)
+    eps = config.rms_norm_eps
+    torch.manual_seed(67)
+    chunk = 16
+    lengths = [20, 36, 8]
+    starts = torch.tensor([0] + list(torch.tensor(lengths).cumsum(0)), dtype=torch.int32)
+    prompts = [torch.randn(1, length, _TEST_HIDDEN) for length in lengths]
+    row = torch.cat(prompts, dim=1)
+
+    requests = len(lengths)
+    aligned = sum(lengths) + requests * (chunk - 1)
+    aligned += (-aligned) % chunk
+    layout = _ops.chunk_aligned_layout(starts, chunk, aligned, _TEST_DIMS["kernel"])
+
+    with torch.no_grad():
+        solo = [gated_delta_net_prefill(prompt, weights, _TEST_DIMS, eps, chunk_size=chunk)
+                for prompt in prompts]
+        out, state, conv = gated_delta_net_prefill(
+            row, weights, _TEST_DIMS, eps, chunk_size=chunk, packed=layout)
+
+    assert out.shape == row.shape, "the output must come back in the caller's packed layout"
+    assert state.shape[0] == requests, f"expected one state per request, got {state.shape[0]}"
+    assert conv.shape[0] == requests
+
+    for index, (length, start) in enumerate(zip(lengths, starts[:-1].tolist())):
+        want_out, want_state, want_conv = solo[index]
+        got_out = out[:, start:start + length]
+        assert (got_out - want_out).abs().max() < 2e-5, (
+            f"request {index} (length {length}) output differs by "
+            f"{(got_out - want_out).abs().max():.3e}")
+        assert (state[index] - want_state[0]).abs().max() < 2e-5, (
+            f"request {index}'s recurrent state is not the one its solo prefill ended with")
+        assert (conv[index] - want_conv[0]).abs().max() < 2e-5, (
+            f"request {index}'s conv history is not its own tail")
+
+
+def test_packed_prefill_of_a_single_request_agrees_with_the_unpacked_path():
+    """A pooled deployment carrying one request must not take a different numerical path than one
+    without the pool. The two convolutions differ by the accumulation order, so this is a numerical
+    bound rather than bit equality -- which is itself the reason the model passes packed=None when there
+    is only one request."""
+    module, config = _hf_gated_delta_net(seed=71)
+    weights = _weights_from_hf(module)
+    torch.manual_seed(73)
+    chunk, length = 16, 32
+    prompt = torch.randn(1, length, _TEST_HIDDEN)
+    starts = torch.tensor([0, length], dtype=torch.int32)
+    layout = _ops.chunk_aligned_layout(starts, chunk, length, _TEST_DIMS["kernel"])
+    with torch.no_grad():
+        plain = gated_delta_net_prefill(prompt, weights, _TEST_DIMS, config.rms_norm_eps,
+                                        chunk_size=chunk)
+        boxed = gated_delta_net_prefill(prompt, weights, _TEST_DIMS, config.rms_norm_eps,
+                                        chunk_size=chunk, packed=layout)
+    assert (boxed[0] - plain[0]).abs().max() < 2e-5
+    assert (boxed[1][0] - plain[1][0]).abs().max() < 2e-5
+    assert (boxed[2][0] - plain[2][0]).abs().max() < 2e-5

@@ -63,6 +63,7 @@ from .layout import (
 )
 from .ops import (
     apply_partial_rotary,
+    chunk_aligned_layout,
     mrope_tables,
     read_state_slot,
     read_state_slots,
@@ -908,7 +909,8 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             output = self.tp_group.all_reduce(output)
         return output.contiguous()
 
-    def forward_prefill(self, hidden_states, cached_seq_len=None, valid_mask=None, slot=None):
+    def forward_prefill(self, hidden_states, cached_seq_len=None, valid_mask=None, slot=None,
+                        packed=None):
         """Chunked gated-delta-rule prefill; the scan and the mask contract are in ``gdn.py``.
 
         ``cached_seq_len`` is non-None only in segmented / continuation prefill, and is the number of
@@ -1038,6 +1040,8 @@ class Qwen3_5MoeModel(nn.Module):
         self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, config.rms_norm_eps, config.torch_dtype)
         self.first_attention_layer = next(
             i for i, layer in enumerate(self.layers) if layer.layer_type == FULL_ATTENTION)
+        self.first_linear_layer = next(
+            i for i, layer in enumerate(self.layers) if layer.layer_type == LINEAR_ATTENTION)
         # Registered empty and filled in load_weights: the runner constructs the model under `meta`,
         # where the arange/cos/sin that build these tables would themselves be meta tensors.
         self.register_buffer(
@@ -1086,6 +1090,28 @@ class Qwen3_5MoeModel(nn.Module):
         if metadata.get("kv_segment_size"):
             return metadata.get("cached_seq_len")
         return None
+
+    def _packed_prefill_layout(self, attn_metadata, tokens):
+        """The chunk-aligned layout for a packed multi-request prefill, or None when there is one request.
+
+        None covers every configuration without the state pool, and also a pooled one carrying a single
+        request -- in both cases the row already starts on a chunk boundary and the scan needs no carry
+        mask, so the graph is the one that was verified.
+
+        The aligned buffer is sized ``tokens + requests * (chunk - 1)``, the worst case when every
+        request needs padding up to a whole chunk. It has to be a compile-time constant because the
+        graph is compiled for it, so it is derived from the bucket rather than from the batch.
+        """
+        entry = attn_metadata.get(state_metadata_key(self.first_linear_layer))
+        starts = None if entry is None else entry.get("query_start_loc")
+        if starts is None or starts.numel() <= 2:
+            return None
+        mixer = self.decoder_layers[self.first_linear_layer].linear_attn
+        chunk = mixer.chunk_size
+        requests = starts.numel() - 1
+        aligned = tokens + requests * (chunk - 1)
+        aligned += (-aligned) % chunk
+        return chunk_aligned_layout(starts, chunk, aligned, mixer.conv_kernel_size)
 
     def _state_slot(self, attn_metadata, layer_idx):
         """Which slot this layer's recurrent state lives in, or None when there is no pool.
@@ -1146,6 +1172,9 @@ class Qwen3_5MoeModel(nn.Module):
         # ONE FLAG PER REQUEST at decode, where each position belongs to a different request. With a
         # single request that is a length-one vector rather than a scalar, which multiplies the state
         # identically -- so this is not a change to the shipped configuration's numbers.
+        # One layout for the whole forward, not one per layer: it depends only on the request offsets and
+        # the chunk width, both of which every Gated DeltaNet layer shares.
+        packed = self._packed_prefill_layout(attn_metadata, input_ids.shape[0]) if is_prefill else None
         is_continuation = (positions.reshape(-1) > 0) if not is_prefill else (
             positions.reshape(-1)[:1] > 0).reshape(())
         cos, sin = self._rotary(positions, rotary_position_ids)
@@ -1182,12 +1211,12 @@ class Qwen3_5MoeModel(nn.Module):
             else:
                 slot = self._state_slot(attn_metadata, layer_index)
                 if is_prefill:
-                    # One request per prefill step: the scan is a recurrence over a single sequence, and
-                    # a batch mixing two requests' tokens would carry one's tail into the other's head.
-                    # The token axis leads here.
+                    # The token axis leads for prefill. With several requests packed into the row the
+                    # mixer is additionally given the chunk-aligned layout, which is what keeps one
+                    # request's tail out of the next one's head.
                     mixed = layer.linear_attn.forward_prefill(
                         normed.unsqueeze(0), cached_seq_len=cached_seq_len, valid_mask=valid_mask,
-                        slot=slot).squeeze(0)
+                        slot=slot, packed=packed).squeeze(0)
                 else:
                     # Decode puts the REQUEST axis first: one token each, and the scan is batch-general
                     # over that axis (measured bit-identical per row against single-request calls). With
