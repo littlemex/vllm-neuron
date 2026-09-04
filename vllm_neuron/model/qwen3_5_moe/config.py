@@ -124,6 +124,11 @@ class Qwen3_5MoeConfig:
 
     # -- Framework config (not model-specific) ------------------------------
     neuron_config: NeuronConfig | None = None
+    # Concurrent sequences the Gated DeltaNet state has room for. One is what the runner supports
+    # today: its LayerSpec cannot describe a recurrent state, so there is no pool to allocate and the
+    # state lives in module buffers. The model is written for any number so that the runner-side work
+    # (see docs/DESIGN-concurrency.md) does not also require rewriting the mixer.
+    num_state_slots: int = 1
 
     def __post_init__(self):
         if not self.layer_types:
@@ -151,6 +156,11 @@ class Qwen3_5MoeConfig:
             # The prefill/decode phase and the real/pad token mask both come from an attention layer's
             # metadata, so at least one such layer has to exist.
             raise ValueError("Qwen3.5-MoE on Neuron requires at least one full_attention layer.")
+        if self.num_state_slots < 1:
+            raise ValueError(
+                f"num_state_slots must be at least 1; got {self.num_state_slots}. One slot is the "
+                "single-sequence configuration the runner supports today."
+            )
         if not self.attn_output_gate:
             raise ValueError(
                 "Qwen3.5-MoE on Neuron assumes attn_output_gate=True (q_proj emits query and gate "

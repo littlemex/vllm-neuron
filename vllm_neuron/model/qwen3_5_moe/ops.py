@@ -195,3 +195,49 @@ def redirect_padded_slots(slot_mapping, rows):
     safe_slot = torch.where(real, slot_mapping, donor_slot.clamp(min=0))
     safe_rows = torch.where(real.unsqueeze(-1), rows, donor_row)
     return safe_slot, safe_rows
+
+
+# ---------------------------------------------------------------------------
+# Per-slot recurrent state
+# ---------------------------------------------------------------------------
+# The Gated DeltaNet's conv and recurrent state carry a leading SLOT axis, one entry per concurrent
+# sequence. Selecting a slot with `state[slot]` would be a data-dependent index into a compiled graph,
+# which is the thing that does not reliably trace; a one-hot multiply is the same select written as
+# arithmetic, and it is the form already used for speculative candidate selection.
+#
+# `num_slots` is a Python int, so the branch on it is resolved at trace time and no runtime condition
+# enters the graph. At one slot the functions are the identity and the assignment they replaced, so the
+# single-slot graph is the same graph as before slots existed.
+
+
+def slot_mask(slot, state: torch.Tensor, num_slots: int):
+    """One-hot over the slot axis, shaped to broadcast onto ``state``; None when there is one slot."""
+    if num_slots < 1:
+        raise ValueError(f"num_slots must be at least 1; got {num_slots}")
+    if num_slots == 1:
+        return None
+    index = torch.arange(num_slots, device=state.device)
+    mask = (index == torch.as_tensor(slot, device=state.device).reshape(()).to(index.dtype))
+    return mask.to(state.dtype).reshape((num_slots,) + (1,) * (state.dim() - 1))
+
+
+def read_state_slot(state: torch.Tensor, slot, num_slots: int) -> torch.Tensor:
+    """This slot's state as ``[1, ...]`` -- the shape the scans take."""
+    mask = slot_mask(slot, state, num_slots)
+    if mask is None:
+        return state
+    return (state * mask).sum(dim=0, keepdim=True)
+
+
+def write_state_slot(state: torch.Tensor, updated: torch.Tensor, slot, num_slots: int) -> None:
+    """Write ``updated`` (``[1, ...]``) into this slot in place, leaving the other slots untouched.
+
+    The ``copy_`` target is the WHOLE buffer, not a slice. That is deliberate: the aliasing pass
+    recognises a full-tensor in-place write, and an in-place write into a slice is not known to produce
+    the same alias. The other slots are preserved by the arithmetic, not by writing less.
+    """
+    mask = slot_mask(slot, state, num_slots)
+    if mask is None:
+        state.copy_(updated.to(state.dtype))
+        return
+    state.copy_(state * (1 - mask) + updated.to(state.dtype) * mask)

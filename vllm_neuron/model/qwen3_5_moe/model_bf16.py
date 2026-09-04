@@ -64,10 +64,12 @@ from .layout import (
 from .ops import (
     apply_partial_rotary,
     mrope_tables,
+    read_state_slot,
     redirect_padded_slots,
     rmsnorm,
     rotary_tables,
     temporal_axis,
+    write_state_slot,
 )
 
 # Chunk width for the gated-delta-rule prefill scan. 64 is the reference kernel's default; it is a
@@ -699,7 +701,13 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     """The ``linear_attention`` mixer. Conv and recurrent state live in module buffers updated in
     place; the plugin's ``AliasingOutputRewritePass`` rewrites the ``copy_`` into an HLO
     ``input_output_alias`` so the state survives between the runner's per-step graph calls, with no
-    runner-side state pool. Consequence: batch=1.
+    runner-side state pool.
+
+    The state carries a leading SLOT axis and every read and write goes through it, so the mixer itself
+    does not impose batch=1 -- the runner does. Its ``LayerSpec`` cannot describe a recurrent state, so
+    there is no pool to allocate and nothing hands out slots; ``num_state_slots`` is therefore 1 in
+    every shipped configuration, which makes the slot arithmetic the identity (see ``ops``). The
+    runner-side work is scoped in the project's ``docs/DESIGN-concurrency.md``.
 
     >>> PARALLELISM: TP (key/value head sharding; the depthwise conv shards with its channels) <<<
 
@@ -767,15 +775,31 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # Recurrent state, carried across graphs by in-place update + the aliasing pass. fp32 because
         # the checkpoint declares mamba_ssm_dtype float32 and the recurrence compounds over the whole
         # sequence. Materialised on the device in load_weights (the runner builds on `meta`).
+        #
+        # The leading axis is the SLOT: one entry per concurrent sequence. It was already there with
+        # length one, so widening it is a shape change rather than a redesign -- but the slot has to be
+        # selected without a data-dependent index, which is what `_slot_mask` is for. With num_slots == 1
+        # every mask is the constant one and the arithmetic reduces to today's, bit for bit.
+        self.num_slots = config.num_state_slots
         self.register_buffer(
             "recurrent_state",
-            torch.zeros(1, self.v_heads_pr, self.head_k_dim, self.head_v_dim, dtype=torch.float32),
+            torch.zeros(self.num_slots, self.v_heads_pr, self.head_k_dim, self.head_v_dim,
+                        dtype=torch.float32),
             persistent=False)
         self.register_buffer(
             "conv_state",
-            torch.zeros(1, self.conv_dim_pr, self.conv_kernel_size - 1, dtype=self.dtype),
+            torch.zeros(self.num_slots, self.conv_dim_pr, self.conv_kernel_size - 1,
+                        dtype=self.dtype),
             persistent=False)
         self._setup_weight_loaders()
+
+    def _read_state(self, state: torch.Tensor, slot) -> torch.Tensor:
+        """This slot's state as ``[1, ...]``. The arithmetic is in ``ops`` so the tests can reach it."""
+        return read_state_slot(state, slot, self.num_slots)
+
+    def _write_state(self, state: torch.Tensor, updated: torch.Tensor, slot) -> None:
+        """Write this slot, leaving the others untouched."""
+        write_state_slot(state, updated, slot, self.num_slots)
 
     def _setup_weight_loaders(self):
         """>>> PARALLELISM: slice every projection by head <<<
@@ -851,7 +875,7 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             output = self.tp_group.all_reduce(output)
         return output.contiguous()
 
-    def forward_prefill(self, hidden_states, cached_seq_len=None, valid_mask=None):
+    def forward_prefill(self, hidden_states, cached_seq_len=None, valid_mask=None, slot=None):
         """Chunked gated-delta-rule prefill; the scan and the mask contract are in ``gdn.py``.
 
         ``cached_seq_len`` is non-None only in segmented / continuation prefill, and is the number of
@@ -865,8 +889,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             initial_state = None
         else:
             is_continuation = (cached_seq_len.reshape(()) > 0).to(self.dtype)
-            conv_state = self.conv_state
-            initial_state = self.recurrent_state * is_continuation.to(self.recurrent_state.dtype)
+            conv_state = self._read_state(self.conv_state, slot)
+            initial_state = (self._read_state(self.recurrent_state, slot)
+                             * is_continuation.to(self.recurrent_state.dtype))
 
         output, state, new_conv_state = gated_delta_net_prefill(
             hidden_states, self._weights(), self._dims(), self.eps,
@@ -875,11 +900,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             initial_state=initial_state,
         )
         # In place -> aliased by the FX pass, so the next graph call sees this state.
-        self.recurrent_state.copy_(state)
-        self.conv_state.copy_(new_conv_state.to(self.conv_state.dtype))
+        self._write_state(self.recurrent_state, state, slot)
+        self._write_state(self.conv_state, new_conv_state, slot)
         return self._reduce(output)
 
-    def forward_decode(self, hidden_states, is_continuation):
+    def forward_decode(self, hidden_states, is_continuation, slot=None):
         """One-token step. Raises rather than mis-generating if handed more than one token, which is
         what makes speculative decoding fail loudly instead of silently advancing the state once.
 
@@ -895,11 +920,12 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
             )
         output, state, new_conv_state = gated_delta_net_decode(
             hidden_states.to(self.dtype), self._weights(), self._dims(), self.eps,
-            conv_state=self.conv_state, recurrent_state=self.recurrent_state,
+            conv_state=self._read_state(self.conv_state, slot),
+            recurrent_state=self._read_state(self.recurrent_state, slot),
             is_continuation=is_continuation,
         )
-        self.recurrent_state.copy_(state)
-        self.conv_state.copy_(new_conv_state.to(self.conv_state.dtype))
+        self._write_state(self.recurrent_state, state, slot)
+        self._write_state(self.conv_state, new_conv_state, slot)
         return self._reduce(output)
 
 

@@ -1759,3 +1759,128 @@ def test_the_two_neuron_config_spellings_resolve_to_one_and_refuse_disagreement(
     assert resolve(sentinel, sentinel) is sentinel
     with pytest.raises(ValueError, match="both supplied"):
         resolve(sentinel, object())
+
+
+# ---------------------------------------------------------------------------
+# Per-slot recurrent state: the mechanism concurrency needs
+# ---------------------------------------------------------------------------
+
+
+def test_one_slot_is_the_identity_and_the_plain_assignment():
+    """At one slot the slot functions must be exactly what they replaced, or generalising the state
+    changes the shipped configuration's numbers."""
+    state = torch.randn(1, 3, 4, dtype=torch.float32)
+    assert _ops.slot_mask(0, state, 1) is None
+    assert _ops.read_state_slot(state, 0, 1) is state, "one slot must not copy or reduce"
+    updated = torch.randn(1, 3, 4, dtype=torch.float32)
+    _ops.write_state_slot(state, updated, 0, 1)
+    assert torch.equal(state, updated), "one slot must be the plain assignment, bit for bit"
+
+
+@pytest.mark.parametrize("num_slots", [2, 3, 8])
+def test_reading_a_slot_returns_exactly_that_slot(num_slots):
+    state = torch.randn(num_slots, 2, 3, dtype=torch.float32)
+    for slot in range(num_slots):
+        got = _ops.read_state_slot(state, torch.tensor(slot), num_slots)
+        assert got.shape == (1, 2, 3)
+        assert torch.equal(got[0], state[slot]), f"slot {slot} read the wrong entry"
+
+
+@pytest.mark.parametrize("num_slots", [2, 5])
+def test_writing_a_slot_leaves_the_others_bit_identical(num_slots):
+    """The whole point. A write that perturbs another slot is a request reading someone else's state,
+    which produces fluent output with the wrong history rather than an error."""
+    state = torch.randn(num_slots, 2, 3, dtype=torch.float32)
+    for slot in range(num_slots):
+        before = state.clone()
+        updated = torch.randn(1, 2, 3, dtype=torch.float32)
+        _ops.write_state_slot(state, updated, torch.tensor(slot), num_slots)
+        assert torch.equal(state[slot], updated[0]), f"slot {slot} was not written"
+        for other in range(num_slots):
+            if other != slot:
+                assert torch.equal(state[other], before[other]), (
+                    f"writing slot {slot} disturbed slot {other}")
+
+
+def test_the_slot_functions_hold_for_bf16_state_too():
+    """The conv state is the model dtype, not fp32, so the mask must not promote it."""
+    state = torch.randn(3, 4, dtype=torch.bfloat16).unsqueeze(0).expand(3, 3, 4).contiguous()
+    state = state + torch.arange(3, dtype=torch.bfloat16).reshape(3, 1, 1)
+    updated = torch.randn(1, 3, 4, dtype=torch.bfloat16)
+    before = state.clone()
+    _ops.write_state_slot(state, updated, torch.tensor(1), 3)
+    assert state.dtype is torch.bfloat16
+    assert torch.equal(state[1], updated[0])
+    assert torch.equal(state[0], before[0]) and torch.equal(state[2], before[2])
+
+
+def test_two_slots_carry_two_independent_recurrences():
+    """End to end over the real scan: two sequences interleaved in two slots must give the same output
+    as each run alone.
+
+    This is the claim concurrency rests on, and the mechanism is checkable without a device even though
+    the runner-side pool is not. The decode inputs are pre-generated so both runs consume exactly the
+    same tensors -- a shared generator would make an ordering difference look like a state leak.
+    """
+    module, config = _hf_gated_delta_net(seed=21)
+    weights = _weights_from_hf(module)
+    eps = config.rms_norm_eps
+    torch.manual_seed(31)
+    prefill_len, decode_steps, sequences = 32, 3, 2
+    prompts = [torch.randn(1, prefill_len, _TEST_HIDDEN) for _ in range(sequences)]
+    steps = [[torch.randn(1, 1, _TEST_HIDDEN) for _ in range(decode_steps)]
+             for _ in range(sequences)]
+    continuing = torch.tensor(1.0)
+
+    def empty(slots):
+        recurrent = torch.zeros(slots, _TEST_DIMS["v_heads"], _TEST_DIMS["head_k_dim"],
+                                _TEST_DIMS["head_v_dim"], dtype=torch.float32)
+        conv = torch.zeros(slots, 2 * _TEST_DIMS["k_heads"] * _TEST_DIMS["head_k_dim"]
+                           + _TEST_DIMS["v_heads"] * _TEST_DIMS["head_v_dim"],
+                           _TEST_DIMS["kernel"] - 1)
+        return recurrent, conv
+
+    with torch.no_grad():
+        # Each sequence alone, in a single-slot state.
+        alone = []
+        for sequence in range(sequences):
+            recurrent, conv = empty(1)
+            _, state, conv_out = gated_delta_net_prefill(
+                prompts[sequence], weights, _TEST_DIMS, eps, chunk_size=DEFAULT_CHUNK_SIZE)
+            _ops.write_state_slot(recurrent, state, 0, 1)
+            _ops.write_state_slot(conv, conv_out, 0, 1)
+            outputs = []
+            for step in steps[sequence]:
+                out, state, conv_out = gated_delta_net_decode(
+                    step, weights, _TEST_DIMS, eps, conv_state=conv, recurrent_state=recurrent,
+                    is_continuation=continuing)
+                _ops.write_state_slot(recurrent, state, 0, 1)
+                _ops.write_state_slot(conv, conv_out, 0, 1)
+                outputs.append(out.clone())
+            alone.append(outputs)
+
+        # Both sequences sharing a two-slot state, decode steps alternating between them.
+        recurrent, conv = empty(sequences)
+        for sequence in range(sequences):
+            _, state, conv_out = gated_delta_net_prefill(
+                prompts[sequence], weights, _TEST_DIMS, eps, chunk_size=DEFAULT_CHUNK_SIZE)
+            _ops.write_state_slot(recurrent, state, torch.tensor(sequence), sequences)
+            _ops.write_state_slot(conv, conv_out, torch.tensor(sequence), sequences)
+        shared: list[list[torch.Tensor]] = [[] for _ in range(sequences)]
+        for step_index in range(decode_steps):
+            for sequence in range(sequences):
+                slot = torch.tensor(sequence)
+                out, state, conv_out = gated_delta_net_decode(
+                    steps[sequence][step_index], weights, _TEST_DIMS, eps,
+                    conv_state=_ops.read_state_slot(conv, slot, sequences),
+                    recurrent_state=_ops.read_state_slot(recurrent, slot, sequences),
+                    is_continuation=continuing)
+                _ops.write_state_slot(recurrent, state, slot, sequences)
+                _ops.write_state_slot(conv, conv_out, slot, sequences)
+                shared[sequence].append(out.clone())
+
+    for sequence in range(sequences):
+        for step_index, (want, got) in enumerate(zip(alone[sequence], shared[sequence])):
+            assert torch.equal(want, got), (
+                f"sequence {sequence} step {step_index} differs once the two share the state; "
+                "one request is reading the other's history")
