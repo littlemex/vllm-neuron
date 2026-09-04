@@ -292,17 +292,57 @@ def test_video_is_refused_rather_than_packed_as_one_item():
 
 
 # ---------------------------------------------------------------------------
-# write_block_ids
+# cache_write_destinations
 # ---------------------------------------------------------------------------
 
 
-def test_write_block_ids_fills_the_tail_with_scratch():
-    ids = vision_inputs.write_block_ids([[3], [7, 8]], num_blocks=5, scratch_block_id=99)
+def test_cache_write_destinations_fills_the_tail_with_scratch():
+    ids = vision_inputs.cache_write_destinations([[3], [7, 8]], num_blocks=5, scratch_block_id=99)
     assert ids.tolist() == [3, 7, 8, 99, 99]
     assert ids.dtype is torch.int64
 
 
-def test_write_block_ids_refuses_more_cache_blocks_than_the_graph_takes():
+def test_cache_write_destinations_refuses_more_cache_blocks_than_the_graph_takes():
     """Dropping the extras would not fail: those tokens would be read back as whatever the cache held."""
     with pytest.raises(ValueError, match="the graph takes"):
-        vision_inputs.write_block_ids([[1, 2, 3]], num_blocks=2, scratch_block_id=0)
+        vision_inputs.cache_write_destinations([[1, 2, 3]], num_blocks=2, scratch_block_id=0)
+
+
+# ---------------------------------------------------------------------------
+# The warmup grid formula
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("block_size", [128, 256, 1024, 2048])
+def test_the_warmup_grid_formula_is_legal_for_a_divisible_block_size(block_size):
+    """``[1, merge, block_size // merge]`` fills exactly one block and satisfies the merge grid.
+
+    The warmup computes this rather than searching for a legal side, which is only safe while the block
+    size is divisible by ``merge ** 2`` — the factory enforces that. This pins the formula itself: the
+    grid must hold exactly ``block_size`` patches, and both its height and width must be multiples of
+    the merge size, or the merger consumes partial groups.
+    """
+    merge = VISION_CONFIG.spatial_merge_size
+    assert block_size % (merge ** 2) == 0, "the parametrisation itself must be legal"
+    height, width = merge, block_size // merge
+    assert height * width == block_size
+    assert height % merge == 0 and width % merge == 0
+    # And the packer accepts it, which is the claim that matters.
+    built, _grid, num_blocks = _build([[1, height, width]], block_size=block_size,
+                                      buckets=[block_size])
+    assert num_blocks == 1
+    assert built["pixel_values"].shape[:2] == (1, block_size)
+
+
+def test_several_bucket_sized_items_get_one_block_each():
+    """The warmup builds ceil(bucket / block_size) items of one block each; the bucket derivation has to
+    give them that many blocks. Deriving it from the token total instead would come up short."""
+    merge = VISION_CONFIG.spatial_merge_size
+    height, width = merge, BLOCK_SIZE // merge
+    rows = [[1, height, width]] * 3
+    built, _grid, num_blocks = _build(rows, buckets=[BLOCK_SIZE, BLOCK_SIZE * 2, BLOCK_SIZE * 4])
+    assert num_blocks >= 3, f"three one-block items need at least three blocks, got {num_blocks}"
+    low = built["bound_min"].reshape(num_blocks, -1)
+    high = built["bound_max"].reshape(num_blocks, -1)
+    occupied = sum(1 for block in range(num_blocks) if (high[block] > low[block]).any())
+    assert occupied == 3

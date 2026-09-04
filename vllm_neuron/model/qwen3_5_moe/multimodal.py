@@ -34,9 +34,9 @@ from .model_bf16 import Qwen3_5MoeForCausalLM
 from .ops import temporal_axis
 from .vision_inputs import (
     build_vision_inputs,
+    cache_write_destinations,
     patch_dim,
     vision_blocks,
-    write_block_ids,
 )
 
 
@@ -92,21 +92,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
         """
         block_size = vision_neuron_config.vision_attention_block_size
         merge = self.vision_config.spatial_merge_size
-        # One synthetic item that fills the bucket. Its grid has to be legal for the packer -- a frame
-        # must fit in a block -- so the bucket is expressed as ceil(bucket / block_size) items of
-        # block_size patches each, rather than one item of `bucket` patches.
-        per_item = block_size
-        side = merge
-        while (per_item // side) % merge or side * (per_item // side) != per_item:
-            side += merge
-            if side > per_item:
-                raise ValueError(
-                    f"vision_attention_block_size={block_size} cannot be written as a grid whose "
-                    f"height and width are multiples of spatial_merge_size={merge}."
-                )
+        # Synthetic items that fill the bucket, each exactly one block. The bucket is expressed as
+        # ceil(bucket / block_size) items of block_size patches rather than one item of `bucket`
+        # patches, because an item has to fit inside a block for the packer to accept it.
+        #
+        # The grid is computed, not searched: height and width must both be multiples of the merge size,
+        # so `merge` by `block_size // merge` is a legal grid whenever block_size is divisible by
+        # merge**2 — which the factory checks at construction, where the other block-size constraints
+        # live. Searching for a legal side here would report a config error as a warmup failure.
         items = max(1, -(-bucket // block_size))
-        grid = torch.tensor([[1, side, per_item // side]] * items)
-        pixels = torch.zeros(items * per_item, patch_dim(self.vision_config), dtype=torch.bfloat16)
+        grid = torch.tensor([[1, merge, block_size // merge]] * items)
+        pixels = torch.zeros(items * block_size, patch_dim(self.vision_config), dtype=torch.bfloat16)
         num_blocks = vision_blocks(
             grid, block_size, list(vision_neuron_config.num_vision_tokens_buckets),
             dp_size=vision_neuron_config.dp_size)
@@ -150,20 +146,42 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
         block_size = vision_neuron_config.vision_attention_block_size
         merge_factor = self.vision_config.spatial_merge_size ** 2
 
-        # Allocate cache blocks per item, in item order. That order is what makes the encoder-block to
-        # cache-block mapping a flattening rather than a lookup.
-        cache_block_map = []
-        for index, row in enumerate(image_grid_thw.tolist()):
-            merged = (row[0] * row[1] * row[2]) // merge_factor
-            cache_block_map.append(encoder_cache.allocate(
-                mm_hashes[index], encoder_cache.dense_tokens_per_block(merged, block_size)))
-
+        # Everything that can be refused is done BEFORE a single cache block is reserved. The order is
+        # the point: `allocate` records blocks under the item's mm_hash, which is the cache key, so a
+        # later failure would leave a hash present whose blocks were never written — and the next request
+        # carrying the same image would find the hash and read back whatever the cache held. Nothing in
+        # the two calls below needs the cache, so there is no reason to allocate first.
         num_blocks = vision_blocks(
             image_grid_thw, block_size, list(vision_neuron_config.num_vision_tokens_buckets),
             dp_size=vision_neuron_config.dp_size)
         built = build_vision_inputs(
             pixel_values, image_grid_thw, self.vision_config, block_size, num_blocks)
-        destinations = write_block_ids(
+
+        # Now reserve, in item order. That order is what makes the encoder-block to cache-block mapping
+        # a flattening rather than a lookup.
+        #
+        # The two block counts are computed in different units: the packer works in raw patches, the
+        # cache in merged tokens, and both are divided by the same `block_size`. They agree only because
+        # an item is limited to one block, which makes both ceilings 1 — so the equality is checked
+        # rather than assumed. If either rule is relaxed, an item could own two encoder blocks and one
+        # cache block, and its tail would scatter into a neighbour's entry with no error.
+        cache_block_map = []
+        for index, row in enumerate(image_grid_thw.tolist()):
+            raw = row[0] * row[1] * row[2]
+            merged = raw // merge_factor
+            blocks = encoder_cache.allocate(
+                mm_hashes[index], encoder_cache.dense_tokens_per_block(merged, block_size))
+            encoder_blocks = -(-raw // block_size)
+            if len(blocks) != encoder_blocks:
+                raise ValueError(
+                    f"item {index} occupies {encoder_blocks} encoder block(s) but was allocated "
+                    f"{len(blocks)} cache block(s) ({raw} raw patches, {merged} merged tokens, "
+                    f"block_size {block_size}). The encoder writes block i into cache block i, so the "
+                    "two counts must agree per item."
+                )
+            cache_block_map.append(blocks)
+
+        destinations = cache_write_destinations(
             cache_block_map, num_blocks, encoder_cache.scratch_block_id)
 
         device = next(self.visual.parameters()).device

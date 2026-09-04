@@ -85,23 +85,27 @@ def vision_blocks(grid_thw: torch.Tensor, block_size: int, buckets: list[int],
     request needing three blocks runs the graph warmed for its bucket and pads the rest. Deriving it
     from ``ceil(tokens / block_size)`` instead would produce a shape no graph was warmed for.
 
-    The bucket is chosen from the greater of the token count and ``items * block_size``, because items
-    do not share blocks: two images of 64 and 48 patches total 112 and so select a 128 bucket, which is
-    one block, and the packing then needs two. The reference applies this correction for video (where
-    whole-frame packing makes it obvious) and not for images, so a request carrying several small images
-    reaches the packer one block short.
+    The bucket is selected from the number of blocks the packing NEEDS, expressed back as a token count,
+    not from the token count itself. Items do not share blocks, so two images of 64 and 48 patches total
+    112, select a 128 bucket, and that is one block where the packing needs two. The reference applies
+    this correction for video (where whole-frame packing makes it obvious) and not for images, so a
+    request carrying several small images reaches the packer one block short.
+
+    The per-item sum is used rather than ``items * block_size`` because the two agree only while every
+    item fits in one block. That rule is enforced by ``ffd_pack_images``, three calls away, and a bucket
+    derivation whose correctness depends on a rule enforced elsewhere is the kind that survives the rule
+    being relaxed.
     """
-    tokens = int(grid_thw.prod(dim=1).sum().item())
-    items = int(grid_thw.shape[0])
+    per_item = grid_thw.prod(dim=1).tolist()
+    blocks_needed = sum(-(-int(tokens) // block_size) for tokens in per_item)
     _bucket, num_blocks = select_vision_bucket(
-        max(tokens, items * block_size), buckets, block_size, dp_size=dp_size
+        max(int(sum(per_item)), blocks_needed * block_size), buckets, block_size, dp_size=dp_size
     )
     return int(num_blocks)
 
 
 def build_vision_inputs(pixel_values: torch.Tensor, grid_thw: torch.Tensor, vision_config,
-                        block_size: int, num_blocks: int,
-                        rope_theta: float = 10000.0) -> dict[str, torch.Tensor]:
+                        block_size: int, num_blocks: int) -> dict[str, torch.Tensor]:
     """The six host-side tensors, keyed by the encoder's parameter names.
 
     ``num_blocks`` is required rather than derived: it has to be the count the graph was warmed for
@@ -111,6 +115,11 @@ def build_vision_inputs(pixel_values: torch.Tensor, grid_thw: torch.Tensor, visi
     Items are packed one per block. That is the helper's rule and it is not an efficiency choice: the
     encoder writes block i into one cache block, and the cache allocates blocks per item, so a shared
     block has no valid destination. The helper raises when an item does not fit in a block.
+
+    There is deliberately no ``theta`` argument. This checkpoint's ``vision_config`` does not carry one,
+    so ``compute_rotary_pos_emb``'s own default is the single authority; taking it as a parameter would
+    let the warmup path and the real path be given different rotary tables, which is not an error and
+    not a shape mismatch -- it is a quietly degraded image embedding.
     """
     tokens_per_item = grid_thw.prod(dim=1).tolist()
     total = int(sum(tokens_per_item))
@@ -135,7 +144,7 @@ def build_vision_inputs(pixel_values: torch.Tensor, grid_thw: torch.Tensor, visi
     merge = vision_config.spatial_merge_size
     grid_side = int(vision_config.num_position_embeddings ** 0.5)
 
-    cos, sin = compute_rotary_pos_emb(grid_thw, head_dim, merge, theta=rope_theta)
+    cos, sin = compute_rotary_pos_emb(grid_thw, head_dim, merge)
     corners, weights = compute_position_indices_and_weights(grid_thw, grid_side, merge)
     bound_min, bound_max = compute_block_bounds(tokens_per_item, assignment, grid_thw)
 
@@ -158,8 +167,8 @@ def build_vision_inputs(pixel_values: torch.Tensor, grid_thw: torch.Tensor, visi
     }
 
 
-def write_block_ids(cache_block_map: list[list[int]], num_blocks: int,
-                    scratch_block_id: int) -> torch.Tensor:
+def cache_write_destinations(cache_block_map: list[list[int]], num_blocks: int,
+                             scratch_block_id: int) -> torch.Tensor:
     """Map each encoder output block to the cache block it writes into.
 
     Items own contiguous runs of encoder blocks in item order, so flattening the per-item cache block

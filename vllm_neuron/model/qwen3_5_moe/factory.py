@@ -213,13 +213,14 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
                            neuron_config: NeuronConfig | None,
                            vision_neuron_config) -> nn.Module:
         cls._validate_config(hf_config, neuron_config)
-        cls._validate_vision_config(vision_neuron_config)
+        cls._validate_vision_config(hf_config, vision_neuron_config)
         from .multimodal import Qwen3_5MoeForConditionalGeneration as Model
         return cast(nn.Module, Model.from_configs(
             hf_config, neuron_config, vision_neuron_config=vision_neuron_config))
 
     @classmethod
-    def _validate_vision_config(cls, vision_neuron_config) -> None:
+    def _validate_vision_config(cls, hf_config: PretrainedConfig,
+                                vision_neuron_config) -> None:
         """Reject a vision configuration the encoder cannot be given.
 
         Read directly rather than through ``getattr`` with a default, for the reason the text checks
@@ -244,6 +245,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
         block_size = vision_neuron_config.vision_attention_block_size
         if block_size <= 0:
             raise ValueError(f"vision_attention_block_size must be positive; got {block_size}.")
+        # A block has to be expressible as a patch grid whose height and width are both multiples of the
+        # spatial merge size, because the merger consumes merge x merge patch groups. Checked here, with
+        # the other block-size constraints, so a bad deployment value is reported as a config error
+        # rather than surfacing later as a failure to build the encoder's warmup input.
+        merge = hf_config.vision_config.spatial_merge_size
+        if block_size % (merge ** 2):
+            raise ValueError(
+                f"vision_attention_block_size={block_size} is not divisible by "
+                f"spatial_merge_size**2 ({merge}**2 = {merge ** 2}), so a block cannot be filled by "
+                "whole merge groups."
+            )
         if any(bucket % block_size for bucket in buckets):
             raise ValueError(
                 f"every vision token bucket must be a multiple of the block size {block_size}; got "
