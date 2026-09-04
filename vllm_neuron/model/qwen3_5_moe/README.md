@@ -335,7 +335,21 @@ reading dominates decode, and the KV gather is not where the time goes.
 Adding the logprobs gather (see below) changed neither number: 0.375 s / 9.2 ms against 0.376 s /
 9.2 ms without it.
 
-The example's default bucket set follows from this: `[128, 2048]`, not a power-of-two ladder.
+**The per-bucket cost is a property of the width, not of `max_model_len`.** Recompiled at
+`max_model_len` 4096 with buckets `[128, 512, 1024, 2048, 4096]`, the same widths cost the same:
+
+| Bucket | at `max_model_len` 2048 | at 4096 | per token |
+|---|---|---|---|
+| 128 | 0.157 s | 0.157 s | 1.23 ms |
+| 512 | 0.507 s | 0.510 s | 1.00 ms |
+| 1024 | 1.115 s | 1.119 s | 1.09 ms |
+| 2048 | 0.373 s | 0.375 s | **0.183 ms** |
+| 4096 | — | 0.667 s | **0.163 ms** |
+
+So the efficient widths are 128 and everything from 2048 up, and the example keeps exactly those:
+`[128, 2048]` at `max_model_len` 2048, `[128, 2048, 4096]` at 4096. Dropping 2048 from the 4096 case
+would cost 1.78x on a 1500-token prompt (0.667 s in the 4096 bucket against 0.375 s in the 2048 one),
+which is what the first version of this rule did before it was measured at a second `max_model_len`.
 
 Compilation and loading, for planning device time: loading the 72 GB checkpoint from the shared
 filesystem cold takes about 16 minutes; compiling one 2048 prefill bucket about 12 minutes; four

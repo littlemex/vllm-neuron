@@ -14,16 +14,24 @@ from vllm import LLM, SamplingParams
 os.environ.setdefault("NEURON_SKIP_EFA_AFFINITY", "1")
 
 
-def _prefill_buckets(max_model_len):
-    """A small bucket for short prompts, then straight to the widest one.
+# Widths measured to be efficient on this model, in tokens. 128 is cheap in absolute terms for short
+# prompts; everything from 2048 up is cheap per token. The gap is not an omission: 512 and 1024 cost MORE
+# in absolute time than the 2048 bucket they exist to avoid, so a request is better off padded past them.
+# Measured per bucket at max_model_len 2048 and again at 4096, with identical results, so the cost is a
+# property of the width and not of max_model_len.
+_EFFICIENT_PREFILL_WIDTHS = (128, 2048, 4096, 8192, 16384)
 
-    Skipping the intermediate widths is deliberate — see the note at the call site. Anything below the
-    small bucket cannot be expressed (128 is the minimum the plugin generates), and the last bucket must
-    equal ``max_num_batched_tokens``, which this example sets to ``max_model_len``.
+
+def _prefill_buckets(max_model_len):
+    """Only the widths measured to be efficient, ending exactly at max_model_len.
+
+    The last bucket must equal ``max_num_batched_tokens``, which this example sets to ``max_model_len``,
+    so that value is always included even if it is not one of the measured widths. Retune the table for
+    a different model: the widths that land on efficient kernels are a property of the shapes, and this
+    one was measured for this architecture at TP=4 in bf16.
     """
-    if max_model_len <= 128:
-        return [max_model_len]
-    return [128, max_model_len]
+    buckets = [w for w in _EFFICIENT_PREFILL_WIDTHS if w < max_model_len]
+    return buckets + [max_model_len]
 
 
 def _text_architecture(config):
@@ -74,11 +82,11 @@ def main():
         additional_config={
             "neuron_config": {
                 # Measured, not guessed: TTFT per prefill bucket is NOT monotonic in bucket width.
-                # At max_model_len 2048 the buckets cost 0.157 s (128), 0.507 s (512), 1.115 s (1024)
-                # and 0.373 s (2048), so a request landing in 512 or 1024 pays MORE than one padded
-                # all the way to 2048. A power-of-two ladder is therefore the wrong default here; the
-                # small bucket is worth keeping and the middle is not. Retune per max_model_len,
-                # because the cheap widths are a property of the shapes, not of this list.
+                # The buckets cost 0.157 s (128), 0.510 s (512), 1.119 s (1024), 0.375 s (2048) and
+                # 0.667 s (4096) — so a request landing in 512 or 1024 pays MORE than one padded all
+                # the way to 2048. Per token the wide buckets are far better still (0.18 ms at 2048 and
+                # 0.16 ms at 4096, against 1.0-1.2 ms below). A power-of-two ladder is therefore the
+                # wrong default; see _EFFICIENT_PREFILL_WIDTHS for what to keep.
                 "num_batched_tokens_buckets": _prefill_buckets(args.max_model_len),
             },
             "vision_neuron_config": {
