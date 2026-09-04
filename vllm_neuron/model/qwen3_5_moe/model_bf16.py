@@ -20,6 +20,8 @@ import json
 import os
 
 import nki.language as nl
+from typing import Any, cast
+
 import torch
 import torch.nn.functional as F
 from nkilib.core.moe.moe_cte.moe_cte import (
@@ -112,7 +114,9 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return rmsnorm(x, self.weight, self.eps)
+        # `rmsnorm` comes from an untyped helper module, so its return is Any; naming it here keeps the
+        # ambiguity from spreading to every caller of this layer.
+        return cast(torch.Tensor, rmsnorm(x, self.weight, self.eps))
 
 
 # ============================================================
@@ -204,9 +208,41 @@ class Qwen3_5MoeAttention(nn.Module):
         self.q_norm_weight = nn.Parameter(torch.zeros(self.head_dim, dtype=self.dtype))
         self.k_norm_weight = nn.Parameter(torch.zeros(self.head_dim, dtype=self.dtype))
 
-        self.k_cache: torch.Tensor | None = None
-        self.v_cache: torch.Tensor | None = None
+        # Optional only until the runner calls bind_kv_cache. Reads go through the properties below,
+        # which fail with the reason rather than with an AttributeError on None.
+        self._k_cache: torch.Tensor | None = None
+        self._v_cache: torch.Tensor | None = None
         self._setup_weight_loaders()
+
+    @property
+    def k_cache(self) -> torch.Tensor:
+        """The key cache the runner bound to this layer.
+
+        A property rather than a plain attribute so that using the layer before ``bind_kv_cache`` says
+        so. Left as ``Tensor | None``, every read site would have to narrow it, and the narrowing would
+        be noise at forty call sites for a condition that is really a lifecycle fact.
+        """
+        if self._k_cache is None:
+            raise RuntimeError(
+                f"layer {self.layer_idx} has no key cache; the runner must call bind_kv_cache "
+                "before the first forward"
+            )
+        return self._k_cache
+
+    @property
+    def v_cache(self) -> torch.Tensor:
+        """The value cache the runner bound to this layer. See ``k_cache``."""
+        if self._v_cache is None:
+            raise RuntimeError(
+                f"layer {self.layer_idx} has no value cache; the runner must call bind_kv_cache "
+                "before the first forward"
+            )
+        return self._v_cache
+
+    def bind_caches(self, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
+        """Give this layer the caches the runner allocated for it."""
+        self._k_cache = k_cache
+        self._v_cache = v_cache
 
     def _setup_weight_loaders(self):
         """>>> PARALLELISM: Q sharded by head, KV sliced per rank group (replicated when TP > KV) <<<
@@ -303,10 +339,12 @@ class Qwen3_5MoeAttention(nn.Module):
         else:
             key = key.repeat_interleave(self.num_key_value_groups, dim=0)
             value = value.repeat_interleave(self.num_key_value_groups, dim=0)
-            attn_output = NF.flash_attention(
+            # The kernel's annotation covers several paths, one of which returns a tuple. This call
+            # is the plain path, so the type is named rather than narrowed at every later use.
+            attn_output = cast(torch.Tensor, NF.flash_attention(
                 query.transpose(1, 2), key.transpose(1, 2), value,
                 scale=self.scaling, causal_mask=True, tp_q=False, tp_out=True,
-            )                                                       # [heads, head_dim, T]
+            ))                                                      # [heads, head_dim, T]
         # [heads, head_dim, T] -> [T, heads * head_dim] so the gate lines up with q_proj's packing.
         attn_output = attn_output.permute(2, 0, 1).reshape(-1, self.q_size)
         return self._gate_and_project_out(attn_output, gate)
@@ -557,7 +595,9 @@ class Qwen3_5MoeMoE(nn.Module):
         )
         (expert_affinities_masked, token_position_to_id, block_to_expert,
          conditions) = NF.build_blockwise_mapping(
-            expert_affinities=expert_affinities,
+            # The router returns a tuple when router logits are requested; only the affinities are
+            # wanted here, and the call site above has already normalised it.
+            expert_affinities=cast(torch.Tensor, expert_affinities),
             num_local_experts=self.num_experts,
             num_experts_per_token=self.top_k,
             block_size=self.block_size,
@@ -618,10 +658,10 @@ class Qwen3_5MoeMoE(nn.Module):
             skip_router_logits=True,
         )
         # The kernel returns a tuple when router logits are included; skip_router_logits=True still
-        # returns a 1-tuple on some paths, so normalise here rather than at the call sites.
-        if isinstance(output, tuple):
-            output = output[0]
-        return output
+        # returns a 1-tuple on some paths, so normalise here rather than at the call sites. Bound to a
+        # new name so neither name has to carry both types.
+        tensor_output = output[0] if isinstance(output, tuple) else output
+        return cast(torch.Tensor, tensor_output)
 
 
 # ============================================================
@@ -641,6 +681,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
     key head ``j`` to value heads ``2j, 2j+1`` — so a rank's key heads expand to exactly its own
     value heads and no cross-rank exchange is needed inside the mixer.
     """
+
+    # Registered buffers, annotated because nn.Module.__getattr__ hides their type. The recurrent state
+    # is fp32 regardless of the model dtype: it accumulates over the whole prefix.
+    recurrent_state: torch.Tensor
+    conv_state: torch.Tensor
 
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
@@ -840,6 +885,15 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
     mixer is either a Gated DeltaNet or a gated GQA; the MoE half is identical for both.
     """
 
+    # nn.Module.__getattr__ is typed `Tensor | Module`, so without these a type checker cannot tell a
+    # submodule from a buffer and every attribute read here becomes ambiguous. They also say what the
+    # layer holds, which the dispatch on layer_type otherwise leaves implicit.
+    input_layernorm: Qwen3_5MoeRMSNorm
+    post_attention_layernorm: Qwen3_5MoeRMSNorm
+    mlp: "Qwen3_5MoeMoE"
+    self_attn: "Qwen3_5MoeAttention"
+    linear_attn: "Qwen3_5MoeGatedDeltaNet"
+
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
         self.layer_idx = layer_idx
@@ -861,6 +915,21 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
 
 class Qwen3_5MoeModel(nn.Module):
     """Embedding + 40 hybrid layers + final norm."""
+
+    layers: nn.ModuleList
+    norm: Qwen3_5MoeRMSNorm
+    rotary_cos: torch.Tensor
+    rotary_sin: torch.Tensor
+
+    @property
+    def decoder_layers(self) -> list["Qwen3_5MoeDecoderLayer"]:
+        """The layers, typed.
+
+        ``nn.ModuleList`` yields ``Module``, which loses everything the layer declares, so iterating it
+        directly defeats the annotations above. This is a view over the same registered modules — not a
+        second registration — and it exists so the loops below read the layer's real attributes.
+        """
+        return cast(list["Qwen3_5MoeDecoderLayer"], list(self.layers))
 
     def __init__(self, config: Qwen3_5MoeConfig):
         super().__init__()
@@ -953,7 +1022,7 @@ class Qwen3_5MoeModel(nn.Module):
         # checkpoint's bf16 accumulation. Each block normalises from fp32 into the model dtype for the
         # weights, and its output is cast back to fp32 for the residual add.
         hidden_states = self.embed_tokens(input_ids, scatter_tokens=False).to(torch.float32)
-        for layer in self.layers:
+        for layer in self.decoder_layers:
             normed = layer.input_layernorm(hidden_states).to(model_dtype)
             if layer.layer_type == FULL_ATTENTION:
                 mixed = layer.self_attn(normed, positions, cos, sin, attn_metadata, is_prefill)
@@ -1043,7 +1112,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         deliberately absent here: the runner's LayerSpec has no representation for a recurrent state,
         which is why it lives in module buffers instead."""
         layers = []
-        for i, layer in enumerate(self.model.layers):
+        for i, layer in enumerate(self.model.decoder_layers):
             if layer.layer_type != FULL_ATTENTION:
                 continue
             attention = layer.self_attn
@@ -1056,14 +1125,13 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         return KVSpec(layers=layers)
 
     def bind_kv_cache(self, kv_caches):
-        for i, layer in enumerate(self.model.layers):
+        for i, layer in enumerate(self.model.decoder_layers):
             if layer.layer_type != FULL_ATTENTION:
                 continue
             name = attention_metadata_key(i)
             if name not in kv_caches:
                 raise RuntimeError(f"KV cache for {name} not initialized")
-            layer.self_attn.k_cache = kv_caches[name][0]
-            layer.self_attn.v_cache = kv_caches[name][1]
+            layer.self_attn.bind_caches(kv_caches[name][0], kv_caches[name][1])
 
     @torch.no_grad()
     def forward(self, input_ids, positions, attn_metadata, sampling_positions,
@@ -1097,7 +1165,9 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             # >>> PARALLELISM: gather the vocabulary shards for logprobs <<<
             # The gather uses the lm_head's OWN group and the same primitive the layer uses for
             # gather_output, so it cannot disagree with how the vocabulary was sharded.
-            gathered_logits = all_gather_tensor(logits, 1, self.lm_head.tp_group)
+            # The layer's group is Optional in its annotation and set by construction here, so the
+            # cast records that rather than adding a check that cannot fire.
+            gathered_logits = all_gather_tensor(logits, 1, cast(Any, self.lm_head.tp_group))
         return (self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank),
                 gathered_logits)
 
@@ -1170,7 +1240,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         # The runner builds the model on `meta`; the recurrent buffers are runtime state rather than
         # checkpoint entries, so load_state_dict leaves them there. Reassign real zeros so the
         # in-place updates (and the aliasing they rely on) have somewhere to write.
-        for layer in self.model.layers:
+        for layer in self.model.decoder_layers:
             if layer.layer_type != LINEAR_ATTENTION:
                 continue
             mixer = layer.linear_attn

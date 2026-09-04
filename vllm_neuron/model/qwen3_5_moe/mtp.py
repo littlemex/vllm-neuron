@@ -91,7 +91,7 @@ class Qwen3_5MoeMultiTokenPredictor(nn.Module):
         ``embeddings`` comes from the main model's embedding table — the checkpoint has no separate one
         for the head — and both inputs are ``[batch, tokens, hidden]``.
         """
-        if embeddings.shape != last_hidden_state.shape:
+        if embeddings.shape != last_hidden_state.shape:  # lint-port: ok shapes are graph-static
             raise ValueError(
                 f"the embedding and the hidden state must have the same shape; got "
                 f"{tuple(embeddings.shape)} and {tuple(last_hidden_state.shape)}"
@@ -112,3 +112,22 @@ class Qwen3_5MoeMultiTokenPredictor(nn.Module):
                            valid_mask)
         hidden_states = hidden_states + moe_out.reshape(hidden_states.shape)
         return self.norm(hidden_states)
+
+    def kv_layer_spec(self):
+        """What the runner has to allocate for this head, as a plain tuple.
+
+        The draft layer is full attention, so it needs its own KV cache and its own attention metadata,
+        both keyed by a layer index that must not collide with the main model's. This is the by-product
+        that makes "the model is right but nothing runs": the head itself is four small modules, and the
+        contract around it is the work.
+
+        A tuple rather than a ``LayerSpec`` so this module does not import the runner's types and stays
+        loadable by a CPU test. The model assembles the real spec.
+        """
+        attention = self.self_attn
+        return (self.layer_idx, attention.num_key_value_heads_per_rank, attention.head_dim,
+                attention.dtype, attention.window_size)
+
+    def bind_kv_cache_entry(self, k_cache, v_cache) -> None:
+        """Give the draft layer the caches the runner allocated for its index."""
+        self.self_attn.bind_caches(k_cache, v_cache)

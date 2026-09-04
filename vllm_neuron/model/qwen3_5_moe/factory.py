@@ -8,6 +8,8 @@ capacity have been spent. See the model README for the reasons behind each refus
 
 from __future__ import annotations
 
+from typing import cast
+
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -66,7 +68,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                                neuron_config: NeuronConfig | None) -> nn.Module:
         cls._validate_config(hf_config, neuron_config)
         from .model_bf16 import Qwen3_5MoeForCausalLM as Model
-        return Model.from_configs(hf_config, neuron_config)
+        return cast(nn.Module, Model.from_configs(hf_config, neuron_config))
 
     @classmethod
     def _validate_config(cls, hf_config: PretrainedConfig,

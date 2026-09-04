@@ -34,8 +34,8 @@ def patch_dim(vision_config) -> int:
     This is the width the checkpoint's ``patch_embed.proj`` expects, so it is derived from the config
     rather than passed in; a mismatch here would show up as a shape error deep inside the encoder.
     """
-    return (vision_config.in_channels * vision_config.temporal_patch_size
-            * vision_config.patch_size * vision_config.patch_size)
+    return int(vision_config.in_channels * vision_config.temporal_patch_size
+               * vision_config.patch_size * vision_config.patch_size)
 
 
 def block_count(total_patches: int, block_size: int) -> int:
