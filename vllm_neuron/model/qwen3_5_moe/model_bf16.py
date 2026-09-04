@@ -18,10 +18,9 @@ from __future__ import annotations
 import glob
 import json
 import os
-
-import nki.language as nl
 from typing import Any, cast
 
+import nki.language as nl
 import torch
 import torch.nn.functional as F
 from nkilib.core.moe.moe_cte.moe_cte import (
@@ -890,9 +889,9 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
     # layer holds, which the dispatch on layer_type otherwise leaves implicit.
     input_layernorm: Qwen3_5MoeRMSNorm
     post_attention_layernorm: Qwen3_5MoeRMSNorm
-    mlp: "Qwen3_5MoeMoE"
-    self_attn: "Qwen3_5MoeAttention"
-    linear_attn: "Qwen3_5MoeGatedDeltaNet"
+    mlp: Qwen3_5MoeMoE
+    self_attn: Qwen3_5MoeAttention
+    linear_attn: Qwen3_5MoeGatedDeltaNet
 
     def __init__(self, config: Qwen3_5MoeConfig, layer_idx: int):
         super().__init__()
@@ -922,7 +921,7 @@ class Qwen3_5MoeModel(nn.Module):
     rotary_sin: torch.Tensor
 
     @property
-    def decoder_layers(self) -> list["Qwen3_5MoeDecoderLayer"]:
+    def decoder_layers(self) -> list[Qwen3_5MoeDecoderLayer]:
         """The layers, typed.
 
         ``nn.ModuleList`` yields ``Module``, which loses everything the layer declares, so iterating it
