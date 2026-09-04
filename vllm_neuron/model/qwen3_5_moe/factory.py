@@ -180,3 +180,84 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "state has no block-hash addressing, so a reused prefix would continue from the "
                 "wrong state. Unset --enable-prefix-caching."
             )
+
+
+class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
+    """The multimodal architecture: the same text backbone with the vision tower attached.
+
+    Registered under the name the published checkpoint declares. Registering it is what opens the
+    runner's multimodal path — the runner keys off the architecture name to build a vision
+    NeuronConfig, size the encoder's buckets and route image inputs to ``embed_multimodal``. So this
+    class existing is not a convenience; it is the entry point, and without it the model-side vision
+    work is unreachable (the same shape of wall the MTP head hit, from the other side).
+
+    Every deployment check the text architecture makes applies unchanged and is inherited. What is
+    added is the vision tower's own requirement: the encoder needs a VisionNeuronConfig, and it needs
+    the block size and the token buckets in it, because the graph is compiled per bucket.
+    """
+
+    def __init__(self, hf_config: PretrainedConfig, text_neuron_config: NeuronConfig | None = None,
+                 vision_neuron_config=None) -> None:
+        nn.Module.__init__(self)
+        self._model = self._select_multimodal(hf_config, text_neuron_config, vision_neuron_config)
+
+    @classmethod
+    def from_configs(cls, hf_config: PretrainedConfig, neuron_config: NeuronConfig | None = None,
+                     text_neuron_config: NeuronConfig | None = None,
+                     vision_neuron_config=None, **kwargs) -> nn.Module:
+        neuron = neuron_config if neuron_config is not None else text_neuron_config
+        return cls._select_multimodal(hf_config, neuron, vision_neuron_config)
+
+    @classmethod
+    def _select_multimodal(cls, hf_config: PretrainedConfig,
+                           neuron_config: NeuronConfig | None,
+                           vision_neuron_config) -> nn.Module:
+        cls._validate_config(hf_config, neuron_config)
+        cls._validate_vision_config(vision_neuron_config)
+        from .multimodal import Qwen3_5MoeForConditionalGeneration as Model
+        return cast(nn.Module, Model.from_configs(
+            hf_config, neuron_config, vision_neuron_config=vision_neuron_config))
+
+    @classmethod
+    def _validate_vision_config(cls, vision_neuron_config) -> None:
+        """Reject a vision configuration the encoder cannot be given.
+
+        Read directly rather than through ``getattr`` with a default, for the reason the text checks
+        give: a default turns a renamed field into a guard that never fires.
+        """
+        if vision_neuron_config is None:
+            raise ValueError(
+                "the multimodal architecture needs a VisionNeuronConfig; without it the encoder's "
+                "block size and token buckets are unknown and no encoder graph can be warmed. Serve "
+                "the checkpoint as Qwen3_5MoeForCausalLM for text-only."
+            )
+        buckets = list(vision_neuron_config.num_vision_tokens_buckets)
+        block_size = vision_neuron_config.vision_attention_block_size
+        if not buckets:
+            raise ValueError(
+                "num_vision_tokens_buckets is empty, so no encoder graph would be compiled and the "
+                "first image would arrive with nothing to run."
+            )
+        if block_size <= 0:
+            raise ValueError(f"vision_attention_block_size must be positive; got {block_size}.")
+        if any(bucket % block_size for bucket in buckets):
+            raise ValueError(
+                f"every vision token bucket must be a multiple of the block size {block_size}; got "
+                f"{[b for b in buckets if b % block_size]}. A partial block at the end has no cache "
+                "block to be written into."
+            )
+
+    @classmethod
+    def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:
+        """How many raw patches collapse into one embedding token, for the runner's budgeting."""
+        return int(hf_config.vision_config.spatial_merge_size) ** 2
+
+    @classmethod
+    def get_max_pixels_token_count(cls, hf_config: PretrainedConfig, max_pixels: int) -> int:
+        """Convert a pixel cap into a raw (pre-merge) patch count.
+
+        Patch tiling differs across architectures, which is why the model owns this rather than the
+        runner: here a patch is ``patch_size`` square, so the count is the cap divided by its area.
+        """
+        patch_size = int(hf_config.vision_config.patch_size)
+        return max_pixels // (patch_size ** 2)

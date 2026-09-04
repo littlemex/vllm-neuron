@@ -36,6 +36,7 @@ from vllm.distributed.parallel_state import get_tp_group
 import vllm_neuron.functional as NF
 from vllm_neuron.functional.moe.router import RouterComputationOrder
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.qwen3_vl.utils.merge_vision_embeds import merge_vision_embeddings
 from vllm_neuron.nn import ColumnParallelLinear
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.utils.weight_loader import (
@@ -60,7 +61,14 @@ from .layout import (
     shard_heads,
     shard_rows_transposed,
 )
-from .ops import apply_partial_rotary, redirect_padded_slots, rmsnorm, rotary_tables
+from .ops import (
+    apply_partial_rotary,
+    mrope_tables,
+    redirect_padded_slots,
+    rmsnorm,
+    rotary_tables,
+    temporal_axis,
+)
 
 # Chunk width for the gated-delta-rule prefill scan. 64 is the reference kernel's default; it is a
 # tiling choice only (pinned by test_chunk_size_does_not_change_the_result), so it can be retuned for
@@ -1002,7 +1010,29 @@ class Qwen3_5MoeModel(nn.Module):
         slot_mapping = self._attention_metadata(attn_metadata).get("slot_mapping")
         return None if slot_mapping is None else (slot_mapping >= 0)
 
-    def forward(self, input_ids, positions, attn_metadata):
+    def _rotary(self, positions, rotary_position_ids):
+        """cos/sin for this step, from either the single-axis table or the three axes.
+
+        ``rotary_position_ids`` is ``[3, T]`` and is supplied only by the multimodal architecture, where
+        the axes genuinely differ. When it is absent the precomputed table is indexed, which is both
+        cheaper (a gather instead of an outer product per token, inside the graph) and exact: for a text
+        prompt the three axes carry the same position, so the interleave selects the same frequency from
+        whichever plane it reads.
+
+        That last sentence is the regression condition, and it is pinned to the bit rather than to a
+        tolerance (``test_three_axis_rotary_matches_the_table_when_the_axes_agree``). Without bit
+        equality, a change in the text output after wiring vision could not be attributed: it might be
+        this path or it might be the vision plumbing.
+        """
+        if rotary_position_ids is None:
+            index = positions.to(torch.long)
+            return self.rotary_cos.index_select(0, index), self.rotary_sin.index_select(0, index)
+        return mrope_tables(rotary_position_ids, self.config.rotary_dim, self.config.rope_theta,
+                            self.config.mrope_section, dtype=self.config.torch_dtype)
+
+    def forward(self, input_ids, positions, attn_metadata,
+                vision_embedding_blocks=None, vision_positions=None,
+                rotary_position_ids=None):
         is_prefill = self._is_prefill(attn_metadata)
         cached_seq_len = self._segmented_cached_len(attn_metadata) if is_prefill else None
         valid_mask = self._prefill_valid_mask(attn_metadata) if is_prefill else None
@@ -1013,14 +1043,33 @@ class Qwen3_5MoeModel(nn.Module):
         # carried recurrent and conv state so a fresh request starts from zero. It is tensor
         # arithmetic, so no Python branch on a runtime value enters the graph.
         is_continuation = (positions.reshape(-1)[:1] > 0).reshape(())
-        cos = self.rotary_cos.index_select(0, positions.to(torch.long))
-        sin = self.rotary_sin.index_select(0, positions.to(torch.long))
+        cos, sin = self._rotary(positions, rotary_position_ids)
 
         model_dtype = self.config.torch_dtype
         # The residual stream is kept in fp32: see the module docstring for why this deviates from the
         # checkpoint's bf16 accumulation. Each block normalises from fp32 into the model dtype for the
         # weights, and its output is cast back to fp32 for the residual add.
-        hidden_states = self.embed_tokens(input_ids, scatter_tokens=False).to(torch.float32)
+        embedded = self.embed_tokens(input_ids, scatter_tokens=False)
+        if is_prefill and vision_embedding_blocks is not None and vision_positions is not None:
+            # Scattered in the embedding dtype, before the fp32 cast: the vision embeddings replace token
+            # embeddings, so they belong in the same representation the table produced. Casting first
+            # would give the same values (the widening is exact) at twice the traffic.
+            #
+            # rank is 0 because this backbone does not shard the sequence (embed_tokens is called with
+            # scatter_tokens=False), so the merge's global and local coordinates coincide. Passing
+            # self.tp_group's rank instead would remap positions that were never split.
+            embedded, deepstack = merge_vision_embeddings(
+                embedded, vision_embedding_blocks, vision_positions, rank=0)
+            if deepstack is not None:
+                # A wider cache row than the text stream means the checkpoint wants per-layer visual
+                # injection. The config class already refuses such a checkpoint; this is the second
+                # place it could arrive from, and dropping it silently would serve an image whose
+                # intermediate features never reached the decoder.
+                raise NotImplementedError(
+                    "the encoder cache carries deepstack features, which this implementation does not "
+                    "inject into the decoder layers."
+                )
+        hidden_states = embedded.to(torch.float32)
         for layer in self.decoder_layers:
             normed = layer.input_layernorm(hidden_states).to(model_dtype)
             if layer.layer_type == FULL_ATTENTION:
@@ -1132,6 +1181,19 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 raise RuntimeError(f"KV cache for {name} not initialized")
             layer.self_attn.bind_caches(kv_caches[name][0], kv_caches[name][1])
 
+    def _positions(self, positions):
+        """Split the runner's positions into the sequential axis and the rotary's position ids.
+
+        Two things are wanted from one argument. The KV cache, the attention mask and the recurrent
+        layers' fresh-request test need ONE monotone position per token; the rotary may need three.
+
+        For the text architecture the three agree (see ``get_mrope_input_positions``), so the first axis
+        serves as the sequential one and the rotary needs no separate ids — returning None for them
+        selects the cheaper table lookup. The multimodal subclass overrides this, because there the axes
+        differ and only the temporal one is monotone.
+        """
+        return temporal_axis(positions), None
+
     @torch.no_grad()
     def forward(self, input_ids, positions, attn_metadata, sampling_positions,
                 sampling_params, spec_decode_metadata=None, logit_mask=None, rank=None,
@@ -1146,14 +1208,12 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             raise NotImplementedError(
                 "Qwen3.5-MoE on Neuron does not merge prompt embeddings; it embeds input_ids only."
             )
-        if positions.dim() == 2 and positions.shape[0] == 3:  # lint-port: ok dim and shape are graph-static, not tensor contents
-            # MRoPE positions arrive as [3, T]. For text the three axes are identical (see
-            # get_mrope_input_positions), so collapsing to the first is exact rather than an
-            # approximation. A multimodal request never reaches here: get_mrope_input_positions
-            # refuses it while the positions are being built.
-            positions = positions[0]
-        positions = positions.to(torch.int32)
-        hidden_states = self.model(input_ids, positions, attn_metadata)
+        sequential, rotary_position_ids = self._positions(positions)
+        hidden_states = self.model(
+            input_ids, sequential, attn_metadata,
+            vision_embedding_blocks=kwargs.get("vision_embedding_blocks"),
+            vision_positions=kwargs.get("vision_positions"),
+            rotary_position_ids=rotary_position_ids)
         sampled = torch.index_select(hidden_states, 0, sampling_positions)
         logits = self.lm_head(sampled)
         if self.on_device_sampling_config is None:
@@ -1169,6 +1229,22 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             gathered_logits = all_gather_tensor(logits, 1, cast(Any, self.lm_head.tp_group))
         return (self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank),
                 gathered_logits)
+
+    def checkpoint_mappings(self, source, checkpoint_keys):
+        """Every parameter this model needs, mapped to the checkpoint key(s) that fill it.
+
+        Split out of ``load_weights`` so an architecture that adds parameters extends the map instead of
+        reimplementing the load. That matters more than it looks: the load ends with two checks — every
+        mapped source present, and nothing left on ``meta`` — and both are written over the WHOLE model.
+        A subclass that loaded its extra weights in a second pass would run the meta check before its own
+        parameters were filled, so it would have to weaken the check that catches the worst failure.
+        """
+        return checkpoint_mappings(
+            [layer.layer_type for layer in self.model.layers],
+            source,
+            has_lm_head="lm_head.weight" in checkpoint_keys,
+            tie_word_embeddings=self.config.tie_word_embeddings,
+        )
 
     def load_weights(self, checkpoint_path, device, cache_dir=None):
         """Map the HF checkpoint onto the per-rank parameters.
@@ -1212,12 +1288,7 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 f"e.g. {sorted(checkpoint_keys)[:5]}"
             )
 
-        mappings = checkpoint_mappings(
-            [layer.layer_type for layer in self.model.layers],
-            source,
-            has_lm_head="lm_head.weight" in checkpoint_keys,
-            tie_word_embeddings=self.config.tie_word_embeddings,
-        )
+        mappings = self.checkpoint_mappings(source, checkpoint_keys)
 
         missing = sorted(
             key for value in mappings.values()

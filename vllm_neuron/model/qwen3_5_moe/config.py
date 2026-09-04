@@ -18,7 +18,7 @@ import torch
 from transformers import PretrainedConfig
 
 if TYPE_CHECKING:      # keeps this module free of Neuron imports; it is only an annotation
-    from vllm_neuron.model.neuron_config import NeuronConfig
+    from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 
 # layer_types legend (HF strings, used verbatim so a config change cannot silently remap a layer).
 LINEAR_ATTENTION = "linear_attention"
@@ -49,6 +49,9 @@ class Qwen3_5MoeVisionConfig:
     # A non-empty list means intermediate vision layers feed the text layers and would need that path.
     deepstack_visual_indexes: list[int] = field(default_factory=list)
     torch_dtype: torch.dtype = torch.bfloat16
+    # The runner's VisionNeuronConfig: the encoder's block size and token buckets. A deployment choice
+    # rather than a checkpoint fact, so it is attached here and not read from the config dict.
+    neuron_config: VisionNeuronConfig | None = None
 
     @property
     def head_dim(self) -> int:
@@ -265,3 +268,93 @@ class Qwen3_5MoeConfig:
 
         filtered["neuron_config"] = neuron_config
         return cls(**filtered)
+
+
+@dataclass
+class Qwen3_5MoeMultimodalConfig:
+    """The wrapper the published checkpoint actually is: a text backbone plus a vision tower.
+
+    ``Qwen3_5MoeConfig.from_configs`` unwraps ``text_config`` and drops everything beside it, which is
+    right for the text-only architecture and wrong for this one: the vision tower's shape and the four
+    special token ids live at the TOP level, next to ``text_config`` rather than inside it. Building this
+    from the same source dict keeps the unwrapping in one place instead of teaching the text config to
+    half-remember its wrapper.
+
+    The token ids have no defaults. A wrong id here does not fail: it makes the position builder mark the
+    wrong spans as vision, so the image is placed at the wrong offsets and the output is a fluent lie.
+    """
+
+    text_config: Qwen3_5MoeConfig
+    vision_config: Qwen3_5MoeVisionConfig
+    image_token_id: int
+    video_token_id: int
+    vision_start_token_id: int
+    vision_end_token_id: int
+
+    def __post_init__(self) -> None:
+        text = self.text_config
+        vision = self.vision_config
+        if vision.out_hidden_size != text.hidden_size:
+            raise ValueError(
+                f"the vision tower emits {vision.out_hidden_size}-wide embeddings but the text stream "
+                f"is {text.hidden_size} wide; this checkpoint family relies on them matching so the "
+                "patch merger's output enters the token embedding stream with no extra projection."
+            )
+        for name in ("image_token_id", "video_token_id",
+                     "vision_start_token_id", "vision_end_token_id"):
+            value = getattr(self, name)
+            if not 0 <= value < text.vocab_size:
+                raise ValueError(
+                    f"{name}={value} is outside the vocabulary (0, {text.vocab_size}); a wrong id "
+                    "marks the wrong prompt spans as vision rather than failing."
+                )
+
+    @property
+    def neuron_config(self):
+        """The text backbone's NeuronConfig, so the top-level model can read it uniformly."""
+        return self.text_config.neuron_config
+
+    @classmethod
+    def from_configs(cls, hf_config, neuron_config: NeuronConfig | None,
+                     vision_neuron_config=None) -> Qwen3_5MoeMultimodalConfig:
+        """Build both halves from one HF config.
+
+        ``vision_neuron_config`` is attached to the vision config rather than consumed here: the
+        encoder's block size and token buckets are runner-supplied deployment choices, not checkpoint
+        facts, and the preprocessing needs them at call time.
+        """
+        if isinstance(hf_config, (str, bytes)):
+            with open(hf_config) as handle:
+                config_dict = json.load(handle)
+        elif isinstance(hf_config, PretrainedConfig):
+            config_dict = hf_config.to_dict()
+        else:
+            config_dict = dict(hf_config)
+
+        vision_dict = config_dict.get("vision_config") or {}
+        if not vision_dict:
+            raise ValueError(
+                "this architecture requires a vision_config in the checkpoint config; a text-only "
+                "checkpoint should be served as Qwen3_5MoeForCausalLM instead."
+            )
+        vision_fields = set(Qwen3_5MoeVisionConfig.__dataclass_fields__)
+        vision = Qwen3_5MoeVisionConfig(
+            **{k: v for k, v in vision_dict.items() if k in vision_fields and v is not None})
+        vision.neuron_config = vision_neuron_config
+
+        missing = [name for name in ("image_token_id", "video_token_id",
+                                     "vision_start_token_id", "vision_end_token_id")
+                   if config_dict.get(name) is None]
+        if missing:
+            raise ValueError(
+                f"the checkpoint config is missing {missing}; these mark which prompt spans are "
+                "vision, and guessing them would place the image at the wrong offsets."
+            )
+        return cls(
+            text_config=Qwen3_5MoeConfig.from_configs(hf_config, neuron_config),
+            vision_config=vision,
+            image_token_id=int(config_dict["image_token_id"]),
+            video_token_id=int(config_dict["video_token_id"]),
+            vision_start_token_id=int(config_dict["vision_start_token_id"]),
+            vision_end_token_id=int(config_dict["vision_end_token_id"]),
+        )

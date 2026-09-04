@@ -17,6 +17,7 @@ Two independent oracles are used deliberately:
 import importlib
 import importlib.util
 import json
+import math
 import os
 import sys
 import types
@@ -1392,6 +1393,22 @@ PUBLISHED_CONFIG = {
     },
 }
 
+# The multimodal half of the same published config: the vision tower's shape and the four special token
+# ids sit BESIDE text_config, not inside it. Kept separate so the text tests above keep proving that the
+# text architecture ignores all of this.
+PUBLISHED_MULTIMODAL_CONFIG = {
+    **PUBLISHED_CONFIG,
+    "image_token_id": 248056,
+    "video_token_id": 248057,
+    "vision_start_token_id": 248053,
+    "vision_end_token_id": 248054,
+    "vision_config": {
+        "depth": 27, "hidden_act": "gelu_pytorch_tanh", "hidden_size": 1152, "in_channels": 3,
+        "intermediate_size": 4304, "num_heads": 16, "num_position_embeddings": 2304,
+        "out_hidden_size": 2048, "patch_size": 16, "spatial_merge_size": 2,
+        "temporal_patch_size": 2, "deepstack_visual_indexes": [],
+    },
+}
 
 def test_published_config_parses_to_the_expected_shape():
     config = Qwen3_5MoeConfig.from_configs(PUBLISHED_CONFIG, None)
@@ -1521,3 +1538,188 @@ def test_checkpoint_mapping_matches_a_real_checkpoint():
     decoder = {k for k in checkpoint_keys if k.startswith(f"{source}.")} | {"lm_head.weight"}
     unconsumed = sorted(k for k in decoder - sources if ".visual." not in k)
     assert not unconsumed, unconsumed[:8]
+
+
+# ---------------------------------------------------------------------------
+# The vision activation: why the reference's GELU is kept as-is
+# ---------------------------------------------------------------------------
+
+
+def _gelu_erf(x):
+    return 0.5 * x * (1.0 + torch.erf(x / 1.4142135623730951))
+
+
+def _gelu_tanh(x):
+    inner = math.sqrt(2.0 / math.pi) * (x + 0.044715 * x.pow(3))
+    return 0.5 * x * (1.0 + torch.tanh(inner))
+
+
+def _bf16_grid(lo=-30.0, hi=30.0):
+    """Every bf16 value in the range, as fp64. An input the network cannot represent cannot produce a
+    difference the network can observe, so the sweep is over the representable grid, not a linspace."""
+    dense = torch.arange(lo, hi, 1.0 / 4096, dtype=torch.float32)
+    return torch.unique(dense.to(torch.bfloat16)).to(torch.float64)
+
+
+def test_the_activation_choice_sits_below_the_precision_floor():
+    """The checkpoint's config asks for ``gelu_pytorch_tanh``; the reused encoder computes the exact
+    erf form. Substituting the tanh form is a change that looks obviously right and buys nothing.
+
+    Two quantities decide it. The approximation difference is what switching would remove. The
+    precision floor is what any bf16 realisation of either form already costs. Switching is only worth
+    doing if the first is the larger of the two, and it is ~17x smaller.
+    """
+    grid = _bf16_grid()
+    exact_erf = _gelu_erf(grid)
+    exact_tanh = _gelu_tanh(grid)
+
+    approximation_gap = (exact_tanh - exact_erf).abs().max().item()
+    precision_floor = min(
+        (_gelu_erf(grid.to(torch.float32)).to(torch.bfloat16).to(torch.float64)
+         - exact_erf).abs().max().item(),
+        (_gelu_tanh(grid.to(torch.float32)).to(torch.bfloat16).to(torch.float64)
+         - exact_tanh).abs().max().item(),
+    )
+    assert approximation_gap < 1e-3, approximation_gap
+    assert precision_floor > 5e-3, precision_floor
+    assert approximation_gap * 10 < precision_floor, (
+        f"the approximation gap ({approximation_gap:.3e}) is no longer small against the bf16 "
+        f"precision floor ({precision_floor:.3e}); revisit whether the tanh form should be used")
+
+
+def test_the_tanh_form_cancels_in_bf16_where_the_erf_form_barely_does():
+    """A second reason not to substitute it: computed in bf16, ``1 + tanh(...)`` reaches exactly zero
+    on the negative side, so the activation returns 0 where the true GELU is still around -3e-3. The
+    erf form saturates at a similar count, so this is not an argument for erf either — it is why the
+    substitution cannot be justified as 'closer to the checkpoint'."""
+    grid = _bf16_grid().to(torch.bfloat16)
+    tanh_inner = torch.tanh(math.sqrt(2.0 / math.pi) * (grid + 0.044715 * grid.pow(3)))
+    erf_inner = torch.erf(grid / 1.4142135623730951)
+    tanh_cancels = int((tanh_inner == -1.0).sum())
+    erf_cancels = int((erf_inner == -1.0).sum())
+    assert tanh_cancels > 0 and erf_cancels > 0
+    assert abs(tanh_cancels - erf_cancels) < 0.05 * tanh_cancels, (
+        f"tanh cancels at {tanh_cancels} inputs and erf at {erf_cancels}; if these diverge, the "
+        "choice of form starts to matter for a reason other than the approximation")
+
+
+# ---------------------------------------------------------------------------
+# Positions: the sequential axis, and the regression condition for the 3-axis rotary
+# ---------------------------------------------------------------------------
+
+
+def test_temporal_axis_is_taken_and_narrowed():
+    positions = torch.stack([torch.arange(6), torch.arange(6) * 2, torch.arange(6) * 3])
+    got = _ops.temporal_axis(positions)
+    assert got.dtype is torch.int32
+    assert got.tolist() == list(range(6)), "the sequential position must come from the temporal axis"
+    # A one-dimensional input is text and passes through, so a text request cannot become a shape error.
+    assert _ops.temporal_axis(torch.arange(4)).tolist() == [0, 1, 2, 3]
+
+
+def test_the_height_axis_is_not_monotone_so_it_cannot_be_the_sequential_one():
+    """States the reason the temporal axis is the one taken, rather than asserting the choice twice.
+
+    A 2x3 image's height axis is [0,0,0,1,1,1]: it repeats, so it cannot index a KV slot, and its width
+    axis [0,1,2,0,1,2] goes backwards at each row.
+    """
+    height = torch.tensor([0, 0, 0, 1, 1, 1])
+    width = torch.tensor([0, 1, 2, 0, 1, 2])
+    assert not bool((height[1:] > height[:-1]).all())
+    assert not bool((width[1:] > width[:-1]).all())
+
+
+def test_three_axis_rotary_matches_the_table_when_the_axes_agree():
+    """The regression condition for wiring vision: bit equality, not a tolerance.
+
+    Without it, a change in the text output after the vision path lands cannot be attributed — it could
+    be the new rotary or the vision plumbing. With it, text moving means the cause is vision.
+    """
+    config = Qwen3_5MoeConfig.from_configs(PUBLISHED_CONFIG, None)
+    positions = torch.tensor([0, 1, 2, 7, 63, 1024, 16383], dtype=torch.int64)
+    table_cos, table_sin = rotary_tables(
+        config.rotary_dim, config.max_position_embeddings, config.rope_theta,
+        dtype=config.torch_dtype)
+    expected_cos = table_cos.index_select(0, positions)
+    expected_sin = table_sin.index_select(0, positions)
+
+    three = positions.unsqueeze(0).expand(3, positions.numel()).contiguous()
+    got_cos, got_sin = mrope_tables(three, config.rotary_dim, config.rope_theta,
+                                        config.mrope_section, dtype=config.torch_dtype)
+    assert torch.equal(got_cos, expected_cos), "the three-axis path is not bit-identical for text"
+    assert torch.equal(got_sin, expected_sin)
+
+
+def test_three_axis_rotary_differs_once_the_axes_differ():
+    """The negative half: if it agreed here too, the interleave would be doing nothing and the whole
+    three-axis path would be decoration."""
+    config = Qwen3_5MoeConfig.from_configs(PUBLISHED_CONFIG, None)
+    positions = torch.arange(8, dtype=torch.int64)
+    same = positions.unsqueeze(0).expand(3, 8).contiguous()
+    varied = torch.stack([positions, positions * 0 + 3, positions * 0 + 5])
+    a, _ = mrope_tables(same, config.rotary_dim, config.rope_theta, config.mrope_section,
+                            dtype=config.torch_dtype)
+    b, _ = mrope_tables(varied, config.rotary_dim, config.rope_theta, config.mrope_section,
+                            dtype=config.torch_dtype)
+    assert not torch.equal(a, b)
+
+
+# ---------------------------------------------------------------------------
+# The multimodal config wrapper
+# ---------------------------------------------------------------------------
+
+
+def test_multimodal_config_reads_the_wrapper_not_the_text_half():
+    """The vision shape and the four special token ids live BESIDE text_config, so the text config's
+    unwrapping drops them. This is the class that keeps them."""
+    config = _config.Qwen3_5MoeMultimodalConfig.from_configs(PUBLISHED_MULTIMODAL_CONFIG, None)
+    assert config.vision_config.depth == 27
+    assert config.vision_config.out_hidden_size == config.text_config.hidden_size
+    for name in ("image_token_id", "video_token_id",
+                 "vision_start_token_id", "vision_end_token_id"):
+        assert getattr(config, name) > 0, f"{name} was not read from the wrapper"
+    assert config.image_token_id != config.video_token_id
+
+
+def test_multimodal_config_refuses_a_token_id_outside_the_vocabulary():
+    """A wrong id marks the wrong prompt span as vision, which places the image at the wrong offsets and
+    produces a fluent lie rather than an error."""
+    published = dict(PUBLISHED_MULTIMODAL_CONFIG)
+    published["image_token_id"] = 10 ** 9
+    with pytest.raises(ValueError, match="outside the vocabulary"):
+        _config.Qwen3_5MoeMultimodalConfig.from_configs(published, None)
+
+
+def test_multimodal_config_refuses_a_missing_token_id():
+    published = dict(PUBLISHED_MULTIMODAL_CONFIG)
+    del published["vision_start_token_id"]
+    with pytest.raises(ValueError, match="vision_start_token_id"):
+        _config.Qwen3_5MoeMultimodalConfig.from_configs(published, None)
+
+
+def test_multimodal_config_refuses_a_text_only_checkpoint():
+    published = {k: v for k, v in PUBLISHED_MULTIMODAL_CONFIG.items() if k != "vision_config"}
+    with pytest.raises(ValueError, match="Qwen3_5MoeForCausalLM"):
+        _config.Qwen3_5MoeMultimodalConfig.from_configs(published, None)
+
+
+def test_no_text_weight_claims_the_vision_namespace():
+    """The multimodal load is ONE map: the text map plus the vision map with a ``visual.`` prefix.
+
+    A name claimed by both halves would let one silently win and the other's weights would never be
+    loaded. The class raises on a collision, so what is worth checking here is the property that keeps
+    the raise from ever firing — and of the two halves, this is the one that can drift quietly. The
+    vision half is generated by the encoder itself (``layout.vision_checkpoint_mappings``), so its names
+    move only when the encoder's do; the text map is written out by hand and a new parameter could land
+    in the vision namespace.
+    """
+    config = Qwen3_5MoeConfig.from_configs(PUBLISHED_CONFIG, None)
+    text = checkpoint_mappings(config.layer_types, "model.language_model", has_lm_head=True,
+                               tie_word_embeddings=False)
+    intruders = sorted(name for name in text if name.startswith("visual."))
+    assert not intruders, f"these text destinations sit in the vision namespace: {intruders}"
+    # And the text map must not consume the vision tower's checkpoint keys, which is what makes reading
+    # the checkpoint once with one map safe.
+    sources = [key for value in text.values()
+               for key in ([value] if isinstance(value, str) else value)]
+    assert not [key for key in sources if key.startswith("model.visual.")]

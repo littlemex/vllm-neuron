@@ -100,6 +100,22 @@ def mrope_tables(positions, rotary_dim, theta, mrope_section, dtype=torch.float3
     return emb.cos().to(dtype), emb.sin().to(dtype)
 
 
+def temporal_axis(positions):
+    """The one monotone position per token, whether positions arrive as ``[3, T]`` or ``[T]``.
+
+    MRoPE positions carry three axes. Only the FIRST is monotone: height and width run over an image's
+    grid and go backwards at the start of each row. The KV cache slot, the attention mask and the
+    recurrent layers' fresh-request test all need a monotone position, so they take this one — using
+    height or width for any of them would place tokens out of order without any error.
+
+    Returned as int32 because that is what the attention metadata and the cache indexing expect; the
+    rotary takes the un-narrowed positions separately.
+    """
+    if positions.dim() == 2 and positions.shape[0] == 3:  # lint-port: ok dim and shape are graph-static, not tensor contents
+        positions = positions[0]
+    return positions.to(torch.int32)
+
+
 def _rotate_half(x):
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
