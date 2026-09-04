@@ -231,13 +231,17 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
                 "block size and token buckets are unknown and no encoder graph can be warmed. Serve "
                 "the checkpoint as Qwen3_5MoeForCausalLM for text-only."
             )
+        # The field is Optional and the platform fills it in check_and_update_config, which runs before
+        # the model is built. Checking for None rather than assuming it means a change in that ordering
+        # says so here instead of raising TypeError inside list() three frames down.
+        if not vision_neuron_config.num_vision_tokens_buckets:
+            raise ValueError(
+                "num_vision_tokens_buckets is unset or empty, so no encoder graph would be compiled "
+                "and the first image would arrive with nothing to run. The platform normally derives "
+                "it during config resolution; an empty value here means that step did not run."
+            )
         buckets = list(vision_neuron_config.num_vision_tokens_buckets)
         block_size = vision_neuron_config.vision_attention_block_size
-        if not buckets:
-            raise ValueError(
-                "num_vision_tokens_buckets is empty, so no encoder graph would be compiled and the "
-                "first image would arrive with nothing to run."
-            )
         if block_size <= 0:
             raise ValueError(f"vision_attention_block_size must be positive; got {block_size}.")
         if any(bucket % block_size for bucket in buckets):

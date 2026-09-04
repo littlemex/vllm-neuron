@@ -109,7 +109,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
         pixels = torch.zeros(items * per_item, patch_dim(self.vision_config), dtype=torch.bfloat16)
         num_blocks = vision_blocks(
             grid, block_size, list(vision_neuron_config.num_vision_tokens_buckets),
-            dp_size=getattr(vision_neuron_config, "dp_size", 1))
+            dp_size=vision_neuron_config.dp_size)
         built = build_vision_inputs(pixels, grid, self.vision_config, block_size, num_blocks)
         return {name: tensor.to(device) for name, tensor in built.items()}
 
@@ -160,7 +160,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
 
         num_blocks = vision_blocks(
             image_grid_thw, block_size, list(vision_neuron_config.num_vision_tokens_buckets),
-            dp_size=getattr(vision_neuron_config, "dp_size", 1))
+            dp_size=vision_neuron_config.dp_size)
         built = build_vision_inputs(
             pixel_values, image_grid_thw, self.vision_config, block_size, num_blocks)
         destinations = write_block_ids(
