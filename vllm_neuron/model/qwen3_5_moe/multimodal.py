@@ -215,6 +215,19 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):
     # Forward and weights
     # ------------------------------------------------------------------
 
+    def _vision_inputs(self, kwargs):
+        """This architecture DOES want them, so it takes them.
+
+        Empty is treated as absent: the runner hands over zero blocks during warmup and for a text-only
+        request, and merging nothing is not the same operation as not merging -- the helper stacks the
+        blocks, which is not defined for none of them.
+        """
+        blocks = kwargs.get("vision_embedding_blocks")
+        positions = kwargs.get("vision_positions")
+        if not blocks or positions is None:
+            return None, None
+        return blocks, positions
+
     def _positions(self, positions):
         """Keep all three axes for the rotary, and use the temporal one as the sequential position.
 

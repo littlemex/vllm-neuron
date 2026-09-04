@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import cast
 
+import torch
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -69,6 +70,51 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         cls._validate_config(hf_config, neuron_config)
         from .model_bf16 import Qwen3_5MoeForCausalLM as Model
         return cast(nn.Module, Model.from_configs(hf_config, neuron_config))
+
+    # ------------------------------------------------------------------
+    # vLLM's hybrid-model contract
+    # ------------------------------------------------------------------
+    # vLLM computes the recurrent state's page size from the REGISTERED class, then raises the attention
+    # block size until an attention page is at least as large and records the padding
+    # (``Platform._align_hybrid_block_size``). Without these two classmethods that computation cannot
+    # run, and the KV cache manager refuses at startup with "The page size of the layer is not
+    # divisible by the maximum page size" -- a message that names neither this model nor its state.
+    #
+    # Declared on the factory because that is the class the registry resolves.
+
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config) -> tuple[tuple[int, ...], ...]:
+        """The conv and recurrent state shapes per layer, WITHOUT the slot axis.
+
+        Derived from the same config the model builds from, and sharded the same way, so the page size
+        vLLM computes is the one the model will allocate. A shape that disagreed here would size the
+        pages for a state nobody writes.
+        """
+        from .config import Qwen3_5MoeConfig
+
+        config = Qwen3_5MoeConfig.from_configs(vllm_config.model_config.hf_config, None)
+        world_size = vllm_config.parallel_config.tensor_parallel_size
+        key_dim = config.linear_num_key_heads * config.linear_key_head_dim
+        value_dim = config.linear_num_value_heads * config.linear_value_head_dim
+        conv_dim = (2 * key_dim + value_dim) // world_size
+        return (
+            (conv_dim, config.linear_conv_kernel_dim - 1),
+            (config.linear_num_value_heads // world_size,
+             config.linear_key_head_dim, config.linear_value_head_dim),
+        )
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config) -> tuple[torch.dtype, ...]:
+        """conv in the model dtype, recurrent in fp32.
+
+        The recurrence compounds over the whole prefix and the checkpoint declares fp32 for it, so the
+        two states do NOT share a dtype -- which is also why the page size cannot be derived from one
+        element size.
+        """
+        from .config import Qwen3_5MoeConfig
+
+        config = Qwen3_5MoeConfig.from_configs(vllm_config.model_config.hf_config, None)
+        return (config.torch_dtype, torch.float32)
 
     @classmethod
     def _validate_config(cls, hf_config: PretrainedConfig,

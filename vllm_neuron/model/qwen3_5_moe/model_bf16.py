@@ -1408,6 +1408,20 @@ class Qwen3_5MoeForCausalLM(nn.Module):
             # that never asked for it, since the runner would have allocated nothing.
             self.bind_state_cache(kv_caches)
 
+    def _vision_inputs(self, kwargs):
+        """The encoder-cache views to merge, or ``(None, None)`` for the text architecture.
+
+        **The runner supplies these whether or not this architecture wants them.** It sets
+        ``supports_mm_inputs`` from the multimodal registry, which is keyed by the config's
+        ``model_type``, so overriding ``architectures`` to the text class does not stop vision inputs
+        from arriving -- during warmup they arrive as zero blocks sized from the encoder cache.
+
+        Discarding them here rather than testing whether they are present is the whole point. A guard
+        that asks "were any supplied?" is always satisfied, so the text model would merge encoder-cache
+        blocks it has no encoder for; CPU mode caught exactly that, in the first warmup it ran.
+        """
+        return None, None
+
     def _positions(self, positions):
         """Split the runner's positions into the sequential axis and the rotary's position ids.
 
@@ -1439,10 +1453,10 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "Qwen3.5-MoE on Neuron does not merge prompt embeddings; it embeds input_ids only."
             )
         sequential, rotary_position_ids = self._positions(positions)
+        vision_blocks, vision_positions = self._vision_inputs(kwargs)
         hidden_states = self.model(
             input_ids, sequential, attn_metadata,
-            vision_embedding_blocks=kwargs.get("vision_embedding_blocks"),
-            vision_positions=kwargs.get("vision_positions"),
+            vision_embedding_blocks=vision_blocks, vision_positions=vision_positions,
             rotary_position_ids=rotary_position_ids)
         sampled = torch.index_select(hidden_states, 0, sampling_positions)
         logits = self.lm_head(sampled)

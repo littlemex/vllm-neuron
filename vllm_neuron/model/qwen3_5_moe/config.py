@@ -264,7 +264,7 @@ class Qwen3_5MoeConfig:
             for name in field_names:
                 if name in filtered:
                     continue
-                value = getattr(source_config, name, None)
+                value = getattr(source_config, name, None)  # lint-port: ok probing every dataclass field by name; absence is the normal case, not a guard
                 if value is not None:
                     filtered[name] = value
 

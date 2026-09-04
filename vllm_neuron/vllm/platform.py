@@ -163,11 +163,49 @@ class NeuronPlatform(Platform):
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
-        """Default block_size to 32 for Neuron when the user didn't override."""
+        """Default block_size to 32 for Neuron when the user didn't override, then align for hybrids.
+
+        A model carrying recurrent state has a page size unrelated to the attention page size, and
+        vLLM's KV cache manager can only allocate one size. ``_align_hybrid_block_size`` is the base
+        platform's answer: it reads the state shapes from the registered class, raises the attention
+        block size until an attention page is at least as large, and records the padding on the cache
+        config. Every platform that supports a hybrid model calls it.
+
+        Not calling it does not degrade gracefully. The manager fails at startup with "The page size of
+        the layer is not divisible by the maximum page size", which names neither the model nor its
+        state, and the natural reading is that the model's own spec is wrong.
+        """
         cache_config = vllm_config.cache_config
-        if cache_config.user_specified_block_size:
+        if not cache_config.user_specified_block_size:
+            cache_config.block_size = 32
+        cls._align_hybrid_block_size_if_hybrid(vllm_config)
+
+    @classmethod
+    def _align_hybrid_block_size_if_hybrid(cls, vllm_config: "VllmConfig") -> None:
+        """Run the base platform's hybrid alignment when the model declares recurrent state.
+
+        Detected by the two classmethods the base hook itself requires, rather than by an interface
+        check: a model that has them is exactly a model the hook can run for, so there is no way for the
+        detection and the requirement to drift apart.
+        """
+        from vllm.model_executor.models import ModelRegistry
+
+        try:
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                vllm_config.model_config.architecture,
+                model_config=vllm_config.model_config,
+            )
+        except Exception:  # noqa: BLE001 - resolution failures belong to the loader, not here
             return
-        cache_config.block_size = 32
+        if not (hasattr(model_cls, "get_mamba_state_shape_from_config")  # lint-port: ok probing vLLM's optional hybrid contract, whose absence is the normal case
+                and hasattr(model_cls, "get_mamba_state_dtype_from_config")):  # lint-port: ok same
+            return
+        # The class, not the path string get_attn_backend_cls returns: the hook reads
+        # get_supported_kernel_block_sizes off it (inherited from AttentionBackend).
+        from vllm_neuron.vllm.attention.attn import NeuronAttentionBackend
+
+        logger.info("Hybrid model detected; aligning the attention block size to the state page size.")
+        cls._align_hybrid_block_size(vllm_config, NeuronAttentionBackend)
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:

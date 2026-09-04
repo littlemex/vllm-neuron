@@ -7936,14 +7936,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         # request a single block from this group (plus num_speculative_blocks when a draft is in flight),
         # so the request's row in this group's block table IS the slot the model writes.
         for state_layer in getattr(target_kv_spec, "state_layers", ()):  # lint-port: ok older models return a KVSpec without the field
+            # block_size and the padding come from the cache config, which the platform's hybrid
+            # alignment filled in (see NeuronPlatform.update_block_size_for_backend). Inventing them
+            # here is how the KV cache manager ends up refusing a page size the model never chose.
+            cache = self.vllm_config.cache_config
+            if cache.mamba_block_size is None:
+                raise RuntimeError(
+                    f"{state_layer.name} declares recurrent state but cache_config.mamba_block_size is "
+                    "unset, which means the platform's hybrid block-size alignment did not run. It "
+                    "needs the registered model class to expose get_mamba_state_shape_from_config and "
+                    "get_mamba_state_dtype_from_config."
+                )
             all_kv_cache_specs[state_layer.name] = MambaSpec(
                 shapes=state_layer.shapes,
                 dtypes=state_layer.dtypes,
-                block_size=self.max_model_len,
+                block_size=cache.mamba_block_size,
+                page_size_padded=cache.mamba_page_size_padded,
                 # Looked up by name so a model declaring an unknown state family fails here rather
                 # than carrying a wrong label that nothing on this platform would resolve.
                 mamba_type=MambaAttentionBackendEnum[state_layer.state_kind],
-                mamba_cache_mode=self.vllm_config.cache_config.mamba_cache_mode,
+                mamba_cache_mode=cache.mamba_cache_mode,
                 num_speculative_blocks=state_layer.num_speculative_blocks,
             )
 
