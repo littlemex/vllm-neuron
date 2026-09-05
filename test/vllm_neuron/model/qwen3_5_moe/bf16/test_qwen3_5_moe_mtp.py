@@ -43,7 +43,6 @@ for _name in ("ops", "layout"):
 
 mtp_checkpoint_mappings = _loaded["layout"].mtp_checkpoint_mappings
 concat_draft_inputs = _loaded["ops"].concat_draft_inputs
-rmsnorm = _loaded["ops"].rmsnorm
 
 MTP_SOURCE_FILE = os.path.join(_model_dir, "mtp.py")
 
@@ -82,8 +81,45 @@ def sources_of(mappings: dict) -> list:
     return flat
 
 
+# The map, association by association. An earlier version of this file asserted only that the SET of
+# source keys equalled the checkpoint's, which permits every permutation: swapping the two pre-norms,
+# reordering q/k/v inside the fused destination, or sending `o_proj` to the qkvg parameter all keep the
+# set identical and load garbage. Every one of those is silent -- the shapes are the same or the loader
+# is handed the wrong three tensors in the right total size. So the expected map is written out.
+EXPECTED_MAP = {
+    "fc.weight": "mtp.fc.weight",
+    "norm.weight": "mtp.norm.weight",
+    "pre_fc_norm_embedding.weight": "mtp.pre_fc_norm_embedding.weight",
+    "pre_fc_norm_hidden.weight": "mtp.pre_fc_norm_hidden.weight",
+    "input_layernorm.weight": "mtp.layers.0.input_layernorm.weight",
+    "post_attention_layernorm.weight": "mtp.layers.0.post_attention_layernorm.weight",
+    # Order matters and is q, k, v: the attention fuses them into one parameter in that order, and the
+    # q rows also carry the output gate.
+    "self_attn.qkvg_proj_weight": [
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+    ],
+    "self_attn.o_proj_weight": "mtp.layers.0.self_attn.o_proj.weight",
+    "self_attn.q_norm_weight": "mtp.layers.0.self_attn.q_norm.weight",
+    "self_attn.k_norm_weight": "mtp.layers.0.self_attn.k_norm.weight",
+    "mlp.router_weight": "mtp.layers.0.mlp.gate.weight",
+    "mlp.gate_up_proj_weight": "mtp.layers.0.mlp.experts.gate_up_proj",
+    "mlp.down_proj_weight": "mtp.layers.0.mlp.experts.down_proj",
+    "mlp.shared_gate_proj_weight": "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+    "mlp.shared_up_proj_weight": "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+    "mlp.shared_down_proj_weight": "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+    "mlp.shared_expert_gate_weight": "mtp.layers.0.mlp.shared_expert_gate.weight",
+}
+
+
+def test_the_map_is_exactly_this_association_of_destinations_to_sources():
+    """The whole map, not its key set. A permutation is the defect this is here to refuse."""
+    assert mtp_checkpoint_mappings() == EXPECTED_MAP
+
+
 def test_the_head_consumes_every_mtp_key_and_invents_none():
-    """Both directions. One direction alone lets a real defect through.
+    """Both directions against the checkpoint. One direction alone lets a real defect through.
 
     Only "every source I ask for exists" misses a key the checkpoint has and the head never loads —
     a parameter left at its initial value, which for this architecture's norms is zero. Only "every key
@@ -110,7 +146,11 @@ def test_the_transcribed_key_list_matches_the_real_checkpoint():
         keys = set(json.load(handle)["weight_map"])
     actual = {key for key in keys if key.startswith("mtp.")}
     if not actual:
-        pytest.skip("this checkpoint has no multi-token prediction head")
+        # Not a skip: a checkpoint pointed at this test is expected to be the one the port targets, and
+        # "no MTP keys" is far more likely to be the wrong file than a legitimately headless checkpoint.
+        raise AssertionError(
+            f"{index_path} has no mtp.* keys, so it is not a checkpoint of this architecture. "
+            f"Point QWEN3_5_MOE_CHECKPOINT_INDEX at one, or unset it to skip this check.")
     assert actual == CHECKPOINT_KEYS, {
         "transcribed but absent": sorted(CHECKPOINT_KEYS - actual),
         "present but not transcribed": sorted(actual - CHECKPOINT_KEYS),
@@ -118,11 +158,19 @@ def test_the_transcribed_key_list_matches_the_real_checkpoint():
 
 
 def test_the_source_prefix_is_a_parameter_rather_than_a_hardcoded_mtp():
-    """A checkpoint that nests the head under another prefix has to be loadable without an edit."""
-    mappings = mtp_checkpoint_mappings(source="model.mtp")
-    assert all(key.startswith("model.mtp.") for key in sources_of(mappings))
-    # The destinations are the head's own attribute paths and must not move with the source.
-    assert set(mappings) == set(mtp_checkpoint_mappings())
+    """A checkpoint that nests the head under another prefix has to be loadable without an edit.
+
+    Asserting the prefix alone would pass an implementation that gets the prefix right and every suffix
+    wrong, so the whole map is compared against the default map with the prefix substituted.
+    """
+    def reprefixed(value):
+        if isinstance(value, list):
+            return [reprefixed(item) for item in value]
+        assert value.startswith("mtp."), value
+        return "model." + value
+
+    expected = {destination: reprefixed(source) for destination, source in EXPECTED_MAP.items()}
+    assert mtp_checkpoint_mappings(source="model.mtp") == expected
 
 
 def test_every_destination_names_something_the_head_actually_declares():
@@ -161,23 +209,239 @@ def test_the_embedding_is_the_first_half_of_the_concatenation():
     assert not torch.allclose(projected, last_hidden_state)
 
 
-def test_the_two_pre_norms_are_not_interchangeable():
-    """Why the head carries two norm weights for two tensors of the same width.
-
-    If the same weight were used for both, the head would still run. This pins that the norms are
-    distinct functions of their weight, so swapping which weight goes with which input changes the
-    result — which is what makes the mapping's two separate keys load-order sensitive rather than
-    cosmetic.
-    """
-    hidden = 8
-    torch.manual_seed(1)
-    x = torch.randn(2, hidden)
-    embedding_scale = torch.randn(hidden) * 0.1
-    hidden_scale = torch.randn(hidden) * 0.1
-    assert not torch.allclose(rmsnorm(x, embedding_scale, 1e-6), rmsnorm(x, hidden_scale, 1e-6))
-
-
 def test_mismatched_shapes_are_refused_rather_than_broadcast():
     """A hidden state of the wrong length must not concatenate into a plausible width."""
     with pytest.raises(ValueError, match="same shape"):
         concat_draft_inputs(torch.zeros(2, 3, 8), torch.zeros(2, 3, 4))
+
+
+# ---------------------------------------------------------------------------
+# The head's own forward, with its framework dependencies stubbed
+# ---------------------------------------------------------------------------
+#
+# Everything above tests the map and one helper. None of it touches `mtp.py`'s forward, so a head that
+# calls `torch.cat` directly in the other order, applies the wrong pre-norm to each input, or drops the
+# residual passes all of it. The composition is the part transcribed from another implementation, which
+# makes it exactly the part worth executing.
+#
+# The head cannot be imported normally on CPU: it builds the plugin's attention and MoE, which reach for
+# the platform. So its four dependencies are replaced with spies and the SHIPPED file is executed as
+# written -- no source rewriting, so what runs is what ships.
+#
+# The stubs go in under the framework's real module names, which is how another file in this directory
+# broke the whole suite. Here they are installed and then removed: `sys.modules` is snapshotted and
+# restored, and `test_loading_the_head_leaves_sys_modules_as_it_found_it` asserts that it worked.
+
+
+class RecordingNorm(torch.nn.Module):
+    """Stands in for the RMS norm, and is identifiable in the output it produces.
+
+    Each instance multiplies by its own constant, so a swapped pair of norms changes the numbers rather
+    than only the call order -- the assertions can then be about values instead of about a call log.
+    """
+
+    def __init__(self, hidden, eps, dtype, factor):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.full((hidden,), float(factor)))
+        self.eps = eps
+        self.factor = factor
+        self.inputs: list = []
+
+    def forward(self, x):
+        self.inputs.append(x)
+        return x * self.factor
+
+
+class RecordingLinear(torch.nn.Module):
+    """Stands in for `ColumnParallelLinear`, recording what it was handed."""
+
+    def __init__(self, in_features, out_features, bias=False, dtype=None, gather_output=True):
+        super().__init__()
+        self.in_features, self.out_features = in_features, out_features
+        self.out_features_per_rank, self.tp_size = out_features, 1
+        self.bias_requested, self.gather_output = bias, gather_output
+        self.weight = torch.nn.Parameter(torch.zeros(out_features, in_features))
+        self.inputs: list = []
+
+    def forward(self, x):
+        self.inputs.append(x)
+        # A projection whose output is recognisable: the two halves, added, so the assertion can name
+        # which half went where.
+        return x[..., :self.out_features] + 10.0 * x[..., self.out_features:]
+
+
+class RecordingAttention(torch.nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.num_key_value_heads_per_rank, self.head_dim = 2, 8
+        self.dtype, self.window_size = torch.bfloat16, None
+        self.inputs: list = []
+        self.bound: list = []
+
+    def forward(self, hidden, positions, cos, sin, attn_metadata, is_prefill):
+        self.inputs.append(hidden)
+        return hidden * 100.0
+
+    def bind_caches(self, k_cache, v_cache):
+        self.bound.append((k_cache, v_cache))
+
+
+class RecordingMoE(torch.nn.Module):
+    def __init__(self, config, layer_idx):
+        super().__init__()
+        self.layer_idx = layer_idx
+        self.calls: list = []
+
+    def forward(self, hidden, norm_weight, is_prefill, valid_mask=None):
+        self.calls.append({"hidden": hidden, "norm_weight": norm_weight,
+                           "is_prefill": is_prefill, "valid_mask": valid_mask})
+        return hidden * 1000.0
+
+
+def load_head_class():
+    """Execute the shipped `mtp.py` with its four framework dependencies replaced by the spies above.
+
+    Returns the class, and leaves `sys.modules` exactly as it was found. The stub names have to be the
+    framework's real ones because the shipped file imports them by those names, and the shipped file is
+    what is worth testing -- so the names are borrowed and given back.
+    """
+    factors = iter([2.0, 3.0, 5.0, 7.0, 11.0])   # one per norm, in construction order
+
+    nn_stub = types.ModuleType("vllm_neuron.nn")
+    nn_stub.ColumnParallelLinear = RecordingLinear
+    loader_stub = types.ModuleType("vllm_neuron.utils.weight_loader")
+    loader_stub.set_weight_loader = lambda *a, **k: None
+    loader_stub.sharding_weight_loader = lambda *a, **k: None
+
+    model_stub = types.ModuleType(f"{_PACKAGE}.model_bf16")
+    model_stub.Qwen3_5MoeRMSNorm = lambda hidden, eps, dtype: RecordingNorm(
+        hidden, eps, dtype, next(factors))
+    model_stub.Qwen3_5MoeAttention = RecordingAttention
+    model_stub.Qwen3_5MoeMoE = RecordingMoE
+
+    installed = {
+        "vllm_neuron": types.ModuleType("vllm_neuron"),
+        "vllm_neuron.nn": nn_stub,
+        "vllm_neuron.utils": types.ModuleType("vllm_neuron.utils"),
+        "vllm_neuron.utils.weight_loader": loader_stub,
+        f"{_PACKAGE}.model_bf16": model_stub,
+    }
+    snapshot = dict(sys.modules)
+    try:
+        sys.modules.update(installed)
+        spec = importlib.util.spec_from_file_location(
+            f"{_PACKAGE}.mtp", os.path.join(_model_dir, "mtp.py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[f"{_PACKAGE}.mtp"] = module
+        spec.loader.exec_module(module)
+        return module.Qwen3_5MoeMultiTokenPredictor
+    finally:
+        sys.modules.clear()
+        sys.modules.update(snapshot)
+
+
+class HeadConfig:
+    """The fields `mtp.py` reads, and nothing else."""
+    hidden_size = 16
+    rms_norm_eps = 1e-6
+    torch_dtype = torch.float32
+    num_hidden_layers = 40
+
+
+def build_head(layer_idx=40):
+    return load_head_class()(HeadConfig(), layer_idx)
+
+
+def test_loading_the_head_leaves_sys_modules_as_it_found_it():
+    """The stubs wear the framework's real names, so giving them back is part of the contract.
+
+    Another file in this directory installed such stubs permanently, and because pytest imports every
+    test module during collection, the whole session's real imports resolved to them.
+    """
+    before = dict(sys.modules)
+    build_head()
+    assert set(sys.modules) == set(before)
+    assert all(sys.modules[name] is module for name, module in before.items())
+
+
+def test_the_head_normalises_each_input_with_its_own_norm_and_concatenates_embedding_first():
+    """The composition, executed. This is the assertion the helper-level test could not make.
+
+    The two pre-norms multiply by different constants and `fc` weights its second half by ten, so the
+    fused value names which half held which input. Swapping the pre-norms, swapping the halves, or
+    reusing one norm for both inputs all change this number.
+    """
+    head = build_head()
+    embeddings = torch.arange(2 * 3 * 16, dtype=torch.float32).reshape(2, 3, 16)
+    hidden = torch.ones(2, 3, 16)
+
+    head(embeddings, hidden, positions=None, cos=None, sin=None, attn_metadata=None, is_prefill=True)
+
+    embedding_factor = head.pre_fc_norm_embedding.factor
+    hidden_factor = head.pre_fc_norm_hidden.factor
+    assert embedding_factor != hidden_factor, "the spies cannot distinguish the two norms"
+
+    # Each pre-norm saw its own input, and only its own.
+    assert len(head.pre_fc_norm_embedding.inputs) == 1
+    assert torch.equal(head.pre_fc_norm_embedding.inputs[0], embeddings)
+    assert torch.equal(head.pre_fc_norm_hidden.inputs[0], hidden)
+
+    # fc was handed [normed embedding | normed hidden], in that order.
+    fused_input = head.fc.inputs[0]
+    assert fused_input.shape == (2, 3, 32)
+    torch.testing.assert_close(fused_input[..., :16], embeddings * embedding_factor)
+    torch.testing.assert_close(fused_input[..., 16:], hidden * hidden_factor)
+
+
+def test_the_residual_is_the_projection_and_the_moe_is_handed_the_post_attention_weight():
+    """Residual placement and the fused-norm handover, which no shape would catch."""
+    head = build_head()
+    embeddings = torch.randn(1, 2, 16)
+    hidden = torch.randn(1, 2, 16)
+
+    out = head(embeddings, hidden, positions=None, cos=None, sin=None, attn_metadata=None,
+               is_prefill=False, valid_mask="the-mask")
+
+    fused = head.fc(head.fc.inputs[0])              # the spy is deterministic, so this reproduces it
+    # The attention was applied to the INPUT norm of the projection, not to the projection itself.
+    torch.testing.assert_close(head.self_attn.inputs[0], fused * head.input_layernorm.factor)
+    # ...and the residual added to it is the projection.
+    after_attention = fused + head.self_attn.inputs[0] * 100.0
+    torch.testing.assert_close(head.mlp.calls[0]["hidden"], after_attention)
+    # The MoE fuses the post-attention norm, so it must receive that norm's WEIGHT, not a normed tensor.
+    assert head.mlp.calls[0]["norm_weight"] is head.post_attention_layernorm.weight
+    assert head.mlp.calls[0]["is_prefill"] is False
+    assert head.mlp.calls[0]["valid_mask"] == "the-mask"
+    # And the output is the final norm of the second residual.
+    expected = (after_attention + after_attention * 1000.0) * head.norm.factor
+    torch.testing.assert_close(out, expected)
+
+
+def test_the_draft_layer_index_must_be_past_the_main_model():
+    """A draft layer inside the main model's range shares a decoder layer's KV cache, silently."""
+    with pytest.raises(ValueError, match="past the main model"):
+        build_head(layer_idx=HeadConfig.num_hidden_layers - 1)
+    head = build_head(layer_idx=HeadConfig.num_hidden_layers)
+    assert head.self_attn.layer_idx == HeadConfig.num_hidden_layers
+    assert head.mlp.layer_idx == HeadConfig.num_hidden_layers
+
+
+def test_the_kv_spec_describes_the_head_s_own_attention_and_the_binding_reaches_it():
+    """The tuple the model turns into a real spec, and the cache handover."""
+    head = build_head(layer_idx=41)
+    assert head.kv_layer_spec() == (41, head.self_attn.num_key_value_heads_per_rank,
+                                    head.self_attn.head_dim, head.self_attn.dtype,
+                                    head.self_attn.window_size)
+    head.bind_kv_cache_entry("k", "v")
+    assert head.self_attn.bound == [("k", "v")]
+
+
+def test_the_projection_is_two_hidden_to_hidden_without_a_bias():
+    """`fc` consumes the concatenation and produces one hidden state; a bias would be an extra tensor
+    the checkpoint does not carry."""
+    head = build_head()
+    assert (head.fc.in_features, head.fc.out_features) == (2 * HeadConfig.hidden_size,
+                                                           HeadConfig.hidden_size)
+    assert head.fc.bias_requested is False
+    assert head.fc.gather_output is True

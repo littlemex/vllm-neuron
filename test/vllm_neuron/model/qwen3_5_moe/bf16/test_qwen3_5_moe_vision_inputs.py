@@ -65,16 +65,30 @@ _pkg = "vllm_neuron.model.qwen3_vl.utils"
 
 
 def _real_package_importable(module_name: str) -> bool:
-    """Whether ``module_name`` imports for real, leaving sys.modules as it was if it does not."""
+    """Whether ``module_name`` imports for real, leaving sys.modules as it was if it does not.
+
+    "For real" is checked rather than assumed. A module already cached under that name satisfies
+    ``import_module`` even if a stub put it there, and this function's answer decides whether the shipped
+    helpers or the stubs get exercised -- so the resolved module has to have a file on disk. A file
+    outside this checkout is also refused: testing the shipped ``vision_inputs.py`` against an older
+    INSTALLED copy of its helpers is a green run that means nothing.
+
+    Only ``ImportError`` counts as unavailable. A real package whose import fails for another reason --
+    a syntax error, a broken initialiser -- is a regression, and turning it into "use the stubs" would
+    hide it behind a suite that still passes.
+    """
     before = set(sys.modules)
     try:
-        importlib.import_module(module_name)
-        return True
-    except Exception:  # noqa: BLE001 - any failure to import means "not available", whatever it was
+        module = importlib.import_module(module_name)
+    except ImportError:
         for name in set(sys.modules) - before:
             if name.split(".")[0] == module_name.split(".")[0]:
                 del sys.modules[name]
         return False
+    origin = getattr(module, "__file__", None)
+    if not origin or not os.path.exists(origin):
+        return False
+    return os.path.realpath(origin).startswith(os.path.realpath(_REPO) + os.sep)
 
 
 _USING_REAL_PLUGIN = _real_package_importable(f"{_pkg}.vision_block_packing")

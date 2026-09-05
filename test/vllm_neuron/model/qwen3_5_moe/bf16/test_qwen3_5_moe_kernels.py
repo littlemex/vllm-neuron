@@ -2030,32 +2030,66 @@ def test_both_slot_forms_read_and_write_the_same_slot(form):
         else:
             os.environ["QWEN3_5_MOE_SLOT_INDEX"] = previous
 
-def assert_matches_solo(got, want, leaked, what, floor_ulps=64):
+def assert_matches_solo(got, want, leaked, what, ulps=16):
     """One row of a batched call against the same request run alone, plus a negative control.
 
-    Bit equality is the natural assertion here and it is NOT portable. The batched call reduces over a
-    wider matmul, so the library is free to use a different kernel and a different summation order:
-    measured, these rows are bit-identical on arm64 and differ by up to 1.0e-06 at a scale of 2.1 on
-    x86_64 with torch 2.11 -- a few ULP of fp32, which is arithmetic, not a leak.
+    Bit equality is the natural assertion here and it is NOT portable. Batching adds ROWS, not reduction
+    length -- each output element is a dot product of the same length either way -- but the library
+    dispatches its kernel and its blocking on the shape, and a different blocking sums the same products
+    in a different order. Measured, these rows are bit-identical on arm64 and differ by up to 1.0e-06 at
+    a scale of 2.1 on x86_64 with torch 2.11.
 
-    Relaxing an equality can hide the thing the test exists to catch, so the assertion is two-sided.
-    The difference from the SAME request must sit at the rounding floor, and the difference from a
-    DIFFERENT request (``leaked``) must be orders of magnitude larger. If the request axis ever stopped
-    being independent, the first bound is the one that breaks; if the tolerance were ever loosened far
-    enough to admit a leak, the second is what says so.
+    The bound is `ulps * eps * (|want| + scale)` elementwise, where `scale` is the largest magnitude in
+    `want`. Both terms are needed and neither is a derived error bound:
+
+    * the relative term is the ordinary rounding of a value of that size;
+    * the absolute term exists because a dot product's error does not shrink when its result cancels to
+      near zero, so a purely relative bound fails on cancellation rather than on a defect.
+
+    `ulps` is an EMPIRICAL portability margin, not a derivation. The measured worst case above is 4.0 ULP
+    of fp32 at that scale, so 16 leaves 4x headroom. It is deliberately not larger: the absolute term
+    means every element is allowed `ulps * eps * scale`, and each ULP of that budget is contamination
+    from a neighbouring request that this assertion would accept. At 16 ULP and this scale the window is
+    4e-6 -- which is stated rather than hidden, because it is the real limit of the check.
+
+    Relaxing an equality can hide the thing the test exists to catch, so the assertion is two-sided: the
+    difference from the SAME request must sit inside the bound, and a DIFFERENT request must fall outside
+    it in most coordinates -- not merely in its largest one, which a single wild element would satisfy.
+
+    It still cannot see contamination smaller than the bound, and no choice of `ulps` fixes that: the
+    measured kernel-order difference is 4 ULP, so any bound that survives it accepts leakage below 4 ULP.
+    That gap is closed by a different test, not by a tighter number here --
+    `test_a_request_is_unchanged_when_only_its_NEIGHBOURS_change` holds the batch shape fixed, so the
+    library makes the same choices and bit equality becomes a portable assertion again.
     """
-    difference = (got.float() - want.float()).abs().max().item()
-    scale = max(want.float().abs().max().item(), 1.0)
-    floor = floor_ulps * torch.finfo(want.dtype).eps * scale
-    assert difference <= floor, (
-        f"{what}: differs by {difference:.3e}, above the {floor:.3e} rounding floor for "
-        f"{want.dtype} at scale {scale:.3e}")
+    # Coarser dtypes make the bound meaningless rather than merely loose: at bf16, eps is 7.8e-3, so
+    # `16 * eps * scale` is 12.5% of scale. A future dtype change must fail here, not silently pass.
+    if want.dtype not in (torch.float32, torch.float64):
+        raise AssertionError(
+            f"{what}: this bound is only meaningful for fp32 or finer; got {want.dtype}, whose eps "
+            f"({torch.finfo(want.dtype).eps:.2e}) would admit gross defects")
 
-    # The control keeps the bound above honest: it must be nowhere near what a wrong row looks like.
-    leak = (leaked.float() - want.float()).abs().max().item()
-    assert leak > 100 * floor, (
-        f"{what}: the negative control is not discriminating -- a different request differs by only "
-        f"{leak:.3e}, which the {floor:.3e} floor cannot be trusted to exclude")
+    difference = (got.float() - want.float()).abs()
+    scale = want.float().abs().max()
+    bound = ulps * torch.finfo(want.dtype).eps * (want.float().abs() + scale)
+    worst = (difference - bound).max().item()
+    if worst > 0:
+        index = (difference - bound).flatten().argmax().item()
+        raise AssertionError(
+            f"{what}: element {index} differs by {difference.flatten()[index].item():.3e}, "
+            f"above its {bound.flatten()[index].item():.3e} bound "
+            f"({ulps} ULP of {want.dtype} at scale {scale.item():.3e})")
+
+    # The control keeps the bound above honest. A wrong row has to be outside the bound in MOST
+    # coordinates: a single large coordinate would be satisfied by any two unrelated tensors, and would
+    # say nothing about a leak into the coordinates where two requests happen to be close.
+    leak = (leaked.float() - want.float()).abs()
+    outside = (leak > bound).float().mean().item()
+    if outside < 0.9:
+        raise AssertionError(
+            f"{what}: the negative control is not discriminating -- a different request lies inside the "
+            f"bound in {(1 - outside) * 100:.0f}% of coordinates, so the bound cannot be trusted to "
+            f"exclude one")
 
 
 def test_the_decode_step_is_batch_general_over_the_request_axis():
@@ -2091,6 +2125,56 @@ def test_the_decode_step_is_batch_general_over_the_request_axis():
                     f"request {request} batched with {requests - 1} others")
 
 
+def test_a_request_is_unchanged_when_only_its_NEIGHBOURS_change():
+    """The leakage test with teeth: same batch shape, different neighbours, and BIT equality.
+
+    Comparing a batched row against a solo run cannot be exact, because the two calls have different
+    shapes and the library blocks them differently -- so that comparison carries a tolerance, and any
+    tolerance admits contamination below it. Here the shape never changes. Only the OTHER requests' data
+    does, so the kernel and the blocking are identical and the row under test must be identical to the
+    bit. A leak of any size, however small, fails this.
+    """
+    module, config = _hf_gated_delta_net(seed=41)
+    weights = _weights_from_hf(module)
+    eps = config.rms_norm_eps
+    torch.manual_seed(43)
+    requests = 3
+    conv_dim = (2 * _TEST_DIMS["k_heads"] * _TEST_DIMS["head_k_dim"]
+                + _TEST_DIMS["v_heads"] * _TEST_DIMS["head_v_dim"])
+    tokens = torch.randn(requests, 1, _TEST_HIDDEN)
+    recurrent = torch.randn(requests, _TEST_DIMS["v_heads"], _TEST_DIMS["head_k_dim"],
+                            _TEST_DIMS["head_v_dim"]) * 0.1
+    conv = torch.randn(requests, conv_dim, _TEST_DIMS["kernel"] - 1) * 0.1
+    continuing = torch.tensor(1.0)
+
+    def step(tokens_in, recurrent_in, conv_in):
+        with torch.no_grad():
+            return gated_delta_net_decode(tokens_in, weights, _TEST_DIMS, eps, conv_state=conv_in,
+                                          recurrent_state=recurrent_in, is_continuation=continuing)
+
+    baseline = step(tokens, recurrent, conv)
+
+    for victim in range(requests):
+        others = [r for r in range(requests) if r != victim]
+        disturbed_tokens, disturbed_recurrent, disturbed_conv = (tokens.clone(), recurrent.clone(),
+                                                                 conv.clone())
+        for other in others:
+            disturbed_tokens[other] = torch.randn_like(disturbed_tokens[other])
+            disturbed_recurrent[other] = torch.randn_like(disturbed_recurrent[other])
+            disturbed_conv[other] = torch.randn_like(disturbed_conv[other])
+        disturbed = step(disturbed_tokens, disturbed_recurrent, disturbed_conv)
+
+        assert len(disturbed) == len(baseline), "the two calls returned different numbers of tensors"
+        for index, (after, before) in enumerate(zip(disturbed, baseline)):
+            assert torch.equal(after[victim], before[victim]), (
+                f"output {index} of request {victim} changed when only the other requests did: "
+                f"max |delta| = "
+                f"{(after[victim].float() - before[victim].float()).abs().max().item():.3e}")
+        # The disturbance has to have been visible somewhere, or this test proves nothing.
+        assert not torch.equal(disturbed[0][others[0]], baseline[0][others[0]]), (
+            "the disturbed requests produced identical output, so the perturbation did nothing")
+
+
 def test_a_per_request_continuation_flag_zeroes_only_that_request():
     """A fresh request in a batched step must start from zero while its neighbours carry on. Without a
     per-request flag, one request's first token would either reset everyone or continue from state it
@@ -2119,6 +2203,25 @@ def test_a_per_request_continuation_flag_zeroes_only_that_request():
             tokens[1:], weights, _TEST_DIMS, eps, conv_state=conv[1:], recurrent_state=recurrent[1:],
             is_continuation=torch.tensor(1.0))
 
+    # An INDEPENDENT oracle for the fresh request: the flag claims the state is ignored, so the same
+    # call with the state explicitly zeroed must agree. Comparing flag 0 against flag 0 -- which is all
+    # this test used to do -- passes even if the flag is ignored entirely or inverted, because both
+    # sides then make the same mistake.
+    with torch.no_grad():
+        from_zero = gated_delta_net_decode(
+            tokens[:1], weights, _TEST_DIMS, eps, conv_state=torch.zeros_like(conv[:1]),
+            recurrent_state=torch.zeros_like(recurrent[:1]), is_continuation=torch.tensor(1.0))
+    assert len(from_zero) == len(fresh), "the two calls returned different numbers of tensors"
+    for index, (zeroed, flagged) in enumerate(zip(from_zero, fresh)):
+        assert torch.equal(zeroed, flagged), (
+            f"output {index}: a fresh request did not equal the same call with the state zeroed, so the "
+            f"continuation flag is not doing what its name says")
+    # ...and the flag has to MATTER: with it set, the supplied state must change the answer.
+    assert not torch.equal(carried[0], from_zero[0]), (
+        "a continuing request produced the same output as one starting from zero, so the supplied state "
+        "was ignored")
+
+    assert len(mixed) == len(fresh) == len(carried)
     for got, want in zip(mixed, fresh):
         assert_matches_solo(got[:1], want, got[1:], "the fresh request, batched with a continuing one")
     for got, want in zip(mixed, carried):
@@ -2146,6 +2249,15 @@ def test_several_requests_decoding_from_a_shared_pool_match_their_solo_runs():
                             _TEST_DIMS["head_v_dim"]),
                 torch.zeros(count, conv_dim, _TEST_DIMS["kernel"] - 1))
 
+    def sentinel(state, slot):
+        """Fill one slot with a recognisable non-zero value.
+
+        The unheld slot used to start at zero and be asserted to still be zero, which a scatter that
+        zeroes every slot it does not select passes. A distinct value makes "left alone" and "cleared"
+        different outcomes.
+        """
+        state[slot] = float(slot + 1) * 7.0
+
     with torch.no_grad():
         # Solo: one state each, stepped independently.
         solo = []
@@ -2162,6 +2274,10 @@ def test_several_requests_decoding_from_a_shared_pool_match_their_solo_runs():
 
         # Shared: one pool of four slots, three of them in use, all advanced together.
         recurrent, conv = blank(slots_total)
+        unheld = ({0, 1, 2, 3} - {int(s) for s in holders}).pop()
+        sentinel(recurrent, unheld)
+        sentinel(conv, unheld)
+        untouched_recurrent, untouched_conv = recurrent[unheld].clone(), conv[unheld].clone()
         shared = []
         for step in range(steps):
             out, new_recurrent, new_conv = gated_delta_net_decode(
@@ -2190,10 +2306,12 @@ def test_several_requests_decoding_from_a_shared_pool_match_their_solo_runs():
             conv[slot:slot + 1], want_conv, conv[other_slot:other_slot + 1],
             f"request {request}'s conv state in slot {slot}")
 
-    # The unused slot must still be zero: nothing may spill into a slot no request holds.
-    unused = ({0, 1, 2, 3} - {int(s) for s in holders}).pop()
-    assert float(recurrent[unused].abs().sum()) == 0.0
-    assert float(conv[unused].abs().sum()) == 0.0
+    # The unheld slot must be exactly what it was: neither written into nor cleared.
+    assert torch.equal(recurrent[unheld], untouched_recurrent), (
+        f"slot {unheld} holds no request and was modified")
+    assert torch.equal(conv[unheld], untouched_conv), (
+        f"slot {unheld} holds no request and its conv state was modified")
+    assert float(untouched_recurrent.abs().sum()) > 0.0, "the sentinel was not actually non-zero"
 
 
 # ---------------------------------------------------------------------------
