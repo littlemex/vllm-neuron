@@ -10,8 +10,10 @@ Two architectures are registered, and the name selects which one runs:
 | `Qwen3_5MoeForCausalLM` | The text backbone | Verified on device |
 | `Qwen3_5MoeForConditionalGeneration` | Text backbone + vision tower | Wired; **not yet run on a device** |
 
-The multi-token-prediction head is out of scope: the runner accepts `eagle3` as the only speculative
-decoding method, so a draft head is unreachable from the model side.
+The multi-token-prediction head is implemented (`mtp.py`: the four modules, the weight map, a KV spec and
+a cache binding) and **unreachable**: the runner accepts `eagle3` as the only speculative method, so
+reaching a draft head needs an `mtp` branch and a proposer in a shared file. What is verified about it is
+on CPU and is listed under "Multi-token verification" below.
 
 Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-attention layers with
 **gated GQA** full-attention layers, and puts a **256-expert MoE** block on every layer.
@@ -52,10 +54,12 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
   number 17, where this form and forward substitution both stay near 1e-7). `||N||_2 > 1` is the
   ordinary regime here — it happens whenever the log decay is weak and the keys inside a chunk are
   correlated, which is normal for adjacent tokens.
-- **Recurrent state without a runner state pool.** The conv and recurrent state are carried across
-  decode steps by in-place module buffers; the plugin's `AliasingOutputRewritePass` turns the `copy_`
-  into an HLO `input_output_alias` so the state persists across the runner's per-step graphs. The
-  runner is unmodified, at the cost of batch=1 (`max_num_seqs=1`).
+- **Recurrent state, two ways.** By default the conv and recurrent state are carried across decode steps
+  by in-place module buffers; the plugin's `AliasingOutputRewritePass` turns the `copy_` into an HLO
+  `input_output_alias` so the state persists across the runner's per-step graphs, and the runner needs no
+  change. That path is single-sequence. With `QWEN3_5_MOE_STATE_POOL=1` the state instead lives in a
+  runner-allocated pool with a slot axis, which is what more than one sequence requires; see the
+  concurrency entry under "Limits".
 - **Two norm conventions.** The residual-stream norm scales by `1 + weight` (weights near zero), while
   the Gated DeltaNet's gated norm scales by `weight` (weights near one) and applies the gate after
   normalising. Using the plugin's usual `weight * x` for the former would collapse the residual stream.
