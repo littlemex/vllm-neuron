@@ -1961,23 +1961,61 @@ def test_a_multi_request_step_is_refused_rather_than_taking_the_first_slot():
     assert _ops.slot_mask(torch.tensor([2]), state, 4) is not None
 
 
-def test_a_slot_outside_the_pool_selects_nothing_and_that_is_visible():
-    """An out-of-range slot produces an all-zero mask, so a read returns zeros and a write is dropped.
-    Worth pinning: the arithmetic cannot raise on it, so the value has to be trusted from the runner --
-    and this test records that the failure mode is a lost state, not a corrupted neighbour."""
+def test_an_out_of_range_slot_raises_with_index_select_and_is_lost_with_the_one_hot():
+    """The two slot forms differ on the case that matters, and the difference is why one is preferred.
+
+    ``index_select`` refuses an out-of-range slot. The one-hot product cannot: the mask is simply all
+    zeros, so a read returns zeros and a write is dropped, and the slot value has to be trusted from the
+    runner. That silent loss is what an early experiment mistook for a defect in the arithmetic -- capping
+    the pool to one slot put the runner's slot (2) out of range, and the resulting zeros looked like a
+    storage failure.
+    """
     state = torch.arange(4 * 6, dtype=torch.float32).reshape(4, 2, 3)
-    before = state.clone()
-    mask = _ops.slot_mask(torch.tensor(9), state, 4)
-    assert float(mask.abs().sum()) == 0.0
-    assert float(_ops.read_state_slot(state, torch.tensor(9), 4).abs().sum()) == 0.0
-    _ops.write_state_slot(state, torch.ones(1, 2, 3), torch.tensor(9), 4)
-    assert torch.equal(state, before), "an out-of-range write must not land on another slot"
+
+    previous = os.environ.get("QWEN3_5_MOE_SLOT_INDEX")
+    try:
+        os.environ["QWEN3_5_MOE_SLOT_INDEX"] = "1"
+        with pytest.raises((IndexError, RuntimeError)):
+            _ops.read_state_slot(state, torch.tensor(9), 4)
+
+        os.environ["QWEN3_5_MOE_SLOT_INDEX"] = "0"
+        before = state.clone()
+        mask = _ops.slot_mask(torch.tensor(9), state, 4)
+        assert float(mask.abs().sum()) == 0.0
+        assert float(_ops.read_state_slot(state, torch.tensor(9), 4).abs().sum()) == 0.0
+        _ops.write_state_slot(state, torch.ones(1, 2, 3), torch.tensor(9), 4)
+        assert torch.equal(state, before), "an out-of-range write must not land on another slot"
+    finally:
+        if previous is None:
+            os.environ.pop("QWEN3_5_MOE_SLOT_INDEX", None)
+        else:
+            os.environ["QWEN3_5_MOE_SLOT_INDEX"] = previous
 
 
-# ---------------------------------------------------------------------------
-# Stage A: several requests decoding in one step, out of a shared pool
-# ---------------------------------------------------------------------------
-
+@pytest.mark.parametrize("form", ["1", "0"])
+def test_both_slot_forms_read_and_write_the_same_slot(form):
+    """Whichever form the device ends up needing, the two must agree on the slot they touch."""
+    previous = os.environ.get("QWEN3_5_MOE_SLOT_INDEX")
+    os.environ["QWEN3_5_MOE_SLOT_INDEX"] = form
+    try:
+        state = torch.randn(5, 2, 3)
+        for slot in range(5):
+            got = _ops.read_state_slot(state, torch.tensor(slot), 5)
+            assert torch.equal(got[0], state[slot]), f"{form}: slot {slot} read the wrong row"
+        for slot in range(5):
+            before = state.clone()
+            updated = torch.randn(1, 2, 3)
+            _ops.write_state_slot(state, updated, torch.tensor(slot), 5)
+            assert torch.equal(state[slot], updated[0]), f"{form}: slot {slot} was not written"
+            for other in range(5):
+                if other != slot:
+                    assert torch.equal(state[other], before[other]), (
+                        f"{form}: writing slot {slot} disturbed slot {other}")
+    finally:
+        if previous is None:
+            os.environ.pop("QWEN3_5_MOE_SLOT_INDEX", None)
+        else:
+            os.environ["QWEN3_5_MOE_SLOT_INDEX"] = previous
 
 def test_the_decode_step_is_batch_general_over_the_request_axis():
     """Measured, not assumed. The kernel guards the TOKEN axis and says nothing about the request axis,

@@ -11,6 +11,7 @@ Two norm conventions coexist in this architecture and mixing them is silent brea
 * ``gated_rmsnorm`` (HF ``Qwen3_5MoeRMSNormGated``, used only inside the Gated DeltaNet) scales by
   ``weight`` and its weight is initialised to ONE, and it applies the gate AFTER the norm.
 """
+import os
 from typing import NamedTuple
 
 import torch
@@ -233,8 +234,30 @@ def slot_mask(slot, state: torch.Tensor, num_slots: int):
     return mask.to(state.dtype).reshape((num_slots,) + (1,) * (state.dim() - 1))
 
 
+def _use_index_select() -> bool:
+    """Whether to select a slot with ``index_select`` instead of a one-hot product.
+
+    The one-hot form was chosen because a data-dependent index was assumed not to trace. That assumption
+    is broader than the evidence: this repository already indexes with a runtime value elsewhere (the
+    conv history is gathered at a runtime length). Which form is correct on the device is a measurement,
+    so both exist and this chooses.
+
+    The one-hot form also has two costs the index form does not. It materialises the WHOLE pool per read
+    (at 19539 slots that is hundreds of megabytes per layer per step), and it is not robust to a
+    non-finite value in an unused slot, because ``0 * NaN`` is NaN and the sum carries it.
+    """
+    return os.environ.get("QWEN3_5_MOE_SLOT_INDEX", "1") == "1"
+
+
 def read_state_slot(state: torch.Tensor, slot, num_slots: int) -> torch.Tensor:
     """This slot's state as ``[1, ...]`` -- the shape the scans take."""
+    if num_slots == 1:
+        return state
+    if _use_index_select():
+        # int64 explicitly: index_select accepts int32 but index_copy_ does not, and a form that reads
+        # with one dtype and writes with another is the kind of asymmetry that shows up only on the write.
+        return torch.index_select(
+            state, 0, torch.as_tensor(slot, device=state.device).reshape(1).long())
     mask = slot_mask(slot, state, num_slots)
     if mask is None:
         return state
@@ -248,6 +271,16 @@ def write_state_slot(state: torch.Tensor, updated: torch.Tensor, slot, num_slots
     recognises a full-tensor in-place write, and an in-place write into a slice is not known to produce
     the same alias. The other slots are preserved by the arithmetic, not by writing less.
     """
+    if num_slots == 1:
+        state.copy_(updated.to(state.dtype))
+        return
+    if _use_index_select():
+        # index_copy_ writes only the named row. The whole-buffer copy_ the one-hot form needs exists to
+        # keep the aliasing pass looking at a full-tensor write; whether index_copy_ satisfies it is a
+        # device question, which is why both forms are kept and this is selectable.
+        state.index_copy_(0, torch.as_tensor(slot, device=state.device).reshape(1).long(),
+                          updated.to(state.dtype))
+        return
     mask = slot_mask(slot, state, num_slots)
     if mask is None:
         state.copy_(updated.to(state.dtype))
