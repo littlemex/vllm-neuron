@@ -483,6 +483,15 @@ requires_hf_modules = pytest.mark.skipif(
     reason="installed transformers has no qwen3_5_moe modeling module",
 )
 
+# The vision map delegates to the plugin's own encoder class, so those two checks -- alone in this file
+# -- need the vllm package importable. They used to ERROR rather than skip on a box without it, and
+# because they also need a checkpoint index they were skipped for that reason first: the error only
+# appeared once someone pointed the tests at a real index. Skipping says which coverage is absent.
+requires_vllm = pytest.mark.skipif(
+    importlib.util.find_spec("vllm") is None,
+    reason="no vllm package: the vision map comes from the plugin's encoder, which imports vllm",
+)
+
 # A small config with the checkpoint's SHAPE (value heads a multiple of key heads, conv kernel 4,
 # head dims equal) but tiny widths, so the tests stay fast while exercising the real code paths.
 _TEST_DIMS = {"k_heads": 4, "v_heads": 8, "head_k_dim": 16, "head_v_dim": 16, "kernel": 4}
@@ -620,6 +629,7 @@ def test_rotary_tables_match_hf_for_text_only_positions():
     assert torch.allclose(picked_sin, ref_sin.reshape(-1, rotary_dim), atol=1e-6)
 
 
+@requires_vllm
 def test_vision_mappings_cover_the_visual_tower_exactly():
     """Both directions against the real checkpoint index, for the vision tower.
 
@@ -645,6 +655,7 @@ def test_vision_mappings_cover_the_visual_tower_exactly():
     assert not visual - declared, sorted(visual - declared)[:8]
 
 
+@requires_vllm
 def test_only_the_mtp_head_is_left_unmapped_once_vision_is_added():
     """The whole checkpoint, accounted for.
 
@@ -2019,6 +2030,34 @@ def test_both_slot_forms_read_and_write_the_same_slot(form):
         else:
             os.environ["QWEN3_5_MOE_SLOT_INDEX"] = previous
 
+def assert_matches_solo(got, want, leaked, what, floor_ulps=64):
+    """One row of a batched call against the same request run alone, plus a negative control.
+
+    Bit equality is the natural assertion here and it is NOT portable. The batched call reduces over a
+    wider matmul, so the library is free to use a different kernel and a different summation order:
+    measured, these rows are bit-identical on arm64 and differ by up to 1.0e-06 at a scale of 2.1 on
+    x86_64 with torch 2.11 -- a few ULP of fp32, which is arithmetic, not a leak.
+
+    Relaxing an equality can hide the thing the test exists to catch, so the assertion is two-sided.
+    The difference from the SAME request must sit at the rounding floor, and the difference from a
+    DIFFERENT request (``leaked``) must be orders of magnitude larger. If the request axis ever stopped
+    being independent, the first bound is the one that breaks; if the tolerance were ever loosened far
+    enough to admit a leak, the second is what says so.
+    """
+    difference = (got.float() - want.float()).abs().max().item()
+    scale = max(want.float().abs().max().item(), 1.0)
+    floor = floor_ulps * torch.finfo(want.dtype).eps * scale
+    assert difference <= floor, (
+        f"{what}: differs by {difference:.3e}, above the {floor:.3e} rounding floor for "
+        f"{want.dtype} at scale {scale:.3e}")
+
+    # The control keeps the bound above honest: it must be nowhere near what a wrong row looks like.
+    leak = (leaked.float() - want.float()).abs().max().item()
+    assert leak > 100 * floor, (
+        f"{what}: the negative control is not discriminating -- a different request differs by only "
+        f"{leak:.3e}, which the {floor:.3e} floor cannot be trusted to exclude")
+
+
 def test_the_decode_step_is_batch_general_over_the_request_axis():
     """Measured, not assumed. The kernel guards the TOKEN axis and says nothing about the request axis,
     and stage A rests entirely on that axis being independent -- so each row of a batched call must be
@@ -2045,9 +2084,11 @@ def test_the_decode_step_is_batch_general_over_the_request_axis():
                 tokens[request:request + 1], weights, _TEST_DIMS, eps,
                 conv_state=conv[request:request + 1],
                 recurrent_state=recurrent[request:request + 1], is_continuation=continuing)
+            neighbour = (request + 1) % requests
             for got, want in zip(batched, alone):
-                assert torch.equal(got[request:request + 1], want), (
-                    f"request {request} differs when batched; the request axis is not independent")
+                assert_matches_solo(
+                    got[request:request + 1], want, got[neighbour:neighbour + 1],
+                    f"request {request} batched with {requests - 1} others")
 
 
 def test_a_per_request_continuation_flag_zeroes_only_that_request():
@@ -2079,9 +2120,9 @@ def test_a_per_request_continuation_flag_zeroes_only_that_request():
             is_continuation=torch.tensor(1.0))
 
     for got, want in zip(mixed, fresh):
-        assert torch.equal(got[:1], want), "the fresh request did not start from zero"
+        assert_matches_solo(got[:1], want, got[1:], "the fresh request, batched with a continuing one")
     for got, want in zip(mixed, carried):
-        assert torch.equal(got[1:], want), "the continuing request was disturbed by its neighbour"
+        assert_matches_solo(got[1:], want, got[:1], "the continuing request, batched with a fresh one")
 
 
 def test_several_requests_decoding_from_a_shared_pool_match_their_solo_runs():
@@ -2134,13 +2175,20 @@ def test_several_requests_decoding_from_a_shared_pool_match_their_solo_runs():
 
     for request in range(requests):
         outputs, want_recurrent, want_conv = solo[request]
+        neighbour = (request + 1) % requests
         for step in range(steps):
-            assert torch.equal(shared[step][request:request + 1], outputs[step]), (
-                f"request {request} step {step} differs when sharing the pool")
+            assert_matches_solo(
+                shared[step][request:request + 1], outputs[step],
+                shared[step][neighbour:neighbour + 1],
+                f"request {request} at step {step}, sharing a {slots_total}-slot pool")
         slot = int(holders[request])
-        assert torch.equal(recurrent[slot:slot + 1], want_recurrent), (
-            f"request {request}'s recurrent state did not land in slot {slot}")
-        assert torch.equal(conv[slot:slot + 1], want_conv)
+        other_slot = int(holders[neighbour])
+        assert_matches_solo(
+            recurrent[slot:slot + 1], want_recurrent, recurrent[other_slot:other_slot + 1],
+            f"request {request}'s recurrent state in slot {slot}")
+        assert_matches_solo(
+            conv[slot:slot + 1], want_conv, conv[other_slot:other_slot + 1],
+            f"request {request}'s conv state in slot {slot}")
 
     # The unused slot must still be zero: nothing may spill into a slot no request holds.
     unused = ({0, 1, 2, 3} - {int(s) for s in holders}).pop()

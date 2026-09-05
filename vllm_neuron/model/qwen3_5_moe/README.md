@@ -91,7 +91,9 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
 | DP (data parallel) | No | Not wired for this backbone |
 | EP (expert parallel) | No | Every rank holds all 256 experts and shards the intermediate dimension; rejected at construction |
 | Eagle3 / speculative decode | No | Rejected at construction and in `forward` — see below |
-| FP8 / NVFP4 | No | bf16 only; the factory rejects other quantizations and the config rejects a non-bf16 checkpoint dtype |
+| FP8 / NVFP4 weights | No | bf16 only; the factory rejects other quantizations and the config rejects a non-bf16 checkpoint dtype |
+| `--dtype` other than bfloat16 | No | Rejected at construction. Every parameter, the Gated DeltaNet kernels and the declared KV dtype are bf16, so another dtype disagrees with the graph rather than trading precision for it |
+| Quantized KV cache (`--kv-cache-dtype`) | No | Rejected at construction. The runner allocates the cache from `cache_config`, not from this model's KV spec, so an fp8 cache would be read as bf16 with nothing raising. `bind_caches` also checks the dtype it is handed against the dtype the attention reads with |
 | On-device sampling | Yes | Via `Sampler` when `on_device_sampling_config` is set |
 | Image input | Wired, unverified | `Qwen3_5MoeForConditionalGeneration` builds the vision tower, encodes into the runner's encoder cache and merges at prefill. **No device run yet** — see below for what that leaves open |
 | Video input | No | Frames pack per frame rather than per item; `embed_multimodal` refuses video rather than packing it as one item |
@@ -108,13 +110,23 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
   `QWEN3_5_MOE_GDN_CHUNK` trades chunk-internal work for fewer unrolled bodies. Neither is a numerical
   limit; both are why the shipped example starts at a modest `max_model_len`.
 
-- **Batch size 1 only** (`max_num_seqs=1`). The conv and recurrent state are single per-layer buffers
-  with no per-slot pool, so concurrent sequences would read each other's state. Both the attention
-  decode and the factory raise rather than producing wrong output.
+- **Batch size 1 only** (`max_num_seqs=1`), and the remaining blocker is prefill rather than state.
+  A per-slot state pool exists behind `QWEN3_5_MOE_STATE_POOL=1`: the conv and recurrent states carry a
+  slot axis, decode is general over the request axis and reads each request's slot, and a packed
+  multi-request prefill reproduces the same requests run individually. What is not yet shown is any of
+  that on the device, so the factory still refuses `max_num_seqs > 1` rather than serving a path whose
+  numerics have only been checked on CPU.
 - **Automatic prefix caching is not supported.** Do not set `--enable-prefix-caching`. The attention
   KV is addressable by block hash and would be reused across requests, but the recurrent state has no
   block-hash addressing, so a reused prefix would silently continue from the wrong state. The factory
   rejects it.
+
+  Note that enabling prefix caching also selects a **recurrent-state reuse mode** on this model's
+  behalf: `MambaModelConfig.verify_and_update_config` forces `cache_config.mamba_cache_mode` to `none`
+  whenever prefix caching is off, and derives `align` or `all` whenever it is on. Nothing on the command
+  line says so, which is why the two are refused together rather than separately — a standalone
+  `mamba_cache_mode` guard cannot be reached while prefix caching is refused, and reports a setting the
+  operator never chose.
 - **Speculative decoding is not supported.** The decode path advances the recurrent state by exactly
   one token; a multi-token verify step would leave the state inconsistent with the accepted tokens.
   The factory refuses a speculative config, and `gated_delta_net_decode` raises rather than
@@ -156,10 +168,39 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
   `layer_types` raises at construction. A stack with no `full_attention` layer is also rejected,
   because the prefill/decode phase and the real/pad mask are both derived from attention metadata.
 
+## Serving knobs: honoured, refused, or warned about
+
+Every setting an operator can turn is a promise. There are three honest states, and the fourth one --
+read and silently discarded -- is what this table exists to prevent. The line between refusing and
+warning is **whether the output would be wrong or merely incomplete**, not whether the feature is
+implemented.
+
+| Knob | State | Effect here |
+|---|---|---|
+| `--tensor-parallel-size` | honoured | Every layer and the vocabulary are sharded; 35B-A3B needs 4 on one trn2 chip |
+| `--max-num-batched-tokens` | honoured | The runner derives the prefill buckets from it. Below `max_model_len` it enables segmented prefill, which reproduces single-shot output token for token |
+| `--block-size` | honoured | Raised by the platform's hybrid alignment because this model declares recurrent state; the runner reads the aligned value rather than choosing one |
+| `max_logprobs` | honoured | At 0 the vocabulary all-gather is skipped entirely, so a deployment that never asks for logprobs does not pay for it |
+| `on_device_sampling_config` | honoured | Keeps logits sharded and samples on device |
+| `--async-scheduling` | **warned** | Generation is correct, but the runner's async path returns the sampler output without logprobs, so that field comes back empty on a successful request. Warned rather than refused: refusing it would refuse the default configuration |
+| `--kv-cache-dtype` | refused | See the feature table |
+| `--dtype` other than bfloat16 | refused | See the feature table |
+| `--enable-prefix-caching` | refused | See above, including the state-reuse mode it selects implicitly |
+| `--max-num-seqs > 1` | refused | See the limitations |
+| speculative config | refused | See the limitations |
+| `--enable-expert-parallel` / `ep_degree` | refused | Every rank holds all experts |
+| `--enable-prompt-embeds` | refused | The model embeds `input_ids` only |
+| `decode_context_parallel_size` / `apply_prefill_dcp` | refused | No cross-rank gather in decode attention; recurrent layers need the whole prefix |
+
+Every refusal happens at construction, before compilation or device capacity is spent, and every
+message names this model so that a log search can attribute it.
+
 ## Environment variables
 
 | Variable | Default | Effect |
 |---|---|---|
+| `QWEN3_5_MOE_STATE_POOL` | unset (off) | Give the conv and recurrent state a slot axis so several requests can hold state at once. Off by default because `max_num_seqs > 1` is still refused: the pool is verified on CPU (identical tokens with the pool on, at several pool sizes, compiled and eager) and not yet on the device |
+| `QWEN3_5_MOE_SLOT_INDEX` | 1 | With the pool on, read a slot with `index_select` (1) or with a one-hot product (0). The one-hot form materialises the whole pool and exists as a correctness reference, not as a serving path |
 | `QWEN3_5_MOE_GDN_CHUNK` | 64 | Chunk width for the Gated DeltaNet prefill scan. A tiling choice only — the result is independent of it (pinned by `test_chunk_size_does_not_change_the_result`). **Measured: there is nothing to gain here.** At a 2048 prefill bucket, 32 gives TTFT 0.394 s against 0.376 s at the default 64, and 128 and 256 do not compile at all (`neuronx-cc compilation failed with 70`). The default sits just under the compiler's ceiling. |
 
 On a `trn2.3xlarge` (a single EFA card) set `NEURON_SKIP_EFA_AFFINITY=1`: the Neuron EFA-affinity
@@ -412,11 +453,24 @@ Tested for each accepted count from 0 to 3 against the state reached by stepping
 for byte, with 0 leaving both states untouched; for every proposed token's output against the reference;
 and for graph-staticness under `fullgraph=True`.
 
-**Speculative decoding is still refused.** This removes the reason it had to be, not the refusal: the
-draft head is not implemented, and it needs its own KV cache entry, its own attention metadata and the
-runner's draft calling convention. The failure this guards against is silent — a rejected suffix leaves
-the state ahead of the sequence and every later token is conditioned on tokens the model never emitted,
-with fluent output throughout.
+**Speculative decoding is still refused.** This removes the reason it had to be, not the refusal. The
+failure it guards against is silent — a rejected suffix leaves the state ahead of the sequence and every
+later token is conditioned on tokens the model never emitted, with fluent output throughout.
+
+What exists on the model side is in `mtp.py`: the head's four modules, its weight map (`layout.py`,
+`mtp_checkpoint_mappings`), a KV spec and a cache binding for the one extra full-attention layer, and a
+constructor that refuses a layer index inside the main model's range — a draft layer that reused a
+decoder layer's index would share that layer's cache with every shape matching. What is missing is not
+in this directory: the runner accepts `eagle3` as the only speculative method, so reaching a draft head
+at all needs an `mtp` branch and a proposer in a shared file. Refusing it here is therefore redundant
+with the runner's own refusal, and stays only so the reason is stated where the head is.
+
+The head also has **no differential reference on CPU**: `transformers` drops `mtp.*` on load and vLLM's
+own module cannot be built without a platform attention backend. What is pinned instead is every
+component in isolation, the weight map against the real checkpoint index in both directions, and the one
+composition step that cannot be inferred — the concatenation feeding `fc` puts the embedding first, which
+`ops.concat_draft_inputs` names so a test can hold it. The swapped order loads every weight without
+complaint and reads the wrong learned columns.
 
 ## Interleaved MRoPE
 

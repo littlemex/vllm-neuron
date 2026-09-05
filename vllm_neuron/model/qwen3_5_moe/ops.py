@@ -167,6 +167,26 @@ def gated_delta_projections(a, b, a_log, dt_bias):
     return g, beta
 
 
+def concat_draft_inputs(normed_embeddings, normed_hidden):
+    """Concatenate the multi-token-prediction head's two inputs in the reference's order.
+
+    The embedding is the FIRST half and the hidden state the second, as in vLLM's
+    ``Qwen3_5MultiTokenPredictor.forward``. This is one line with a name and a test because it is the
+    one step of that head that cannot be inferred from the checkpoint: the swapped order has the same
+    shape, loads the same ``fc`` weight without complaint, and reads the wrong learned columns of it —
+    the output stays fluent and is wrong. A named function means the served path cannot be written in
+    the other order without editing something a test is looking at.
+
+    Both are ``[..., hidden]``; the result is ``[..., 2 * hidden]``, which is what ``fc`` consumes.
+    """
+    if normed_embeddings.shape != normed_hidden.shape:  # lint-port: ok shapes are graph-static
+        raise ValueError(
+            f"the embedding and the hidden state must have the same shape; got "
+            f"{tuple(normed_embeddings.shape)} and {tuple(normed_hidden.shape)}"
+        )
+    return torch.cat([normed_embeddings, normed_hidden], dim=-1)
+
+
 def redirect_padded_slots(slot_mapping, rows):
     """Make a padded paged-cache scatter collision-proof.
 

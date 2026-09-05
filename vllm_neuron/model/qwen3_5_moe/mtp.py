@@ -29,7 +29,6 @@ graph-static. The gap is stated in the model README rather than papered over.
 """
 from __future__ import annotations
 
-import torch
 from torch import nn
 
 from vllm_neuron.nn import ColumnParallelLinear
@@ -40,6 +39,7 @@ from .model_bf16 import (
     Qwen3_5MoeMoE,
     Qwen3_5MoeRMSNorm,
 )
+from .ops import concat_draft_inputs
 
 
 class Qwen3_5MoeMultiTokenPredictor(nn.Module):
@@ -53,6 +53,15 @@ class Qwen3_5MoeMultiTokenPredictor(nn.Module):
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
+        # A draft index inside the main model's range is the failure this head invites: the KV cache and
+        # the attention metadata are keyed by layer index, so an index of, say, 39 would make the draft
+        # layer read and overwrite the last decoder layer's cache. Every shape matches and the weights
+        # load, so the only symptom is degraded output. Refuse it at construction.
+        if layer_idx < config.num_hidden_layers:
+            raise ValueError(
+                f"the draft layer's index must be past the main model's layers, so that its KV cache "
+                f"entry is its own; got {layer_idx} with num_hidden_layers={config.num_hidden_layers}"
+            )
         self.config = config
         self.layer_idx = layer_idx
         hidden = config.hidden_size
@@ -91,16 +100,12 @@ class Qwen3_5MoeMultiTokenPredictor(nn.Module):
         ``embeddings`` comes from the main model's embedding table — the checkpoint has no separate one
         for the head — and both inputs are ``[batch, tokens, hidden]``.
         """
-        if embeddings.shape != last_hidden_state.shape:  # lint-port: ok shapes are graph-static
-            raise ValueError(
-                f"the embedding and the hidden state must have the same shape; got "
-                f"{tuple(embeddings.shape)} and {tuple(last_hidden_state.shape)}"
-            )
-        # Order transcribed from the reference: the EMBEDDING is the first half of the concatenation.
-        # Swapping the halves keeps every shape and silently reads the wrong learned columns of fc.
+        # Order transcribed from the reference, and kept in `ops.concat_draft_inputs` so a CPU test can
+        # pin it: the EMBEDDING is the first half. Swapping the halves keeps every shape and silently
+        # reads the wrong learned columns of fc. That helper also raises on mismatched shapes.
         normed_embeddings = self.pre_fc_norm_embedding(embeddings)
         normed_hidden = self.pre_fc_norm_hidden(last_hidden_state)
-        fused = self.fc(torch.cat([normed_embeddings, normed_hidden], dim=-1))
+        fused = self.fc(concat_draft_inputs(normed_embeddings, normed_hidden))
 
         residual = fused
         mixed = self.self_attn(self.input_layernorm(fused), positions, cos, sin, attn_metadata,

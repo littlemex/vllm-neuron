@@ -14,6 +14,7 @@ before it is trusted (``test_the_contract_extractor_found_the_declaration``), be
 silently finds nothing would make every check below vacuous.
 """
 import ast
+import importlib
 import importlib.util
 import os
 import sys
@@ -48,17 +49,44 @@ def _load(path, name, package):
     return module
 
 
-# vision_inputs imports the helpers through the real package path, so those names are pre-registered
-# here pointing at the same files. Loading them by path keeps `import vllm_neuron` out of the picture.
+# vision_inputs imports its helpers through the real package path, so that path has to resolve. Where
+# the plugin is genuinely importable (a machine with vLLM), the real package is used and nothing is
+# stubbed. Where it is not, a stub is registered under the real names so the helpers can be loaded by
+# file.
+#
+# Both halves of that are the fix for a defect this file caused: it USED to stub unconditionally, and
+# pytest imports every test module during collection, so the stub was in place before any test ran and
+# shadowed the real package for the whole session. Two checks in another file that import the real
+# vision encoder then failed with ModuleNotFoundError -- and passed when run alone, which is the
+# signature of collection-time pollution. The stub's ``__path__`` was also wrong by one component
+# (``_REPO/model`` for ``vllm_neuron.model``), so even the stubbed path could not have resolved a
+# submodule Python had to find on disk.
 _pkg = "vllm_neuron.model.qwen3_vl.utils"
-for _part in ("vllm_neuron", "vllm_neuron.model", "vllm_neuron.model.qwen3_vl", _pkg):
-    _stub = sys.modules.get(_part) or types.ModuleType(_part)
-    # lint-port: ok a freshly made ModuleType has no __path__ by construction, so the default IS the
-    # value being installed rather than a guard that could fail to fire
-    _stub.__path__ = getattr(_stub, "__path__", [os.path.join(_REPO, *_part.split(".")[1:])])  # lint-port: ok see above
-    sys.modules[_part] = _stub
-_load(os.path.join(_UTILS_DIR, "vision_block_packing.py"), "vision_block_packing", _pkg)
-_load(os.path.join(_UTILS_DIR, "vision_preprocessing.py"), "vision_preprocessing", _pkg)
+
+
+def _real_package_importable(module_name: str) -> bool:
+    """Whether ``module_name`` imports for real, leaving sys.modules as it was if it does not."""
+    before = set(sys.modules)
+    try:
+        importlib.import_module(module_name)
+        return True
+    except Exception:  # noqa: BLE001 - any failure to import means "not available", whatever it was
+        for name in set(sys.modules) - before:
+            if name.split(".")[0] == module_name.split(".")[0]:
+                del sys.modules[name]
+        return False
+
+
+_USING_REAL_PLUGIN = _real_package_importable(f"{_pkg}.vision_block_packing")
+if not _USING_REAL_PLUGIN:
+    for _part in ("vllm_neuron", "vllm_neuron.model", "vllm_neuron.model.qwen3_vl", _pkg):
+        _stub = sys.modules.get(_part) or types.ModuleType(_part)
+        # Every component of the dotted name is a directory under the repo root, so the whole name is
+        # joined -- not name[1:], which pointed one level above the package.
+        _stub.__path__ = getattr(_stub, "__path__", [os.path.join(_REPO, *_part.split("."))])  # lint-port: ok a freshly made ModuleType has no __path__, so the default IS the value being installed
+        sys.modules[_part] = _stub
+    _load(os.path.join(_UTILS_DIR, "vision_block_packing.py"), "vision_block_packing", _pkg)
+    _load(os.path.join(_UTILS_DIR, "vision_preprocessing.py"), "vision_preprocessing", _pkg)
 
 _MINE = "_qwen3_5_moe_vision_under_test"
 config = _load(os.path.join(_MODEL_DIR, "config.py"), "config", _MINE)
