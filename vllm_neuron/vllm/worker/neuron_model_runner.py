@@ -7838,11 +7838,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                         target_shape = (num_slots, *shape)
                         inner_stride = torch.empty(target_shape).stride()
                         assert offset_bytes % dtype_size == 0
+                        # as_strided does NOT bounds-check: a view past the end of the storage reads
+                        # uninitialised memory, which for float reinterpretation shows up as NaN and then
+                        # poisons the recurrence. Measured: without this check the second group's state
+                        # read NaN before anything had been written to it, and the symptom was a
+                        # repeating token rather than an error.
+                        typed = raw_tensor.view(dtype)
+                        start = offset_bytes // dtype_size
+                        last = start + (num_slots - 1) * elements_per_page + inner_stride[0]
+                        if last > typed.numel():
+                            raise RuntimeError(
+                                f"{layer_name}: the {dtype} state view would end at element {last} of a "
+                                f"{typed.numel()}-element storage. num_slots={num_slots}, "
+                                f"page={elements_per_page}, per_slot={inner_stride[0]}, start={start}. "
+                                "as_strided does not check this, so the view would read uninitialised "
+                                "memory as NaN."
+                            )
                         state_tensors.append(torch.as_strided(
-                            raw_tensor.view(dtype),
-                            size=target_shape,
+                            typed, size=target_shape,
                             stride=(elements_per_page, *inner_stride[1:]),
-                            storage_offset=offset_bytes // dtype_size,
+                            storage_offset=start,
                         ))
                         offset_bytes += inner_stride[0] * dtype_size
 

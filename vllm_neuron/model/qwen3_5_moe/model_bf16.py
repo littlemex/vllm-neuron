@@ -32,6 +32,7 @@ from nkilib.core.utils.common_types import RouterActFnType
 from torch import nn
 from torch.distributed._functional_collectives import all_gather_tensor
 from vllm.distributed.parallel_state import get_tp_group
+from vllm.logger import init_logger
 
 import vllm_neuron.functional as NF
 from vllm_neuron.functional.moe.router import RouterComputationOrder
@@ -83,6 +84,8 @@ _DEFAULT_GDN_CHUNK = DEFAULT_CHUNK_SIZE
 # selected ones.
 _MOE_BLOCK_SIZE = 256
 _SELECTIVE_LOADING_THRESHOLD = 1.0
+
+logger = init_logger(__name__)
 
 
 def attention_metadata_key(layer_idx: int) -> str:
@@ -1347,14 +1350,19 @@ class Qwen3_5MoeForCausalLM(nn.Module):
 
         **Slot counts agree** between the two states, since they index by the same slot.
 
-        **Storage is distinct across layers.** This is the one that cost a debugging session. vLLM's KV
-        cache config can hand the SAME raw tensor to several layers of one group -- for attention that is
-        fine because each layer writes a different slice, but a recurrent state indexed only by slot has
-        no per-layer dimension, so three layers wrote over each other every step. The output stayed
-        fluent and degenerated to a repeated token; nothing raised. Measured: layers 0, 1 and 2 shared
-        one pointer and layers 4, 5 and 6 shared another.
+        **Storage sharing is recorded, not refused.** vLLM hands the same raw tensor to the layer at the
+        same POSITION in every group: with groups [0, 4], [1, 5], [2, 6], layers 0, 1 and 2 share one
+        tensor and layers 4, 5 and 6 share another. That is the design, not a defect -- each group gets
+        its own block id, so those three layers are given different slots (2, 3 and 4 as measured) and
+        their writes are disjoint.
+
+        An earlier version of this method REFUSED the sharing. That was wrong, and the reasoning behind
+        it is worth keeping: a pointer collision was observed and read as a collision of writes, without
+        checking whether the slots differed. The invariant that actually matters is
+        ``(storage, slot)`` distinctness, and the slot is not known here -- it arrives per step in the
+        metadata. So this logs the sharing and leaves the invariant to be checked where the slot is.
         """
-        seen: dict[int, str] = {}
+        self._state_storage: dict[int, list[str]] = {}
         for index, layer in enumerate(self.model.decoder_layers):
             if layer.layer_type != LINEAR_ATTENTION:
                 continue
@@ -1384,20 +1392,16 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                     f"{name}: the two states were allocated {conv.shape[0]} and {recurrent.shape[0]} "
                     "slots; they index by the same slot so the counts must agree."
                 )
-            for label, tensor in (("conv", conv), ("recurrent", recurrent)):
-                pointer = tensor.data_ptr()
-                if pointer in seen:
-                    raise RuntimeError(
-                        f"{name}'s {label} state shares storage with {seen[pointer]}. A recurrent state "
-                        "is indexed by slot only, with no per-layer dimension, so the layers would "
-                        "overwrite each other every step -- which produces fluent output that "
-                        "degenerates rather than an error. Each state layer needs its own tensor from "
-                        "the cache config."
-                    )
-                seen[pointer] = f"{name}'s {label}"
+            self._state_storage[conv.data_ptr()] = self._state_storage.get(
+                conv.data_ptr(), []) + [name]
             mixer.conv_state = conv
             mixer.recurrent_state = recurrent
             mixer.num_slots = conv.shape[0]
+        for pointer, sharers in self._state_storage.items():
+            if len(sharers) > 1:
+                # Expected: the layer at the same position in every group. Recorded so a step that hands
+                # two of them the same slot can be recognised as a collision rather than as arithmetic.
+                logger.info("state storage %s is shared by %s", pointer, sharers)
 
     def get_kv_spec(self):
         """The full_attention layers' KV, plus the Gated DeltaNet state when a pool was asked for.
