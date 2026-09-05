@@ -117,8 +117,16 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
 - **Concurrency needs the state pool, and is verified on CPU only.** `max_num_seqs > 1` is refused unless
   `QWEN3_5_MOE_STATE_POOL=1` asks for the per-slot state; with the pool on it proceeds and logs a warning
   that the multi-request path has not run on a device. What is verified, at rung 2 with the whole runner:
-  four requests in one scheduler step produce token-for-token what the same four produce at
-  `max_num_seqs=1`. The pieces behind that are a slot axis on the conv and recurrent state, a packed
+  requests in one scheduler step do not read each other's state. Established three ways -- a request's
+  output is bit-identical across three different sets of neighbours, one request alone in a four-seat
+  engine matches the single-seat run, and at the one position where a batched run picked a different token
+  the top-two logit margin was measured at exactly zero in BOTH runs.
+
+  **Token equality between a batched step and a serial one does not hold in general, and cannot.** Where
+  two candidates are equal to the last bit, the reduction's shape decides which the argmax reports. The
+  acceptance criterion is therefore agreement except at positions whose top-two margin is at the dtype's
+  resolution -- the same criterion the device runs use for a changed bucket width. One fixture here agreed
+  exactly and a second did not; the first was luck, not a stronger result. The pieces behind that are a slot axis on the conv and recurrent state, a packed
   chunk-aligned prefill whose scan carries per-request masks and whose convolution gathers each request's
   own history, and a decode attention that is batch-general (`ops.paged_decode_attention`). Nothing here
   has been measured on a device, so the seat count that pays for itself is not yet known.
