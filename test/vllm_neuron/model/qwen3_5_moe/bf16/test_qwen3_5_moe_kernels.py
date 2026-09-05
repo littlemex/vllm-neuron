@@ -2131,8 +2131,19 @@ def test_a_request_is_unchanged_when_only_its_NEIGHBOURS_change():
     Comparing a batched row against a solo run cannot be exact, because the two calls have different
     shapes and the library blocks them differently -- so that comparison carries a tolerance, and any
     tolerance admits contamination below it. Here the shape never changes. Only the OTHER requests' data
-    does, so the kernel and the blocking are identical and the row under test must be identical to the
-    bit. A leak of any size, however small, fails this.
+    does, so the kernel and the blocking are identical and the row under test must be identical to the bit.
+
+    What it catches, exactly: contamination whose VALUE depends on a neighbour's data, at any magnitude --
+    a 1e-7 mixture fails this and passes every batched-versus-solo comparison.
+
+    What it does not catch, and neither does the tolerance-based test, so this is a real hole rather than a
+    division of labour: contamination that does not depend on neighbour values. Reading an uninitialised
+    scratch row, or a stale slot of the request's own state, is invariant under this perturbation and
+    smaller than the other test's floor. The state-pool tests cover that side by filling unheld slots with
+    non-zero sentinels; nothing here covers it for the outputs.
+
+    And this is the CPU reference path. Leakage through a device kernel's shared tiles or its DMA is not
+    exercised by any of it; that is rung 5.
     """
     module, config = _hf_gated_delta_net(seed=41)
     weights = _weights_from_hf(module)
@@ -2153,6 +2164,12 @@ def test_a_request_is_unchanged_when_only_its_NEIGHBOURS_change():
                                           recurrent_state=recurrent_in, is_continuation=continuing)
 
     baseline = step(tokens, recurrent, conv)
+    # Every returned tensor must have the request axis first, or the slicing below compares the wrong
+    # rows and passes for the wrong reason.
+    for index, tensor in enumerate(baseline):
+        assert tensor.shape[0] == requests, (
+            f"output {index} has shape {tuple(tensor.shape)}; this test assumes the request axis is "
+            f"first, with {requests} of them")
 
     for victim in range(requests):
         others = [r for r in range(requests) if r != victim]
@@ -2170,9 +2187,13 @@ def test_a_request_is_unchanged_when_only_its_NEIGHBOURS_change():
                 f"output {index} of request {victim} changed when only the other requests did: "
                 f"max |delta| = "
                 f"{(after[victim].float() - before[victim].float()).abs().max().item():.3e}")
-        # The disturbance has to have been visible somewhere, or this test proves nothing.
-        assert not torch.equal(disturbed[0][others[0]], baseline[0][others[0]]), (
-            "the disturbed requests produced identical output, so the perturbation did nothing")
+        # The disturbance has to have been visible in EVERY disturbed row of every output, or this test
+        # proves nothing about the rows it then finds unchanged.
+        for index, (after, before) in enumerate(zip(disturbed, baseline)):
+            for other in others:
+                assert not torch.equal(after[other], before[other]), (
+                    f"output {index} of request {other} was disturbed and did not change, so the "
+                    f"perturbation did nothing there")
 
 
 def test_a_per_request_continuation_flag_zeroes_only_that_request():

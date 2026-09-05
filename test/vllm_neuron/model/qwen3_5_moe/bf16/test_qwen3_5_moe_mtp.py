@@ -234,39 +234,48 @@ def test_mismatched_shapes_are_refused_rather_than_broadcast():
 
 
 class RecordingNorm(torch.nn.Module):
-    """Stands in for the RMS norm, and is identifiable in the output it produces.
+    """Stands in for the RMS norm: records what it was built with and what it was handed.
 
-    Each instance multiplies by its own constant, so a swapped pair of norms changes the numbers rather
-    than only the call order -- the assertions can then be about values instead of about a call log.
+    **Affine, not linear.** An earlier version multiplied by a constant, which made a whole class of defect
+    invisible: with a linear stand-in, `norm(a) + norm(b)` equals `norm(a + b)` to the bit, so a head that
+    normalises each branch separately instead of normalising the sum passed every assertion. The real RMS
+    norm is not additive, and neither is this. The `+ offset` is what restores the distinction.
+
+    The constructor arguments are recorded because nothing else would notice them being swapped: this stub
+    uses neither the epsilon nor the dtype, so a head that passes them in the wrong order builds fine.
     """
 
     def __init__(self, hidden, eps, dtype, factor):
         super().__init__()
+        self.built_with = {"hidden": hidden, "eps": eps, "dtype": dtype}
         self.weight = torch.nn.Parameter(torch.full((hidden,), float(factor)))
-        self.eps = eps
         self.factor = factor
+        self.offset = factor / 2.0
         self.inputs: list = []
 
     def forward(self, x):
         self.inputs.append(x)
-        return x * self.factor
+        return x * self.factor + self.offset
 
 
 class RecordingLinear(torch.nn.Module):
-    """Stands in for `ColumnParallelLinear`, recording what it was handed."""
+    """Stands in for `ColumnParallelLinear`, recording how it was built and what it was handed."""
 
     def __init__(self, in_features, out_features, bias=False, dtype=None, gather_output=True):
         super().__init__()
         self.in_features, self.out_features = in_features, out_features
         self.out_features_per_rank, self.tp_size = out_features, 1
-        self.bias_requested, self.gather_output = bias, gather_output
+        self.built_with = {"bias": bias, "dtype": dtype, "gather_output": gather_output}
         self.weight = torch.nn.Parameter(torch.zeros(out_features, in_features))
         self.inputs: list = []
 
     def forward(self, x):
         self.inputs.append(x)
-        # A projection whose output is recognisable: the two halves, added, so the assertion can name
-        # which half went where.
+        return self.applied(x)
+
+    def applied(self, x):
+        """The projection as a pure function, so a test can predict it without appending to the log."""
+        # Recognisable and NOT symmetric in its two halves: the assertion can name which half went where.
         return x[..., :self.out_features] + 10.0 * x[..., self.out_features:]
 
 
@@ -276,11 +285,14 @@ class RecordingAttention(torch.nn.Module):
         self.layer_idx = layer_idx
         self.num_key_value_heads_per_rank, self.head_dim = 2, 8
         self.dtype, self.window_size = torch.bfloat16, None
-        self.inputs: list = []
+        self.calls: list = []
         self.bound: list = []
 
     def forward(self, hidden, positions, cos, sin, attn_metadata, is_prefill):
-        self.inputs.append(hidden)
+        # Every argument is recorded by NAME. Passing them all as None -- which the first version of these
+        # tests did -- makes swapping cos with sin, or positions with the metadata, invisible.
+        self.calls.append({"hidden": hidden, "positions": positions, "cos": cos, "sin": sin,
+                           "attn_metadata": attn_metadata, "is_prefill": is_prefill})
         return hidden * 100.0
 
     def bind_caches(self, k_cache, v_cache):
@@ -302,17 +314,25 @@ class RecordingMoE(torch.nn.Module):
 def load_head_class():
     """Execute the shipped `mtp.py` with its four framework dependencies replaced by the spies above.
 
-    Returns the class, and leaves `sys.modules` exactly as it was found. The stub names have to be the
-    framework's real ones because the shipped file imports them by those names, and the shipped file is
-    what is worth testing -- so the names are borrowed and given back.
+    Returns `(class, recorded)` where `recorded` collects what the stubbed loader was asked to do, and
+    leaves `sys.modules` exactly as it was found. The stub names have to be the framework's real ones
+    because the shipped file imports them by those names, and the shipped file is what is worth testing --
+    so the names are borrowed and given back.
+
+    What runs is the shipped file, unmodified. What it is BOUND to is not: the real imports are never
+    resolved here, so nothing in this file says the shipped import lines name modules that exist. Rung 2
+    is what settles that.
     """
     factors = iter([2.0, 3.0, 5.0, 7.0, 11.0])   # one per norm, in construction order
+    recorded: dict = {"sharding": [], "set_weight_loader": []}
 
     nn_stub = types.ModuleType("vllm_neuron.nn")
     nn_stub.ColumnParallelLinear = RecordingLinear
     loader_stub = types.ModuleType("vllm_neuron.utils.weight_loader")
-    loader_stub.set_weight_loader = lambda *a, **k: None
-    loader_stub.sharding_weight_loader = lambda *a, **k: None
+    loader_stub.set_weight_loader = lambda *a, **k: recorded["set_weight_loader"].append((a, k))
+    # The sharding arguments are recorded because a wrong shard dimension or a transposed-storage flag is
+    # invisible until TP > 1, where the output is slightly wrong and gets blamed on precision.
+    loader_stub.sharding_weight_loader = lambda *a, **k: recorded["sharding"].append((a, k))
 
     model_stub = types.ModuleType(f"{_PACKAGE}.model_bf16")
     model_stub.Qwen3_5MoeRMSNorm = lambda hidden, eps, dtype: RecordingNorm(
@@ -327,18 +347,33 @@ def load_head_class():
         "vllm_neuron.utils.weight_loader": loader_stub,
         f"{_PACKAGE}.model_bf16": model_stub,
     }
-    snapshot = dict(sys.modules)
+    # Only the keys this function touches are restored, and only if they were absent before. Clearing
+    # sys.modules and reinstating a snapshot -- the previous approach -- EVICTS anything imported during
+    # the window, so the returned class kept a reference to a module the next import would execute a
+    # second time, giving two classes with one name and no assertion able to see it.
+    #
+    # Not thread-safe, and cannot be: the framework's names are globally visible while this runs. Nothing
+    # else in this suite imports concurrently.
+    previously = {name: sys.modules.get(name) for name in installed}
+    added: list = []
     try:
         sys.modules.update(installed)
-        spec = importlib.util.spec_from_file_location(
-            f"{_PACKAGE}.mtp", os.path.join(_model_dir, "mtp.py"))
+        target = f"{_PACKAGE}.mtp"
+        spec = importlib.util.spec_from_file_location(target, os.path.join(_model_dir, "mtp.py"))
         module = importlib.util.module_from_spec(spec)
-        sys.modules[f"{_PACKAGE}.mtp"] = module
+        before_exec = set(sys.modules)
+        sys.modules[target] = module
         spec.loader.exec_module(module)
-        return module.Qwen3_5MoeMultiTokenPredictor
+        added = [name for name in set(sys.modules) - before_exec if name.startswith(_PACKAGE)]
+        return module.Qwen3_5MoeMultiTokenPredictor, recorded
     finally:
-        sys.modules.clear()
-        sys.modules.update(snapshot)
+        for name, original in previously.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
+        for name in added:
+            sys.modules.pop(name, None)
 
 
 class HeadConfig:
@@ -350,27 +385,37 @@ class HeadConfig:
 
 
 def build_head(layer_idx=40):
-    return load_head_class()(HeadConfig(), layer_idx)
+    head_class, recorded = load_head_class()
+    head = head_class(HeadConfig(), layer_idx)
+    head.recorded = recorded
+    return head
 
 
-def test_loading_the_head_leaves_sys_modules_as_it_found_it():
+def test_loading_the_head_leaves_the_framework_s_names_alone():
     """The stubs wear the framework's real names, so giving them back is part of the contract.
 
-    Another file in this directory installed such stubs permanently, and because pytest imports every
-    test module during collection, the whole session's real imports resolved to them.
+    Asserting "the same as before" is not enough on its own, because pytest imports every test module
+    during collection: if something had polluted these names before this test ran, "restored to what I
+    found" would bless the pollution. So the names are asserted ABSENT (or real) rather than unchanged.
     """
+    stub_names = ("vllm_neuron", "vllm_neuron.nn", "vllm_neuron.utils",
+                  "vllm_neuron.utils.weight_loader")
     before = dict(sys.modules)
     build_head()
     assert set(sys.modules) == set(before)
     assert all(sys.modules[name] is module for name, module in before.items())
+    for name in stub_names:
+        residue = sys.modules.get(name)
+        assert residue is None or getattr(residue, "__file__", None), (
+            f"{name} is left in sys.modules as a module with no file, i.e. a stub")
 
 
 def test_the_head_normalises_each_input_with_its_own_norm_and_concatenates_embedding_first():
     """The composition, executed. This is the assertion the helper-level test could not make.
 
-    The two pre-norms multiply by different constants and `fc` weights its second half by ten, so the
-    fused value names which half held which input. Swapping the pre-norms, swapping the halves, or
-    reusing one norm for both inputs all change this number.
+    The two pre-norms are affine with different constants and `fc` weights its second half by ten, so the
+    fused value names which half held which input. Swapping the pre-norms, swapping the halves, or reusing
+    one norm for both inputs all change this number.
     """
     head = build_head()
     embeddings = torch.arange(2 * 3 * 16, dtype=torch.float32).reshape(2, 3, 16)
@@ -378,44 +423,86 @@ def test_the_head_normalises_each_input_with_its_own_norm_and_concatenates_embed
 
     head(embeddings, hidden, positions=None, cos=None, sin=None, attn_metadata=None, is_prefill=True)
 
-    embedding_factor = head.pre_fc_norm_embedding.factor
-    hidden_factor = head.pre_fc_norm_hidden.factor
-    assert embedding_factor != hidden_factor, "the spies cannot distinguish the two norms"
+    embedding_norm, hidden_norm = head.pre_fc_norm_embedding, head.pre_fc_norm_hidden
+    assert embedding_norm.factor != hidden_norm.factor, "the spies cannot distinguish the two norms"
 
     # Each pre-norm saw its own input, and only its own.
-    assert len(head.pre_fc_norm_embedding.inputs) == 1
-    assert torch.equal(head.pre_fc_norm_embedding.inputs[0], embeddings)
-    assert torch.equal(head.pre_fc_norm_hidden.inputs[0], hidden)
+    assert len(embedding_norm.inputs) == 1
+    assert torch.equal(embedding_norm.inputs[0], embeddings)
+    assert torch.equal(hidden_norm.inputs[0], hidden)
 
     # fc was handed [normed embedding | normed hidden], in that order.
     fused_input = head.fc.inputs[0]
     assert fused_input.shape == (2, 3, 32)
-    torch.testing.assert_close(fused_input[..., :16], embeddings * embedding_factor)
-    torch.testing.assert_close(fused_input[..., 16:], hidden * hidden_factor)
+    torch.testing.assert_close(fused_input[..., :16], embedding_norm(embeddings.clone()))
+    torch.testing.assert_close(fused_input[..., 16:], hidden_norm(hidden.clone()))
+
+
+def test_every_norm_is_built_with_the_config_s_epsilon_and_dtype():
+    """Nothing else would notice these being swapped: the head passes three positional arguments to a
+    constructor, and a stand-in that ignores two of them builds happily either way. The real norm reads
+    the epsilon."""
+    head = build_head()
+    for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm", "input_layernorm",
+                 "post_attention_layernorm"):
+        built = getattr(head, name).built_with
+        assert built == {"hidden": HeadConfig.hidden_size, "eps": HeadConfig.rms_norm_eps,
+                         "dtype": HeadConfig.torch_dtype}, f"{name} was built with {built}"
+
+
+def test_the_projection_s_weight_loader_shards_the_output_dimension():
+    """A wrong shard dimension or a transposed-storage flag is invisible until TP > 1, where the output is
+    slightly wrong and gets blamed on precision. `fc` maps 2H -> H, so the dimension that may be split
+    across ranks is the OUTPUT one, dimension 0, and the checkpoint's storage is not transposed."""
+    head = build_head()
+    assert len(head.recorded["sharding"]) == 1, head.recorded["sharding"]
+    _, kwargs = head.recorded["sharding"][0]
+    assert kwargs["shard_dim"] == 0, f"fc is sharded on dimension {kwargs['shard_dim']}"
+    assert kwargs["is_storage_transposed"] is False
+    assert kwargs["shard_size"] == head.fc.out_features_per_rank
+    assert kwargs["num_shards"] == head.fc.tp_size
+    # And the loader was actually attached to the parameter, not merely constructed.
+    assert len(head.recorded["set_weight_loader"]) == 1
+    attached, _ = head.recorded["set_weight_loader"][0]
+    assert attached[0] is head.fc.weight
 
 
 def test_the_residual_is_the_projection_and_the_moe_is_handed_the_post_attention_weight():
-    """Residual placement and the fused-norm handover, which no shape would catch."""
+    """Residual placement, the fused-norm handover, and the final norm's INPUT.
+
+    The last of those matters because the spies used to be linear: with `norm(x) = kx`, a head that
+    normalised each branch separately instead of the sum was bit-identical to the correct one. The norms
+    are affine now, and the final norm's recorded input is asserted directly.
+    """
     head = build_head()
     embeddings = torch.randn(1, 2, 16)
     hidden = torch.randn(1, 2, 16)
+    positions, cos, sin, metadata = "positions", "cos", "sin", "metadata"
 
-    out = head(embeddings, hidden, positions=None, cos=None, sin=None, attn_metadata=None,
+    out = head(embeddings, hidden, positions=positions, cos=cos, sin=sin, attn_metadata=metadata,
                is_prefill=False, valid_mask="the-mask")
 
-    fused = head.fc(head.fc.inputs[0])              # the spy is deterministic, so this reproduces it
+    # Predicted without calling the spy again, so reading the log does not extend it.
+    fused = head.fc.applied(head.fc.inputs[0])
+    call = head.self_attn.calls[0]
+    # Distinct sentinels, so a swapped pair of arguments is visible. All-None hid this entirely.
+    assert (call["positions"], call["cos"], call["sin"], call["attn_metadata"]) == (
+        positions, cos, sin, metadata)
+    assert call["is_prefill"] is False
     # The attention was applied to the INPUT norm of the projection, not to the projection itself.
-    torch.testing.assert_close(head.self_attn.inputs[0], fused * head.input_layernorm.factor)
+    torch.testing.assert_close(call["hidden"], head.input_layernorm(fused.clone()))
     # ...and the residual added to it is the projection.
-    after_attention = fused + head.self_attn.inputs[0] * 100.0
+    after_attention = fused + call["hidden"] * 100.0
     torch.testing.assert_close(head.mlp.calls[0]["hidden"], after_attention)
     # The MoE fuses the post-attention norm, so it must receive that norm's WEIGHT, not a normed tensor.
     assert head.mlp.calls[0]["norm_weight"] is head.post_attention_layernorm.weight
     assert head.mlp.calls[0]["is_prefill"] is False
     assert head.mlp.calls[0]["valid_mask"] == "the-mask"
-    # And the output is the final norm of the second residual.
-    expected = (after_attention + after_attention * 1000.0) * head.norm.factor
-    torch.testing.assert_close(out, expected)
+    # The final norm was applied ONCE, to the second residual -- not to each branch of it.
+    second_residual = after_attention + after_attention * 1000.0
+    assert len(head.norm.inputs) == 1
+    torch.testing.assert_close(head.norm.inputs[0], second_residual)
+    torch.testing.assert_close(out, head.norm(second_residual.clone()))
 
 
 def test_the_draft_layer_index_must_be_past_the_main_model():
@@ -438,10 +525,46 @@ def test_the_kv_spec_describes_the_head_s_own_attention_and_the_binding_reaches_
 
 
 def test_the_projection_is_two_hidden_to_hidden_without_a_bias():
-    """`fc` consumes the concatenation and produces one hidden state; a bias would be an extra tensor
-    the checkpoint does not carry."""
+    """`fc` consumes the concatenation and produces one hidden state; a bias would be an extra tensor the
+    checkpoint does not carry, and an ungathered output would hand the next layer a shard."""
     head = build_head()
     assert (head.fc.in_features, head.fc.out_features) == (2 * HeadConfig.hidden_size,
                                                            HeadConfig.hidden_size)
-    assert head.fc.bias_requested is False
-    assert head.fc.gather_output is True
+    assert head.fc.built_with == {"bias": False, "dtype": HeadConfig.torch_dtype,
+                                  "gather_output": True}
+
+
+# The destinations that belong to the SHARED attention and MoE classes rather than to this head. Their
+# leaf names are those classes' contract, and a stub cannot check them: this file replaces those classes,
+# so asserting their parameter names here would only assert the stub. They are checked where the classes
+# live, and for real by the weight load at rung 2.
+DELEGATED_PREFIXES = ("self_attn.", "mlp.")
+
+
+def test_every_mapping_destination_resolves_on_the_built_head():
+    """The real version of the textual check: walk each destination path on an instance.
+
+    Grepping the source for `self.<attr> = ` is satisfied by a comment, a docstring, an assignment in
+    another method, or `self.attr = None`, and it only ever looked at the FIRST component of the path. Now
+    that the head can be built, the components it owns can be resolved for real.
+    """
+    head = build_head()
+    checked = 0
+    for destination in mtp_checkpoint_mappings():
+        components = destination.split(".")
+        if destination.startswith(DELEGATED_PREFIXES):
+            # Only the submodule, which is what this head is responsible for owning.
+            assert hasattr(head, components[0]), (
+                f"the mapping loads into {destination}, and the head has no {components[0]}")
+            continue
+        target = head
+        for component in components:
+            assert hasattr(target, component), (
+                f"the mapping loads into {destination}, and {component} does not exist on the head")
+            target = getattr(target, component)
+        assert target is not None, f"{destination} exists but is None, so nothing can be loaded into it"
+        checked += 1
+    # Guard against the loop degenerating: if every destination became "delegated", this test would pass
+    # while resolving nothing. Six destinations are the head's own -- fc, three norms, and the two the
+    # decoder layer wraps.
+    assert checked == 6, f"{checked} destinations were resolved, not the expected 6"

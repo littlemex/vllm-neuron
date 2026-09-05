@@ -93,6 +93,8 @@ def _real_package_importable(module_name: str) -> bool:
 
 _USING_REAL_PLUGIN = _real_package_importable(f"{_pkg}.vision_block_packing")
 if not _USING_REAL_PLUGIN:
+    _borrowed = [name for name in ("vllm_neuron", "vllm_neuron.model", "vllm_neuron.model.qwen3_vl",
+                                   _pkg) if name not in sys.modules]
     for _part in ("vllm_neuron", "vllm_neuron.model", "vllm_neuron.model.qwen3_vl", _pkg):
         _stub = sys.modules.get(_part) or types.ModuleType(_part)
         # Every component of the dotted name is a directory under the repo root, so the whole name is
@@ -105,6 +107,18 @@ if not _USING_REAL_PLUGIN:
 _MINE = "_qwen3_5_moe_vision_under_test"
 config = _load(os.path.join(_MODEL_DIR, "config.py"), "config", _MINE)
 vision_inputs = _load(os.path.join(_MODEL_DIR, "vision_inputs.py"), "vision_inputs", _MINE)
+
+if not _USING_REAL_PLUGIN:
+    # The names are given BACK. Everything that needed them has been executed, and the loaded modules hold
+    # their own references, so nothing here depends on the entries surviving.
+    #
+    # This matters because pytest imports every test module during collection: an entry left behind is
+    # visible to the entire session, and a fileless module called `vllm_neuron` sitting in `sys.modules`
+    # is exactly what made two checks in a sibling file fail on a module that exists on disk. Leaving it
+    # in place also made "restore what I found" a meaningless contract for any test written later, since
+    # what it found was already wrong.
+    for _part in reversed(_borrowed):
+        sys.modules.pop(_part, None)
 
 VISION_CONFIG = config.Qwen3_5MoeVisionConfig()
 BLOCK_SIZE = 128
