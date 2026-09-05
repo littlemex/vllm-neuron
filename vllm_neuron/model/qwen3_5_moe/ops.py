@@ -187,6 +187,55 @@ def concat_draft_inputs(normed_embeddings, normed_hidden):
     return torch.cat([normed_embeddings, normed_hidden], dim=-1)
 
 
+def paged_decode_attention(query, key_dense, value_dense, positions, scaling, groups, batch):
+    """Decode attention over a densely gathered, padded context, for any number of sequences.
+
+    Shapes, all of which have to be spelled out because the single-sequence form let two of them coincide:
+
+    * ``query``      ``[heads, batch * decode_tokens, head_dim]`` -- the projection's layout
+    * ``key_dense``  ``[batch * kv_heads, context_len, head_dim]`` -- the gather's layout
+    * ``positions``  ``[batch * decode_tokens]`` -- each row's absolute position
+    * returns        ``[batch * decode_tokens, heads * head_dim]``
+
+    The previous implementation multiplied ``query`` (leading axis ``heads``) by the expanded keys
+    (leading axis ``batch * heads``) and masked with ``positions`` flattened. At ``batch == 1`` those two
+    leading axes are the same number and the mask has one row per token, so it was correct; at any larger
+    batch it would have multiplied the wrong pairs. That is why it refused rather than being "probably
+    fine": the shapes agree by coincidence, so nothing raises.
+
+    fp32 throughout, as the caller's docstring explains: the asymmetric ``q=1`` / ``k=S_ctx`` shape is not
+    what the flash-attention kernel takes, and fp32 removes bf16 accumulation drift over a long context.
+    """
+    heads, total_tokens, head_dim = query.shape
+    if total_tokens % batch:  # lint-port: ok shapes are graph-static; this is a wiring error, not data
+        raise ValueError(f"{total_tokens} decode rows do not divide into {batch} sequences")
+    decode_tokens = total_tokens // batch
+    context_len = key_dense.shape[1]
+
+    # Batch-major everywhere. The keys arrive as [batch * kv_heads, ...] with batch the OUTER axis, so
+    # expanding the groups keeps each sequence's heads together.
+    key_full = key_dense.repeat_interleave(groups, dim=0).to(torch.float32)
+    value_full = value_dense.repeat_interleave(groups, dim=0).to(torch.float32)
+    key_full = key_full.view(batch, heads, context_len, head_dim)
+    value_full = value_full.view(batch, heads, context_len, head_dim)
+
+    # The query's token axis is batch-major too: row b * decode_tokens + t belongs to sequence b.
+    query = (query.to(torch.float32)
+             .view(heads, batch, decode_tokens, head_dim)
+             .permute(1, 0, 2, 3))                              # [batch, heads, decode_tokens, head_dim]
+
+    scores = torch.matmul(query, key_full.transpose(-2, -1)) * scaling
+    # Per-row causal mask over the padded context: each row attends up to its OWN absolute position.
+    # Masking with the last position alone would let earlier rows of a decode bucket read future keys.
+    context_index = torch.arange(context_len, device=scores.device)
+    valid = context_index.view(1, 1, -1) <= positions.view(batch, decode_tokens, 1)
+    scores = scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
+    weights = F.softmax(scores, dim=-1, dtype=torch.float32)
+    out = torch.matmul(weights, value_full)                     # [batch, heads, decode_tokens, head_dim]
+    # Back to the caller's row-major layout: [batch * decode_tokens, heads * head_dim].
+    return out.permute(0, 2, 1, 3).reshape(batch * decode_tokens, heads * head_dim)
+
+
 def redirect_padded_slots(slot_mapping, rows):
     """Make a padded paged-cache scatter collision-proof.
 

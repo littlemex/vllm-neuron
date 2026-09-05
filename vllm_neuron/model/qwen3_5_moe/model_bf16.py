@@ -66,6 +66,7 @@ from .ops import (
     apply_partial_rotary,
     chunk_aligned_layout,
     mrope_tables,
+    paged_decode_attention,
     read_state_slot,
     read_state_slots,
     redirect_padded_slots,
@@ -432,25 +433,6 @@ class Qwen3_5MoeAttention(nn.Module):
         block_table = metadata["block_table_tensor"]
 
         batch = block_table.shape[0]
-        tokens = hidden_states.shape[0]
-        if batch != 1:
-            # The reason named here is the ATTENTION decode, not the recurrent state. The previous message
-            # blamed "single per-layer buffers (no per-slot pool)", which stopped being true when the pool
-            # landed: with the pool on and max_num_seqs=2, CPU mode reaches this line and reports a cause
-            # that has been fixed. A refusal whose stated reason is stale sends the next person to rebuild
-            # something that exists.
-            #
-            # What is actually unfinished: this decode gathers the whole context densely and computes in
-            # fp32, which was chosen when one sequence at a time was the only shape. It uses `batch` in its
-            # views, so it may already be general -- but "may be" is not a verification, and the batched
-            # form has no test. Refusing is correct until it has one.
-            raise NotImplementedError(
-                f"Qwen3.5-MoE attention decode is verified for one sequence at a time; got batch size "
-                f"{batch}. This is NOT the recurrent state, which has a per-slot pool: the dense fp32 "
-                f"context gather in this function was written for a single sequence and its batched form "
-                f"is untested. See the project's docs/DESIGN-concurrency.md, stage C."
-            )
-        decode_tokens = tokens // batch
         hidden_states = hidden_states.to(self.dtype)
         context_len = max_blocks_per_seq * block_size
         kv_heads = self.num_key_value_heads_per_rank
@@ -468,21 +450,14 @@ class Qwen3_5MoeAttention(nn.Module):
         value_dense = (self.v_cache[flat_blocks]
                        .view(batch, max_blocks_per_seq, kv_heads, block_size, self.head_dim)
                        .permute(0, 2, 1, 3, 4).reshape(batch * kv_heads, context_len, self.head_dim))
-        key_full = key_dense.repeat_interleave(self.num_key_value_groups, dim=0).to(torch.float32)
-        value_full = value_dense.repeat_interleave(self.num_key_value_groups, dim=0).to(torch.float32)
 
-        scores = torch.matmul(query.to(torch.float32),
-                              key_full.transpose(-2, -1)) * self.scaling
-        # Per-query causal mask over the padded context. Each decode row attends only up to its own
-        # absolute position; masking with the last position alone would let earlier rows of a decode
-        # bucket read future keys.
-        context_index = torch.arange(context_len, device=scores.device)
-        valid = context_index.view(1, -1) <= positions.view(-1, 1)
-        scores = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
-        weights = F.softmax(scores, dim=-1, dtype=torch.float32)
-        attn_output = torch.matmul(weights, value_full)             # [heads, decode_tokens, head_dim]
-
-        attn_output = attn_output.transpose(0, 1).reshape(-1, self.q_size)
+        # The batching lives in `ops.paged_decode_attention`, where a CPU test can reach it. This used to
+        # be written inline against `batch == 1`, and two of its axes agreed only at that size: the query
+        # led with `heads` while the expanded keys led with `batch * heads`, so a larger batch would have
+        # multiplied the wrong pairs without raising. See that function for the shapes.
+        attn_output = paged_decode_attention(
+            query, key_dense, value_dense, positions,
+            scaling=self.scaling, groups=self.num_key_value_groups, batch=batch)
         return self._gate_and_project_out(attn_output, gate)
 
     def _write_kv_cache(self, key, value, slot_mapping, block_size):

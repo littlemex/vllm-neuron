@@ -110,12 +110,15 @@ Qwen3.5-MoE is a hybrid decoder that interleaves **Gated DeltaNet** linear-atten
   `QWEN3_5_MOE_GDN_CHUNK` trades chunk-internal work for fewer unrolled bodies. Neither is a numerical
   limit; both are why the shipped example starts at a modest `max_model_len`.
 
-- **Batch size 1 only** (`max_num_seqs=1`), and the remaining blocker is prefill rather than state.
-  A per-slot state pool exists behind `QWEN3_5_MOE_STATE_POOL=1`: the conv and recurrent states carry a
-  slot axis, decode is general over the request axis and reads each request's slot, and a packed
-  multi-request prefill reproduces the same requests run individually. What is not yet shown is any of
-  that on the device, so the factory still refuses `max_num_seqs > 1` rather than serving a path whose
-  numerics have only been checked on CPU.
+- **Concurrency needs the state pool, and is verified on CPU only.** `max_num_seqs > 1` is refused unless
+  `QWEN3_5_MOE_STATE_POOL=1` asks for the per-slot state; with the pool on it proceeds and logs a warning
+  that the multi-request path has not run on a device. What is verified, at rung 2 with the whole runner:
+  four requests in one scheduler step produce token-for-token what the same four produce at
+  `max_num_seqs=1`. The pieces behind that are a slot axis on the conv and recurrent state, a packed
+  chunk-aligned prefill whose scan carries per-request masks and whose convolution gathers each request's
+  own history, and a decode attention that is batch-general (`ops.paged_decode_attention`). Nothing here
+  has been measured on a device, so the seat count that pays for itself is not yet known.
+
 - **Automatic prefix caching is not supported.** Do not set `--enable-prefix-caching`. The attention
   KV is addressable by block hash and would be reused across requests, but the recurrent state has no
   block-hash addressing, so a reused prefix would silently continue from the wrong state. The factory

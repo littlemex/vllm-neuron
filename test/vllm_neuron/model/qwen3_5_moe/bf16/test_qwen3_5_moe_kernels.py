@@ -2125,6 +2125,129 @@ def test_the_decode_step_is_batch_general_over_the_request_axis():
                     f"request {request} batched with {requests - 1} others")
 
 
+def _decode_attention_inputs(batch, decode_tokens=1, heads=8, kv_heads=2, head_dim=16, context_len=32,
+                             seed=0):
+    """Query, dense K/V and positions in the layouts `paged_decode_attention` documents."""
+    torch.manual_seed(seed)
+    groups = heads // kv_heads
+    query = torch.randn(heads, batch * decode_tokens, head_dim)
+    key_dense = torch.randn(batch * kv_heads, context_len, head_dim)
+    value_dense = torch.randn(batch * kv_heads, context_len, head_dim)
+    # Each sequence sits at a different absolute position, and later rows of a sequence sit later, so a
+    # mask applied to the wrong row shows up. Kept well inside the context so a test can poke a key just
+    # past a given row's position.
+    positions = torch.tensor([4 + 3 * b + t for b in range(batch) for t in range(decode_tokens)])
+    return query, key_dense, value_dense, positions, groups
+
+
+def _slice_sequence(query, key_dense, value_dense, positions, index, batch, kv_heads, decode_tokens):
+    """The inputs for one sequence, in the same layouts, as a batch of one."""
+    heads = query.shape[0]
+    del batch
+    return (query[:, index * decode_tokens:(index + 1) * decode_tokens, :],
+            key_dense[index * kv_heads:(index + 1) * kv_heads],
+            value_dense[index * kv_heads:(index + 1) * kv_heads],
+            positions[index * decode_tokens:(index + 1) * decode_tokens],
+            heads)
+
+
+def test_the_decode_attention_is_batch_general():
+    """Stage C. Each sequence's rows must equal that sequence run as a batch of one.
+
+    This is the check the previous implementation could not pass, and could not fail either: it multiplied
+    a query whose leading axis was `heads` by keys whose leading axis was `batch * heads`, which are the
+    same number at batch 1. The refusal it carried instead was correct, and had the wrong reason written on
+    it.
+    """
+    batch, kv_heads, decode_tokens = 3, 2, 1
+    query, key_dense, value_dense, positions, groups = _decode_attention_inputs(batch, decode_tokens,
+                                                                               kv_heads=kv_heads, seed=11)
+    with torch.no_grad():
+        batched = _ops.paged_decode_attention(query, key_dense, value_dense, positions,
+                                              scaling=0.125, groups=groups, batch=batch)
+        assert batched.shape == (batch * decode_tokens, query.shape[0] * query.shape[2])
+        for index in range(batch):
+            one_q, one_k, one_v, one_p, _ = _slice_sequence(
+                query, key_dense, value_dense, positions, index, batch, kv_heads, decode_tokens)
+            alone = _ops.paged_decode_attention(one_q, one_k, one_v, one_p, scaling=0.125,
+                                                groups=groups, batch=1)
+            rows = slice(index * decode_tokens, (index + 1) * decode_tokens)
+            neighbour = (index + 1) % batch
+            assert_matches_solo(
+                batched[rows], alone,
+                batched[neighbour * decode_tokens:(neighbour + 1) * decode_tokens],
+                f"decode attention: sequence {index} of {batch}")
+
+
+def test_the_decode_attention_is_unchanged_when_only_its_NEIGHBOURS_change():
+    """Same batch shape, different neighbours, BIT equality -- so any leak of any size fails.
+
+    The tolerance-based comparison above cannot see contamination below a few ULP. Holding the shape fixed
+    removes the tolerance, exactly as for the recurrent path.
+    """
+    batch, kv_heads, decode_tokens = 3, 2, 1
+    query, key_dense, value_dense, positions, groups = _decode_attention_inputs(batch, decode_tokens,
+                                                                               kv_heads=kv_heads, seed=13)
+    with torch.no_grad():
+        baseline = _ops.paged_decode_attention(query, key_dense, value_dense, positions, scaling=0.125,
+                                               groups=groups, batch=batch)
+        for victim in range(batch):
+            disturbed_q, disturbed_k, disturbed_v = query.clone(), key_dense.clone(), value_dense.clone()
+            for other in (b for b in range(batch) if b != victim):
+                disturbed_q[:, other * decode_tokens:(other + 1) * decode_tokens, :] = torch.randn_like(
+                    disturbed_q[:, other * decode_tokens:(other + 1) * decode_tokens, :])
+                disturbed_k[other * kv_heads:(other + 1) * kv_heads] = torch.randn_like(
+                    disturbed_k[other * kv_heads:(other + 1) * kv_heads])
+                disturbed_v[other * kv_heads:(other + 1) * kv_heads] = torch.randn_like(
+                    disturbed_v[other * kv_heads:(other + 1) * kv_heads])
+            after = _ops.paged_decode_attention(disturbed_q, disturbed_k, disturbed_v, positions,
+                                                scaling=0.125, groups=groups, batch=batch)
+            rows = slice(victim * decode_tokens, (victim + 1) * decode_tokens)
+            assert torch.equal(after[rows], baseline[rows]), (
+                f"sequence {victim} changed when only the others did: max |delta| "
+                f"{(after[rows] - baseline[rows]).abs().max().item():.3e}")
+            others = [b for b in range(batch) if b != victim]
+            first = slice(others[0] * decode_tokens, (others[0] + 1) * decode_tokens)
+            assert not torch.equal(after[first], baseline[first]), "the perturbation did nothing"
+
+
+def test_the_decode_mask_is_per_row_not_per_sequence():
+    """Two decode rows in one sequence at different positions must not see each other's future keys.
+
+    With `decode_tokens > 1` a bucket holds several rows per sequence, and masking with the sequence's
+    last position would let the earlier row read a key it has not produced yet.
+    """
+    batch, kv_heads, decode_tokens, context_len = 2, 2, 2, 16
+    query, key_dense, value_dense, positions, groups = _decode_attention_inputs(
+        batch, decode_tokens, kv_heads=kv_heads, context_len=context_len, seed=17)
+    with torch.no_grad():
+        baseline = _ops.paged_decode_attention(query, key_dense, value_dense, positions, scaling=0.125,
+                                               groups=groups, batch=batch)
+        # Change a key strictly beyond the FIRST row's position but within the second's. Only the second
+        # row of that sequence may move.
+        first_position = int(positions[0])
+        changed_k = key_dense.clone()
+        changed_k[0:kv_heads, first_position + 1] = torch.randn_like(changed_k[0:kv_heads,
+                                                                              first_position + 1])
+        after = _ops.paged_decode_attention(query, changed_k, value_dense, positions, scaling=0.125,
+                                            groups=groups, batch=batch)
+    assert torch.equal(after[0], baseline[0]), (
+        "the first decode row of a sequence saw a key past its own position, so the mask is per sequence "
+        "rather than per row")
+    # ...and the row that IS allowed to see that key must have moved, or the test proves nothing.
+    assert not torch.equal(after[1], baseline[1]), (
+        "the second row did not change either, so the key that was altered is outside both rows' windows "
+        "and this test is vacuous")
+
+
+def test_the_decode_attention_refuses_a_row_count_that_does_not_divide():
+    """A wiring error, not data: five rows cannot be two sequences."""
+    query, key_dense, value_dense, positions, groups = _decode_attention_inputs(1, 5, kv_heads=2, seed=19)
+    with pytest.raises(ValueError, match="do not divide"):
+        _ops.paged_decode_attention(query, key_dense, value_dense, positions, scaling=0.125,
+                                    groups=groups, batch=2)
+
+
 def test_a_request_is_unchanged_when_only_its_NEIGHBOURS_change():
     """The leakage test with teeth: same batch shape, different neighbours, and BIT equality.
 
