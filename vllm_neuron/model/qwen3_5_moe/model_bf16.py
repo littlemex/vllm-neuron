@@ -1339,10 +1339,22 @@ class Qwen3_5MoeForCausalLM(nn.Module):
     def bind_state_cache(self, kv_caches):
         """Point each mixer's state at the runner's pooled tensors.
 
-        The shapes are checked rather than the order trusted. Two tensors of different rank arriving the
-        wrong way round would fail loudly here; two of the same rank would not, and the conv and
-        recurrent states differ in rank, so this catches the realistic mistake.
+        Three things are checked, and each was a real defect before it was.
+
+        **Shapes, not order.** Two tensors of different rank arriving the wrong way round fails here;
+        two of the same rank would not, and the conv and recurrent states differ in rank, so this catches
+        the realistic mistake.
+
+        **Slot counts agree** between the two states, since they index by the same slot.
+
+        **Storage is distinct across layers.** This is the one that cost a debugging session. vLLM's KV
+        cache config can hand the SAME raw tensor to several layers of one group -- for attention that is
+        fine because each layer writes a different slice, but a recurrent state indexed only by slot has
+        no per-layer dimension, so three layers wrote over each other every step. The output stayed
+        fluent and degenerated to a repeated token; nothing raised. Measured: layers 0, 1 and 2 shared
+        one pointer and layers 4, 5 and 6 shared another.
         """
+        seen: dict[int, str] = {}
         for index, layer in enumerate(self.model.decoder_layers):
             if layer.layer_type != LINEAR_ATTENTION:
                 continue
@@ -1372,6 +1384,17 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                     f"{name}: the two states were allocated {conv.shape[0]} and {recurrent.shape[0]} "
                     "slots; they index by the same slot so the counts must agree."
                 )
+            for label, tensor in (("conv", conv), ("recurrent", recurrent)):
+                pointer = tensor.data_ptr()
+                if pointer in seen:
+                    raise RuntimeError(
+                        f"{name}'s {label} state shares storage with {seen[pointer]}. A recurrent state "
+                        "is indexed by slot only, with no per-layer dimension, so the layers would "
+                        "overwrite each other every step -- which produces fluent output that "
+                        "degenerates rather than an error. Each state layer needs its own tensor from "
+                        "the cache config."
+                    )
+                seen[pointer] = f"{name}'s {label}"
             mixer.conv_state = conv
             mixer.recurrent_state = recurrent
             mixer.num_slots = conv.shape[0]
