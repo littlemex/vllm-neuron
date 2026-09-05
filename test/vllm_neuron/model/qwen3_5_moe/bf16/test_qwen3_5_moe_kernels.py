@@ -90,8 +90,10 @@ def _hf_reference():
             module = importlib.import_module(module_name)
         except ImportError:
             continue
-        chunk = getattr(module, "torch_chunk_gated_delta_rule", None)
-        recurrent = getattr(module, "torch_recurrent_gated_delta_rule", None)
+        # lint-port: ok probing transformers, whose reference helpers move between versions; absence is
+        # the answer this loop wants, and the caller skips the test rather than trusting a default
+        chunk = getattr(module, "torch_chunk_gated_delta_rule", None)  # lint-port: ok see above
+        recurrent = getattr(module, "torch_recurrent_gated_delta_rule", None)  # lint-port: ok see above
         if chunk is not None and recurrent is not None:
             return chunk, recurrent
     return None

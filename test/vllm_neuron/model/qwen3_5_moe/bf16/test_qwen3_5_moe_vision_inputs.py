@@ -53,7 +53,9 @@ def _load(path, name, package):
 _pkg = "vllm_neuron.model.qwen3_vl.utils"
 for _part in ("vllm_neuron", "vllm_neuron.model", "vllm_neuron.model.qwen3_vl", _pkg):
     _stub = sys.modules.get(_part) or types.ModuleType(_part)
-    _stub.__path__ = getattr(_stub, "__path__", [os.path.join(_REPO, *_part.split(".")[1:])])
+    # lint-port: ok a freshly made ModuleType has no __path__ by construction, so the default IS the
+    # value being installed rather than a guard that could fail to fire
+    _stub.__path__ = getattr(_stub, "__path__", [os.path.join(_REPO, *_part.split(".")[1:])])  # lint-port: ok see above
     sys.modules[_part] = _stub
 _load(os.path.join(_UTILS_DIR, "vision_block_packing.py"), "vision_block_packing", _pkg)
 _load(os.path.join(_UTILS_DIR, "vision_preprocessing.py"), "vision_preprocessing", _pkg)

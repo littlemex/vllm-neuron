@@ -297,7 +297,20 @@ class Qwen3_5MoeAttention(nn.Module):
         return self._v_cache
 
     def bind_caches(self, k_cache: torch.Tensor, v_cache: torch.Tensor) -> None:
-        """Give this layer the caches the runner allocated for it."""
+        """Give this layer the caches the runner allocated for it.
+
+        The dtype is checked because the runner does NOT allocate the dtype this model declared: it
+        overrides it with ``cache_config.cache_dtype``. The factory refuses a cache dtype this attention
+        cannot read, and this is the destination-side half of that -- the check that fires if the refusal
+        is ever bypassed or the runner's override changes.
+        """
+        for label, cache in (("K", k_cache), ("V", v_cache)):
+            if cache.dtype != self.dtype:
+                raise RuntimeError(
+                    f"layer {self.layer_idx}: the {label} cache was allocated as {cache.dtype} but this "
+                    f"attention reads it as {self.dtype}. The runner takes the cache dtype from "
+                    "cache_config, not from the model's KV spec."
+                )
         self._k_cache = k_cache
         self._v_cache = v_cache
 

@@ -13,8 +13,11 @@ from typing import cast
 import torch
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.logger import init_logger
 
 from vllm_neuron.model.neuron_config import NeuronConfig
+
+logger = init_logger(__name__)
 
 
 class Qwen3_5MoeForCausalLM(nn.Module):
@@ -165,6 +168,39 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "Qwen3.5-MoE on Neuron does not implement expert parallelism; unset "
                 "--enable-expert-parallel."
             )
+        # vLLM's performance knobs that this port cannot honour. Each is refused HERE, where it is
+        # selected, rather than left to fail somewhere downstream -- and each was silently accepted
+        # before an audit asked which of vLLM's settings the port actually rides on.
+        #
+        # A quantised KV cache. The runner OVERRIDES the dtype this model declares in get_kv_spec with
+        # cache_config.cache_dtype, and bind_caches would accept the result: the attention reads the
+        # cache expecting the model dtype, so an fp8 cache is read as though it were bf16. Nothing about
+        # that raises.
+        cache_dtype = vllm_config.cache_config.cache_dtype
+        if cache_dtype not in ("auto", "bfloat16"):
+            raise ValueError(
+                f"Qwen3.5-MoE on Neuron reads the KV cache in the model dtype; got "
+                f"--kv-cache-dtype={cache_dtype!r}. The runner would allocate the cache in that dtype "
+                "and the attention would read it as bfloat16."
+            )
+
+        # Async scheduling is a throughput win and IS honoured for generation. What it drops is logprobs:
+        # the runner's async path returns the sampler output without them, so a request asking for
+        # logprobs gets an EMPTY field and a successful response.
+        #
+        # Warned rather than refused, and the distinction is the rule. The other two knobs above produce
+        # WRONG OUTPUT, which has to be refused. This one under-delivers a field: generation is correct,
+        # and a deployment that does not read logprobs loses nothing. Refusing it would also have refused
+        # the default configuration, which an over-eager first version of this check did.
+        if (vllm_config.scheduler_config.async_scheduling
+                and neuron_config is not None and neuron_config.max_logprobs != 0):
+            logger.warning(
+                "async scheduling is on and max_logprobs=%s: the runner's async path returns the sampler "
+                "output WITHOUT logprobs, so the field will come back empty while the request reports "
+                "success. Set async_scheduling=False to receive them.",
+                neuron_config.max_logprobs,
+            )
+
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         if max_num_seqs != 1:
             raise ValueError(
@@ -223,11 +259,26 @@ class Qwen3_5MoeForCausalLM(nn.Module):
                 "the recurrent state by exactly one token."
             )
         if vllm_config.cache_config.enable_prefix_caching:
+            # This one refusal covers the recurrent-state reuse mode as well, and the reason is worth
+            # stating because it is a measured property of vLLM rather than a choice made here.
+            # ``MambaModelConfig.verify_and_update_config`` OVERWRITES ``cache_config.mamba_cache_mode``
+            # from ``enable_prefix_caching``: forced to "none" when prefix caching is off (whatever the
+            # deployment asked for), and DERIVED as "align" or "all" when it is on -- so turning prefix
+            # caching on silently turns state reuse on too, and nothing on the command line said so.
+            #
+            # A separate ``mamba_cache_mode != "none"`` refusal was written here first and then removed:
+            # it can only be reached when prefix caching is on, where this message is the actionable one,
+            # so all it could do is pre-empt a better error. A check whose condition another check
+            # already dominates is not a second layer of safety -- it is a worse message that wins.
+            # Verified in CPU mode: requesting ``--mamba-cache-mode=align`` without prefix caching
+            # reaches this model as "none", so that refusal never fired once.
             raise ValueError(
                 "Qwen3.5-MoE on Neuron cannot use automatic prefix caching. The attention KV is "
                 "addressable by block hash and would be reused, but the Gated DeltaNet recurrent "
                 "state has no block-hash addressing, so a reused prefix would continue from the "
-                "wrong state. Unset --enable-prefix-caching."
+                "wrong state. Note that prefix caching also selects a mamba_cache_mode on this "
+                "model's behalf, so implementing one without the other is not enough. "
+                "Unset --enable-prefix-caching."
             )
 
 
