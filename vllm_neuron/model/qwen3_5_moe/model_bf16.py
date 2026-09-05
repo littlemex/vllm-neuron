@@ -434,10 +434,21 @@ class Qwen3_5MoeAttention(nn.Module):
         batch = block_table.shape[0]
         tokens = hidden_states.shape[0]
         if batch != 1:
+            # The reason named here is the ATTENTION decode, not the recurrent state. The previous message
+            # blamed "single per-layer buffers (no per-slot pool)", which stopped being true when the pool
+            # landed: with the pool on and max_num_seqs=2, CPU mode reaches this line and reports a cause
+            # that has been fixed. A refusal whose stated reason is stale sends the next person to rebuild
+            # something that exists.
+            #
+            # What is actually unfinished: this decode gathers the whole context densely and computes in
+            # fp32, which was chosen when one sequence at a time was the only shape. It uses `batch` in its
+            # views, so it may already be general -- but "may be" is not a verification, and the batched
+            # form has no test. Refusing is correct until it has one.
             raise NotImplementedError(
-                "Qwen3.5-MoE serving supports max_num_seqs=1 only: the Gated DeltaNet conv and "
-                "recurrent state are single per-layer buffers (no per-slot pool), so concurrent "
-                f"sequences would corrupt each other. Got batch size {batch}."
+                f"Qwen3.5-MoE attention decode is verified for one sequence at a time; got batch size "
+                f"{batch}. This is NOT the recurrent state, which has a per-slot pool: the dense fp32 "
+                f"context gather in this function was written for a single sequence and its batched form "
+                f"is untested. See the project's docs/DESIGN-concurrency.md, stage C."
             )
         decode_tokens = tokens // batch
         hidden_states = hidden_states.to(self.dtype)

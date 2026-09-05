@@ -217,13 +217,35 @@ class Qwen3_5MoeForCausalLM(nn.Module):
 
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         if max_num_seqs != 1:
-            raise ValueError(
-                f"Qwen3.5-MoE on Neuron supports max_num_seqs=1 only; got {max_num_seqs}. The "
-                "remaining blocker is PREFILL, not the state pool: the Gated DeltaNet prefill scan is "
-                "a recurrence over one sequence, and a scheduled batch mixing two requests' tokens "
-                "would carry one's tail into the other's head. Decode is already batch-general over "
-                "the request axis and reads its slot from the pool; see the project's "
-                "docs/DESIGN-concurrency.md for what stage B needs."
+            # The reason this refuses has changed, and the message says which reason applies now. It used
+            # to name PREFILL as the blocker: the Gated DeltaNet prefill scan is a recurrence over one
+            # sequence, and a batch mixing two requests' tokens would carry one's tail into the other's
+            # head. That is implemented -- the scan takes a per-chunk carry mask, the convolution
+            # gathers each request's history from its own last real position, and a three-request packed
+            # prefill matches the same three run individually in output, recurrent state and convolution
+            # history. A stale reason is worse than a terse one: the next person reads it and rebuilds
+            # something that already exists.
+            #
+            # What is left is that none of it has run on the device. So this is gated on the state pool,
+            # which is itself an explicit opt-in, rather than refused outright -- and it warns, loudly,
+            # because "verified on CPU" and "verified" are different claims.
+            # Imported here rather than at module scope: model_bf16 pulls the plugin's kernels, and the
+            # validation above has to be readable without them.
+            from .model_bf16 import state_pool_requested
+            if not state_pool_requested(vllm_config):
+                raise ValueError(
+                    f"Qwen3.5-MoE on Neuron needs the state pool for max_num_seqs>1; got "
+                    f"{max_num_seqs} with the pool off. Every layer of the multi-request path is "
+                    f"implemented and matches single-request runs on CPU -- packed chunk-aligned "
+                    f"prefill, per-request convolution history, per-slot decode -- but the state has to "
+                    f"live in the pool for the requests to have separate slots. Set "
+                    f"QWEN3_5_MOE_STATE_POOL=1 to ask for it, and read the warning it prints."
+                )
+            logger.warning(
+                "max_num_seqs=%s with the state pool: the multi-request path is verified on CPU against "
+                "single-request runs (output, recurrent state and convolution history) and has NOT been "
+                "verified on a Neuron device. Treat its output as unproven until it has.",
+                max_num_seqs,
             )
         if vllm_config.speculative_config is not None:
             # Refuse where the capability is selected, not where it first breaks. The Gated DeltaNet
