@@ -307,9 +307,9 @@ class Qwen3_5MoeAttention(nn.Module):
         for label, cache in (("K", k_cache), ("V", v_cache)):
             if cache.dtype != self.dtype:
                 raise RuntimeError(
-                    f"layer {self.layer_idx}: the {label} cache was allocated as {cache.dtype} but this "
-                    f"attention reads it as {self.dtype}. The runner takes the cache dtype from "
-                    "cache_config, not from the model's KV spec."
+                    f"Qwen3.5-MoE on Neuron, layer {self.layer_idx}: the {label} cache was allocated "
+                    f"as {cache.dtype} but this attention reads it as {self.dtype}. The runner takes "
+                    "the cache dtype from cache_config, not from the model's KV spec."
                 )
         self._k_cache = k_cache
         self._v_cache = v_cache

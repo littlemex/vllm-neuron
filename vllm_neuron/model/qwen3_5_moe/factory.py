@@ -176,6 +176,20 @@ class Qwen3_5MoeForCausalLM(nn.Module):
         # cache_config.cache_dtype, and bind_caches would accept the result: the attention reads the
         # cache expecting the model dtype, so an fp8 cache is read as though it were bf16. Nothing about
         # that raises.
+        # The model dtype itself, which is upstream of the cache dtype below. Every parameter, every
+        # kernel and every declared KV dtype in this port is bf16, so another dtype does not degrade --
+        # it disagrees. Refused here rather than where it first shows: with only the cache check in
+        # place, --dtype=float32 loaded the whole checkpoint and then failed inside bind_caches with a
+        # message about layer 3's K cache. Correct refusal, wrong place, and the sweep is what showed
+        # the difference: a guard that fires after the weight load has already spent the expensive part.
+        model_dtype = vllm_config.model_config.dtype
+        if model_dtype != torch.bfloat16:
+            raise ValueError(
+                f"Qwen3.5-MoE on Neuron is bf16 only; got --dtype={model_dtype}. The parameters, the "
+                "Gated DeltaNet kernels and the declared KV dtype are all bfloat16, so another dtype "
+                "disagrees with the graph rather than trading precision for it."
+            )
+
         cache_dtype = vllm_config.cache_config.cache_dtype
         if cache_dtype not in ("auto", "bfloat16"):
             raise ValueError(
