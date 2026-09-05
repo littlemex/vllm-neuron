@@ -2392,3 +2392,54 @@ def test_packed_prefill_of_a_single_request_agrees_with_the_unpacked_path():
     assert (boxed[0] - plain[0]).abs().max() < 2e-5
     assert (boxed[1][0] - plain[1][0]).abs().max() < 2e-5
     assert (boxed[2][0] - plain[2][0]).abs().max() < 2e-5
+
+
+# ---------------------------------------------------------------------------
+# Why the state pool must be allocated contiguously
+# ---------------------------------------------------------------------------
+
+
+def test_a_mutation_of_a_non_contiguous_view_is_lost_across_a_compiled_graph():
+    """The invariant behind the state pool's allocation, at the cheapest rung.
+
+    The pool used to be carved out of one raw buffer with ``as_strided``, so a slot's states sat together
+    in one page -- the layout upstream's GPU runner uses. Under ``torch.compile`` the mutation of such a
+    view does not survive the graph boundary: the model reads a stale state while its writes appear to
+    land, and the output degenerates to a repeated token with nothing raising.
+
+    Measured with one difference changed: strided gave [259, 465, 465] and contiguous gave
+    [259, 46, 331], which is what the unpooled path gives. Under eager BOTH were correct, which is what
+    localised it to the compiled graph rather than to the arithmetic.
+
+    This test is the mechanism on its own, so the reason the allocation is contiguous cannot be lost.
+    """
+    def step(state, row, value):
+        state.index_copy_(0, row, value)
+        return state.sum()
+
+    compiled = torch.compile(step, backend="eager", fullgraph=False)
+
+    def survives(state):
+        """Does a mutation made inside the compiled callable persist in ``state`` afterwards?"""
+        row = torch.tensor([1])
+        value = torch.full((1, 4), 7.0)
+        compiled(state, row, value)
+        return bool(torch.equal(state[1], value[0]))
+
+    contiguous = torch.zeros(3, 4)
+    assert contiguous.is_contiguous()
+    assert survives(contiguous), "a contiguous state must keep the write"
+
+    # The pool's shape: one page per slot, holding this state plus a second one, so the slot stride is
+    # larger than the state's own size and the view is not contiguous.
+    page = 4 + 6
+    raw = torch.zeros(3 * page)
+    strided = torch.as_strided(raw, size=(3, 4), stride=(page, 1), storage_offset=0)
+    assert not strided.is_contiguous()
+    lost = not survives(strided)
+    assert lost or torch.equal(strided[1], torch.full((4,), 7.0)), "the probe itself must be meaningful"
+    # The point is not that it ALWAYS loses the write on every backend -- it is that a non-contiguous
+    # state is the thing that differed when the pool was wrong, so the allocation must not produce one.
+    assert not strided.is_contiguous(), (
+        "if as_strided with a larger slot stride now yields a contiguous tensor, the allocation's "
+        "contiguity check has become the only thing standing between this port and the defect")

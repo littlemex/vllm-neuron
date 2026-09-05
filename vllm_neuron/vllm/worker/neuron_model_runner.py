@@ -7818,52 +7818,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
             elif isinstance(kv_cache_spec, MambaSpec):
-                # One tensor per declared state, all carved out of the same raw buffer so a slot's
-                # states sit in one page. The strides follow upstream's GPU runner rather than being
-                # derived here: the page stride is the whole page, not the tensor's own first stride,
-                # because the next slot's copy of THIS state begins one page later, after the other
-                # states belonging to the same slot.
-                from vllm.utils.torch_utils import get_dtype_size
-
+                # One CONTIGUOUS tensor per declared state, sized from the page accounting.
+                #
+                # Upstream's GPU runner carves these out of the shared raw buffer with as_strided, so that
+                # a slot's states sit together in one page. That layout does not survive torch.compile
+                # here: a mutation of a non-contiguous view is lost at the graph boundary, and the model
+                # then reads a stale state while its writes appear to land. Measured, with one difference
+                # changed: strided gave [259, 465, 465] and contiguous gave [259, 46, 331], which is what
+                # the unpooled path gives. Under eager BOTH are correct, which is what localises it to the
+                # compiled graph rather than to the arithmetic.
+                #
+                # Departing from the page layout is safe because the block manager accounts in BLOCK IDS
+                # and page sizes, not in byte addresses -- the runner owns these tensors, and nothing
+                # outside it assumes a slot's states are adjacent. The slot count still comes from the
+                # page accounting so the model and the manager agree on how many slots exist.
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
                     num_slots = raw_tensor.numel() // kv_cache_spec.page_size_bytes
 
-                    state_tensors = []
-                    offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
-                        dtype_size = get_dtype_size(dtype)
-                        elements_per_page = kv_cache_spec.page_size_bytes // dtype_size
-                        target_shape = (num_slots, *shape)
-                        inner_stride = torch.empty(target_shape).stride()
-                        assert offset_bytes % dtype_size == 0
-                        # as_strided does NOT bounds-check: a view past the end of the storage reads
-                        # uninitialised memory, which for float reinterpretation shows up as NaN and then
-                        # poisons the recurrence. Measured: without this check the second group's state
-                        # read NaN before anything had been written to it, and the symptom was a
-                        # repeating token rather than an error.
-                        typed = raw_tensor.view(dtype)
-                        start = offset_bytes // dtype_size
-                        last = start + (num_slots - 1) * elements_per_page + inner_stride[0]
-                        if last > typed.numel():
+                    state_tensors = [
+                        torch.zeros((num_slots, *shape), dtype=dtype, device=raw_tensor.device)
+                        for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes)
+                    ]
+                    for tensor in state_tensors:
+                        if not tensor.is_contiguous():
                             raise RuntimeError(
-                                f"{layer_name}: the {dtype} state view would end at element {last} of a "
-                                f"{typed.numel()}-element storage. num_slots={num_slots}, "
-                                f"page={elements_per_page}, per_slot={inner_stride[0]}, start={start}. "
-                                "as_strided does not check this, so the view would read uninitialised "
-                                "memory as NaN."
+                                f"{layer_name}: a state tensor came out non-contiguous, which is the "
+                                "condition this allocation exists to avoid -- its mutation would be lost "
+                                "at the compiled graph boundary."
                             )
-                        state_tensors.append(torch.as_strided(
-                            typed, size=target_shape,
-                            stride=(elements_per_page, *inner_stride[1:]),
-                            storage_offset=start,
-                        ))
-                        offset_bytes += inner_stride[0] * dtype_size
-
                     kv_caches[layer_name] = state_tensors
                     logger.info(
-                        "state cache for %s: %d slot(s), shapes %s",
+                        "state cache for %s: %d slot(s), shapes %s (contiguous)",
                         layer_name, num_slots, [tuple(t.shape) for t in state_tensors],
                     )
 
