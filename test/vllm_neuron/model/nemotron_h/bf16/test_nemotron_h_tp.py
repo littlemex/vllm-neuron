@@ -41,9 +41,9 @@ TINY = dict(
 SEQ_LEN = 16
 
 
-def _write_checkpoint(path):
+def _write_checkpoint(path, cfg=TINY):
     """A random checkpoint in the text-only HF layout (backbone.* / lm_head.weight)."""
-    c = NemotronHConfig(**TINY)
+    c = NemotronHConfig(**cfg)
     g = torch.Generator().manual_seed(0)
 
     def rnd(*shape, std=0.1):
@@ -76,6 +76,12 @@ def _write_checkpoint(path):
                 w[f"{p}.mixer.experts.{e}.down_proj.weight"] = rnd(d, mi)
             w[f"{p}.mixer.shared_experts.up_proj.weight"] = rnd(smi, d)
             w[f"{p}.mixer.shared_experts.down_proj.weight"] = rnd(d, smi)
+        elif t == "*":
+            q, kv = c.num_attention_heads * c.head_dim, c.num_key_value_heads * c.head_dim
+            w[f"{p}.mixer.q_proj.weight"] = rnd(q, d)
+            w[f"{p}.mixer.k_proj.weight"] = rnd(kv, d)
+            w[f"{p}.mixer.v_proj.weight"] = rnd(kv, d)
+            w[f"{p}.mixer.o_proj.weight"] = rnd(d, q)
     save_file(w, os.path.join(path, "model.safetensors"))
 
 
@@ -111,13 +117,26 @@ def _reduce_scatter_tensor(x, reduce_op, scatter_dim, group):
     return y.chunk(dist.get_world_size(group), dim=scatter_dim)[dist.get_rank(group)].contiguous()
 
 
+def _build(cfg, ckpt):
+    """NemotronHForCausalLM loaded through load_weights. Every parameter is NaN-filled first and
+    checked after, so a parameter the checkpoint or the mapping misses fails here instead of
+    silently computing on uninitialised memory."""
+    model = nh.NemotronHForCausalLM(NemotronHConfig(**cfg))
+    with torch.no_grad():
+        for prm in model.parameters():
+            prm.fill_(float("nan"))
+    model.load_weights(ckpt, torch.device("cpu"))
+    unloaded = [n for n, prm in model.named_parameters() if torch.isnan(prm).any()]
+    assert not unloaded, f"parameters not loaded from the checkpoint: {unloaded}"
+    return model
+
+
 def _worker(rank, world_size, ckpt, init_file, out_file):
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         nh.get_tp_group = lambda: _TPGroup()
         nn_embedding.reduce_scatter_tensor = _reduce_scatter_tensor
-        model = nh.NemotronHForCausalLM(NemotronHConfig(**TINY))
-        model.load_weights(ckpt, torch.device("cpu"))
+        model = _build(TINY, ckpt)
         input_ids = torch.randint(0, TINY["vocab_size"], (SEQ_LEN,),
                                   generator=torch.Generator().manual_seed(1))
         positions = torch.arange(SEQ_LEN, dtype=torch.int32)
@@ -135,6 +154,94 @@ def _run(world_size, ckpt, tmp):
     out_file = os.path.join(tmp, f"out_{world_size}.pt")
     mp.spawn(_worker, args=(world_size, ckpt, init_file, out_file), nprocs=world_size, join=True)
     return torch.load(out_file)
+
+
+HYBRID = dict(TINY, num_hidden_layers=6, hybrid_override_pattern="MEM*EM")
+BLOCK_SIZE, NUM_BLOCKS = 8, 4                     # 32 KV slots, enough for SEQ_LEN + 1
+
+
+def _attn_metadata(model, slot_mapping, query_len):
+    """The per-attention-layer metadata the runner hands the model (block_table = blocks 0..N-1)."""
+    md = {}
+    for i, layer in enumerate(model.model.layers):
+        if layer.layer_type == "*":
+            md[f"layers.{i}.self_attn"] = {
+                "max_query_len": query_len, "decode_token_threshold": 1,
+                "slot_mapping": slot_mapping, "block_size": BLOCK_SIZE,
+                "block_table_tensor": torch.arange(NUM_BLOCKS).view(1, -1),
+                "max_blocks_per_seq": NUM_BLOCKS, "kv_segment_size": None,
+            }
+    return md
+
+
+def _bind_empty_kv(model):
+    kv = {}
+    for i, layer in enumerate(model.model.layers):
+        if layer.layer_type == "*":
+            a = layer.mixer
+            shape = (NUM_BLOCKS, a.num_key_value_heads_per_rank, BLOCK_SIZE, a.head_dim)
+            kv[f"layers.{i}.self_attn"] = (torch.zeros(shape), torch.zeros(shape))
+    model.bind_kv_cache(kv)
+
+
+def _decode_worker(rank, world_size, ckpt, init_file, out_file, n_real):
+    """Prefill tokens[:SEQ_LEN] (the last SEQ_LEN - n_real of them bucket padding), then decode
+    tokens[n_real]. Saves the decode step's final hidden state."""
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        nh.get_tp_group = lambda: _TPGroup()
+        nn_embedding.reduce_scatter_tensor = _reduce_scatter_tensor
+        model = _build(HYBRID, ckpt)
+        _bind_empty_kv(model)
+        tokens = torch.randint(0, HYBRID["vocab_size"], (SEQ_LEN + 1,),
+                               generator=torch.Generator().manual_seed(2))
+        prompt = tokens[:SEQ_LEN].clone()
+        prompt[n_real:] = 0                                   # pad token id, as the runner pads
+        slots = torch.arange(SEQ_LEN)
+        slots[n_real:] = -1                                   # PAD_SLOT_ID
+        with torch.no_grad():
+            model.model(prompt, torch.arange(SEQ_LEN, dtype=torch.int32),
+                        _attn_metadata(model, slots, SEQ_LEN))
+            hidden = model.model(tokens[n_real:n_real + 1], torch.tensor([n_real], dtype=torch.int32),
+                                 _attn_metadata(model, torch.tensor([n_real]), 1))
+        if rank == 0:
+            torch.save({"hidden": hidden, "tokens": tokens}, out_file)
+    finally:
+        dist.destroy_process_group()
+
+
+def _full_prefill_last(ckpt, tokens):
+    """TP=1 single-shot prefill over tokens; returns the last position's final hidden state."""
+    init = tempfile.mktemp()
+    dist.init_process_group("gloo", init_method=f"file://{init}", rank=0, world_size=1)
+    try:
+        nh.get_tp_group = lambda: _TPGroup()
+        model = _build(HYBRID, ckpt)
+        _bind_empty_kv(model)
+        n = tokens.numel()
+        with torch.no_grad():
+            hidden = model.model(tokens, torch.arange(n, dtype=torch.int32),
+                                 _attn_metadata(model, torch.arange(n), n))
+        return hidden[-1:]
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [1, 4])
+@pytest.mark.parametrize("n_real", [SEQ_LEN, SEQ_LEN - 5])
+def test_decode_after_prefill_matches_single_shot(world_size, n_real):
+    """Prefill (optionally bucket-padded) + one decode step at TP=world_size must give the same
+    hidden state as a TP=1 single-shot prefill over the real tokens plus the decoded one. This runs
+    the attention prefill and decode paths, the KV-cache write/read, and the Mamba state handed from
+    prefill to decode, across the TP collectives."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_checkpoint(tmp, HYBRID)
+        out_file = os.path.join(tmp, "decode.pt")
+        mp.spawn(_decode_worker, args=(world_size, tmp, os.path.join(tmp, "init"), out_file, n_real),
+                 nprocs=world_size, join=True)
+        got = torch.load(out_file)
+        ref = _full_prefill_last(tmp, got["tokens"][:n_real + 1])
+        torch.testing.assert_close(got["hidden"], ref, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
