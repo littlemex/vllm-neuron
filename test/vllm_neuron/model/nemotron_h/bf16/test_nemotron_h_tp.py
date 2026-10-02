@@ -21,6 +21,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import torch.nn.functional as F
 
 try:
     from safetensors.torch import save_file
@@ -257,3 +258,34 @@ def test_prefill_tp_matches_tp1(world_size):
         h_pr = TINY["mamba_num_heads"] // world_size
         for s_ref, s_got in zip(ref["ssm_state_rank0"], got["ssm_state_rank0"]):
             torch.testing.assert_close(s_got, s_ref[:, :h_pr], rtol=1e-4, atol=1e-4)
+
+
+def test_moe_matches_per_expert_reference():
+    """The concatenated two-GEMM MoE equals the per-expert sum over the checkpoint's own expert
+    tensors: sum_e gate[:, e] * down_e(relu(up_e(x))^2) + shared(x). Guards the expert-major layout
+    of the up/down loaders (an expert/column mix-up would still run and stay fluent)."""
+    from safetensors.torch import load_file
+    cfg = dict(TINY, num_hidden_layers=1, hybrid_override_pattern="E")
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_checkpoint(tmp, cfg)
+        dist.init_process_group("gloo", init_method=f"file://{os.path.join(tmp, 'init')}",
+                                rank=0, world_size=1)
+        try:
+            nh.get_tp_group = lambda: _TPGroup()
+            moe = _build(cfg, tmp).model.layers[0].mixer
+            w = load_file(os.path.join(tmp, "model.safetensors"))
+            x = torch.randn(SEQ_LEN, cfg["hidden_size"], generator=torch.Generator().manual_seed(3))
+            with torch.no_grad():
+                got = moe(x)
+                gate = moe._gate_dense(x)
+                p = "backbone.layers.0.mixer"
+                ref = torch.zeros_like(x)
+                for e in range(cfg["n_routed_experts"]):
+                    h = F.relu(x @ w[f"{p}.experts.{e}.up_proj.weight"].T).pow(2)
+                    ref += gate[:, e:e + 1] * (h @ w[f"{p}.experts.{e}.down_proj.weight"].T)
+                sh = F.relu(x @ w[f"{p}.shared_experts.up_proj.weight"].T).pow(2)
+                ref += sh @ w[f"{p}.shared_experts.down_proj.weight"].T
+            assert (gate > 0).sum(1).eq(cfg["num_experts_per_tok"]).all()
+            torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
+        finally:
+            dist.destroy_process_group()

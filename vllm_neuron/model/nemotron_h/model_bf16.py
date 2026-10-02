@@ -396,9 +396,11 @@ class NemotronHMoE(nn.Module):
         self.gate_weight = nn.Parameter(torch.empty(self.E, self.d, dtype=torch.float32))
         self.e_score_correction_bias = nn.Parameter(torch.zeros(self.E, dtype=torch.float32))
 
-        # Routed experts: up [E, mi_per_rank, d], down [E, d, mi_per_rank] (relu^2, no gate).
-        self.up = nn.Parameter(torch.empty(self.E, self.mi_per_rank, self.d, dtype=self.dtype).normal_(0, 0.02))
-        self.down = nn.Parameter(torch.empty(self.E, self.d, self.mi_per_rank, dtype=self.dtype).normal_(0, 0.02))
+        # Routed experts, stored concatenated along the intermediate axis so the whole expert set is
+        # two GEMMs: up [d, E*mi_per_rank] (expert e owns columns e*mi:(e+1)*mi), down
+        # [E*mi_per_rank, d] (same row blocks). relu^2, no gate projection.
+        self.up = nn.Parameter(torch.empty(self.d, self.E * self.mi_per_rank, dtype=self.dtype))
+        self.down = nn.Parameter(torch.empty(self.E * self.mi_per_rank, self.d, dtype=self.dtype))
         # Shared expert (relu^2).
         self.shared_up = nn.Parameter(torch.empty(self.smi_per_rank, self.d, dtype=self.dtype).normal_(0, 0.02))
         self.shared_down = nn.Parameter(torch.empty(self.d, self.smi_per_rank, dtype=self.dtype).normal_(0, 0.02))
@@ -413,18 +415,17 @@ class NemotronHMoE(nn.Module):
         set_weight_loader(self.gate_weight, SafetensorsWeightLoader(transform=lambda s, r: s[0][:, :]))
         set_weight_loader(self.e_score_correction_bias, SafetensorsWeightLoader(transform=lambda s, r: s[0][:]))
 
-        # up: HF experts.{e}.up_proj.weight is [mi, d]; we stack E of them → [E, mi, d], shard mi.
-        # The mappings feed E source keys; transform stacks + shards.
+        # The mappings feed the E per-expert source keys in expert order; each transform takes this
+        # rank's mi slice of every expert and concatenates them expert-major.
         def _up_transform(slices, rank):
             lr = rank % ws
-            stacked = torch.stack([sl[lr * mi_pr:(lr + 1) * mi_pr, :] for sl in slices], dim=0)  # [E, mi_pr, d]
-            return stacked.contiguous()
+            # HF experts.{e}.up_proj.weight is [mi, d] -> rows lr*mi_pr:(lr+1)*mi_pr, then [d, E*mi_pr].
+            return torch.cat([sl[lr * mi_pr:(lr + 1) * mi_pr, :] for sl in slices], dim=0).T.contiguous()
 
         def _down_transform(slices, rank):
             lr = rank % ws
-            # HF down_proj.weight is [d, mi]; shard mi (dim 1).
-            stacked = torch.stack([sl[:, lr * mi_pr:(lr + 1) * mi_pr] for sl in slices], dim=0)  # [E, d, mi_pr]
-            return stacked.contiguous()
+            # HF experts.{e}.down_proj.weight is [d, mi] -> cols lr*mi_pr:(lr+1)*mi_pr, then [E*mi_pr, d].
+            return torch.cat([sl[:, lr * mi_pr:(lr + 1) * mi_pr] for sl in slices], dim=1).T.contiguous()
 
         set_weight_loader(self.up, SafetensorsWeightLoader(transform=_up_transform))
         set_weight_loader(self.down, SafetensorsWeightLoader(transform=_down_transform))
@@ -462,28 +463,25 @@ class NemotronHMoE(nn.Module):
                               self.norm_topk_prob, self.routed_scaling_factor)
         return gate.to(self.dtype)                                 # [T, E] dense gate
 
-    def _expert_mlp(self, x_e, e):
-        # <-- MODEL-SPECIFIC: relu^2 expert activation: down(relu(up(x))^2)
-        h = F.linear(x_e, self.up[e])          # [n, mi_per_rank]
-        h = F.relu(h).pow(2)
-        return F.linear(h, self.down[e])       # [n, d]
-
     def forward(self, hidden_states, is_prefill=False):
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         orig_shape = hidden_states.shape
         x = hidden_states.reshape(-1, orig_shape[-1])   # [T, d]
         # Dense, trace-safe dispatch: build a per-expert weight matrix [T, E] (0 for unselected),
-        # then run every expert over all tokens and scale by that column. `_gate_dense` builds the
-        # gate with only reductions/elementwise ops (no data-dependent scatter/gather), which the
-        # Neuron compiler mishandles once several MoE layers are stacked. No data-dependent Python
-        # control flow either — required for torch.compile / Neuron tracing. Heavier than a gather
-        # loop but static-shape and correctness-first (fast NF.moe path is future work).
+        # then run every expert over all tokens and scale each expert's activations by its column.
+        # `_gate_dense` builds the gate with only reductions/elementwise ops (no data-dependent
+        # scatter/gather), which the Neuron compiler mishandles once several MoE layers are stacked.
+        # With the experts concatenated, the whole set is two GEMMs and one elementwise scale:
+        #   out = (relu(x @ up)^2 * gate_per_column) @ down
+        # which equals sum_e gate[:, e] * down_e(relu(up_e(x))^2), since unselected experts get 0.
+        # A per-expert Python loop computes the same thing but unrolls into E small GEMMs per layer,
+        # which made the 512-token prefill graph take hours in neuronx-cc. Static shapes, no
+        # data-dependent control flow (fast NF.moe path is future work).
         gate = self._gate_dense(x)                      # [T, E], weight in each selected column
-        out = torch.zeros_like(x)
-        for e in range(self.E):
-            w_e = gate[:, e:e + 1]                       # [T, 1]
-            out = out + self._expert_mlp(x, e) * w_e
+        h = F.relu(x @ self.up).pow(2)                  # [T, E*mi_per_rank]
+        h = h * gate.repeat_interleave(self.mi_per_rank, dim=1)
+        out = h @ self.down                             # [T, d]
         # shared expert (relu^2), always on
         sh = F.linear(x, self.shared_up)
         sh = F.relu(sh).pow(2)
