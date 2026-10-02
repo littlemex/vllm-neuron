@@ -826,9 +826,11 @@ class NemotronHMamba2Mixer(nn.Module):
             s0 = ssm_state0.float() if ssm_state0 is not None else None
             y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
         y = y.reshape(b, seq_len, -1)
+        # >>> PARALLELISM: `out` is this rank's partial sum over its heads. It is NOT reduced here:
+        # the caller's reduce_scatter (NemotronHModel.forward) is the one reduction, and also returns
+        # the SP shard. Reducing here as well would sum world_size identical copies (all_reduce is in
+        # place), scaling every Mamba prefill output by world_size. <<<
         out = self._gated_rmsnorm(y, gate).to(dtype) @ self.out_proj_weight
-        if self.world_size > 1:
-            self.tp_group.all_reduce(out)
         # Persist the final SSM state and the last (K-1) conv inputs for the following decode steps
         # (in-place → aliased). conv_state = xBC_t[..., -(K-1):] captured before the conv above.
         self.ssm_state.copy_(h)
@@ -1004,7 +1006,8 @@ class NemotronHModel(nn.Module):
                     out = layer.mixer.forward_decode(h_b)
                 out = out.squeeze(0)
                 if self.world_size > 1 and is_prefill:
-                    # >>> PARALLELISM: reduce-scatter back to SP shards after the Mamba/SSM boundary <<<
+                    # >>> PARALLELISM: sum the per-rank head partials and return to SP shards (the
+                    # only reduction of the Mamba prefill output; decode all_reduces in the mixer) <<<
                     out = self.tp_group.reduce_scatter(out, dim=0)
                 hidden_states = hidden_states + out.to(torch.float32)
         hidden_states = self.norm(hidden_states).to(DT)
