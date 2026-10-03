@@ -144,8 +144,10 @@ def _worker(rank, world_size, ckpt, init_file, out_file):
         with torch.no_grad():
             hidden = model.model(input_ids, positions, attn_metadata={})
             states = [m.mixer.ssm_state.clone() for m in model.model.layers if m.layer_type == "M"]
+            # host-side sampling: the vocab-sharded projection is gathered to full logits
+            logits = model(input_ids, positions, {}, torch.tensor([SEQ_LEN - 1]), None)
         if rank == 0:
-            torch.save({"hidden": hidden, "ssm_state_rank0": states}, out_file)
+            torch.save({"hidden": hidden, "ssm_state_rank0": states, "logits": logits}, out_file)
     finally:
         dist.destroy_process_group()
 
@@ -267,6 +269,8 @@ def test_prefill_tp_matches_tp1(world_size):
         got = _run(world_size, tmp, tmp)
         assert ref["hidden"].shape == got["hidden"].shape == (SEQ_LEN, TINY["hidden_size"])
         torch.testing.assert_close(got["hidden"], ref["hidden"], rtol=1e-4, atol=1e-4)
+        assert got["logits"].shape == (1, TINY["vocab_size"])
+        torch.testing.assert_close(got["logits"], ref["logits"], rtol=1e-4, atol=1e-4)
         # Rank 0 owns the first 1/world_size of the Mamba heads; its carried SSM state (what decode
         # starts from) must equal that slice of the TP=1 state.
         h_pr = TINY["mamba_num_heads"] // world_size
