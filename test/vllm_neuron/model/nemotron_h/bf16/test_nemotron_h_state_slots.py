@@ -26,7 +26,7 @@ def test_rows_are_stable_and_distinct(max_num_seqs, seed):
             key = free_blocks.pop(0)                         # lowest free block, so ids get reused
             row = None
             for seg in range(rng.randint(1, 3)):
-                slot, owner, live = prefill_slot(owner, live, torch.tensor(key), torch.tensor(seg == 0))
+                slot, owner, live = prefill_slot(owner, live, torch.tensor([key]), torch.tensor([seg == 0]))
                 row = int(slot) if row is None else row
                 assert int(slot) == row, "a later segment moved to another row"
             assert row != S - 1, "a request got the scratch row"
@@ -55,11 +55,11 @@ def test_prefill_drops_stale_row_of_reused_block():
     S = pool_size(2)
     owner = torch.full((S,), -1, dtype=torch.int32)
     live = torch.zeros(S, dtype=torch.int32)
-    slot_a, owner, live = prefill_slot(owner, live, torch.tensor(7), torch.tensor(True))
+    slot_a, owner, live = prefill_slot(owner, live, torch.tensor([7]), torch.tensor([True]))
     _, live = decode_slots(owner, live, torch.tensor([7]), torch.tensor([True]))
     # request on block 7 finishes; a new one gets block 7 before the next decode step
-    slot_b, owner, live = prefill_slot(owner, live, torch.tensor(7), torch.tensor(True))
+    slot_b, owner, live = prefill_slot(owner, live, torch.tensor([7]), torch.tensor([True]))
     assert int(slot_b) != int(slot_a)
     assert int(live[slot_a]) == 0 and int(owner[slot_a]) == -1
-    slot_c, owner, live = prefill_slot(owner, live, torch.tensor(7), torch.tensor(False))
+    slot_c, owner, live = prefill_slot(owner, live, torch.tensor([7]), torch.tensor([False]))
     assert int(slot_c) == int(slot_b)

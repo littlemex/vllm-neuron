@@ -1081,9 +1081,9 @@ class NemotronHModel(nn.Module):
             return None
         keys = md["block_table_tensor"][:, 0]
         if is_prefill:
-            is_first = (torch.ones((), dtype=torch.bool, device=keys.device) if seg_cached_len is None
-                        else seg_cached_len.reshape(()) == 0)
-            slot, owner, live = prefill_slot(self.state_owner, self.state_live, keys[0], is_first)
+            is_first = (torch.ones(1, dtype=torch.bool, device=keys.device) if seg_cached_len is None
+                        else seg_cached_len.reshape(1) == 0)
+            slot, owner, live = prefill_slot(self.state_owner, self.state_live, keys[:1], is_first)
             self.state_owner.copy_(owner)
             self.state_live.copy_(live)
             return slot

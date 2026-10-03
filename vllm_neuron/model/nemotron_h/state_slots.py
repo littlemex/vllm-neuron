@@ -50,25 +50,28 @@ def decode_slots(owner, live, keys, real):
 
 
 def prefill_slot(owner, live, key, is_first):
-    """owner/live [S] int32, key [] first-block id of the prefill request, is_first [] bool (first
-    segment of its prompt) -> (slot [1] int64, new owner [S], new live [S])."""
+    """owner/live [S] int32, key [1] first-block id of the prefill request, is_first [1] bool (first
+    segment of its prompt) -> (slot [1] int64, new owner [S], new live [S]). Every intermediate keeps
+    a dimension of size 1: on the Neuron graph path a reduction to a 0-d tensor comes back with the
+    wrong shape."""
     S = owner.shape[0]
     ar = torch.arange(S, device=owner.device)
     not_scratch = ar < S - 1
-    key = key.reshape(()).to(owner.dtype)
+    key = key.reshape(1).to(owner.dtype)
+    is_first = is_first.reshape(1)
     same = owner == key
     # later segment: the live row this request already holds
     held = same & (live > 0) & not_scratch
-    held_idx = (held.to(torch.float32) * (ar + 1).to(torch.float32)).amax() - 1
+    held_idx = (held.to(torch.float32) * (ar + 1).to(torch.float32)).amax(dim=0, keepdim=True) - 1
     # first segment: the lowest free row (weight S - s is largest for the lowest index)
     free = (live == 0) & not_scratch
-    free_idx = S - (free.to(torch.float32) * (S - ar).to(torch.float32)).amax()
-    scratch = torch.full((), S - 1, dtype=torch.int64, device=owner.device)
-    new_row = torch.where(free.any(), free_idx.to(torch.int64), scratch)
-    old_row = torch.where(held.any(), held_idx.to(torch.int64), scratch)
-    slot = torch.where(is_first.reshape(()), new_row, old_row)
-    take = (ar == slot) & is_first.reshape(())
-    drop = same & is_first.reshape(())
+    free_idx = S - (free.to(torch.float32) * (S - ar).to(torch.float32)).amax(dim=0, keepdim=True)
+    scratch = torch.full((1,), S - 1, dtype=torch.int64, device=owner.device)
+    new_row = torch.where(free.any(dim=0, keepdim=True), free_idx.to(torch.int64), scratch)
+    old_row = torch.where(held.any(dim=0, keepdim=True), held_idx.to(torch.int64), scratch)
+    slot = torch.where(is_first, new_row, old_row)
+    take = (ar == slot) & is_first
+    drop = same & is_first
     owner_new = torch.where(take, key, torch.where(drop, torch.full_like(owner, -1), owner))
     live_new = torch.where(take, torch.ones_like(live), torch.where(drop, torch.zeros_like(live), live))
-    return slot.view(1), owner_new, live_new
+    return slot, owner_new, live_new
