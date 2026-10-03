@@ -1198,3 +1198,31 @@ class NemotronHForCausalLM(nn.Module):
                 logger.debug("load_weights: mapping dst not a param (%d):", len(bad_dst))
                 for n in bad_dst[:40]:
                     logger.debug("  BADDST: %s", n)
+
+
+# DIAGNOSTIC ONLY (NEMOTRONH_TRACE_STATE=1): log, per compiled-graph execution on device 0, the
+# address and norm of the first few Mamba ssm_state inputs before and after execute, to see
+# whether the state a prefill graph writes is the state the next decode graph reads.
+if os.environ.get("NEMOTRONH_TRACE_STATE") == "1":
+    from libtorch_neuronx_lite.compile.execute_context import ExecuteContext, set_execute_context
+
+    def _ssm_inputs(tensors):
+        return [t for t in tensors
+                if torch.is_tensor(t) and t.dtype == torch.float32 and t.dim() == 4
+                and tuple(t.shape[-2:]) == (64, 128)][:3]
+
+    def _fmt(tensors):
+        return " ".join(f"{t.data_ptr():#x}:{t.detach().cpu().norm().item():.4g}" for t in tensors)
+
+    def _pre(inputs, md):
+        if md.device_id == 0:
+            with open("/tmp/state_trace.log", "a") as f:
+                f.write(f"PRE  {md.neff_id[:8]} n_in={len(inputs)} {_fmt(_ssm_inputs(inputs))}\n")
+
+    def _post(inputs, outputs, md):
+        if md.device_id == 0:
+            with open("/tmp/state_trace.log", "a") as f:
+                f.write(f"POST {md.neff_id[:8]} in:{_fmt(_ssm_inputs(inputs))} "
+                        f"out:{_fmt(_ssm_inputs(outputs))}\n")
+
+    set_execute_context(ExecuteContext(pre_execute_hook=_pre, execute_hook=_post))
