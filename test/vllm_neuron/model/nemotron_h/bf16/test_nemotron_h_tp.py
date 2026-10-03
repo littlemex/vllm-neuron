@@ -158,7 +158,10 @@ def _run(world_size, ckpt, tmp):
 
 
 HYBRID = dict(TINY, num_hidden_layers=6, hybrid_override_pattern="MEM*EM")
-BLOCK_SIZE, NUM_BLOCKS = 8, 4                     # 32 KV slots, enough for SEQ_LEN + 1
+BLOCK_SIZE, NUM_BLOCKS = 8, 4                     # 32 KV slots per request, enough for SEQ_LEN + 1
+# Block 0 is the reserved null block (NULL_BLOCK_ID): the KV cache manager never gives it to a
+# request, and the runner points padding writes at it. The request owns blocks 1..NUM_BLOCKS.
+NULL_BLOCK = 0
 
 
 def _attn_metadata(model, slot_mapping, query_len):
@@ -169,7 +172,7 @@ def _attn_metadata(model, slot_mapping, query_len):
             md[f"layers.{i}.self_attn"] = {
                 "max_query_len": query_len, "decode_token_threshold": 1,
                 "slot_mapping": slot_mapping, "block_size": BLOCK_SIZE,
-                "block_table_tensor": torch.arange(NUM_BLOCKS).view(1, -1),
+                "block_table_tensor": torch.arange(1, NUM_BLOCKS + 1).view(1, -1),
                 "max_blocks_per_seq": NUM_BLOCKS, "kv_segment_size": None,
             }
     return md
@@ -180,14 +183,19 @@ def _bind_empty_kv(model):
     for i, layer in enumerate(model.model.layers):
         if layer.layer_type == "*":
             a = layer.mixer
-            shape = (NUM_BLOCKS, a.num_key_value_heads_per_rank, BLOCK_SIZE, a.head_dim)
+            shape = (NUM_BLOCKS + 1, a.num_key_value_heads_per_rank, BLOCK_SIZE, a.head_dim)
             kv[f"layers.{i}.self_attn"] = (torch.zeros(shape), torch.zeros(shape))
     model.bind_kv_cache(kv)
 
 
-def _decode_worker(rank, world_size, ckpt, init_file, out_file, n_real):
-    """Prefill tokens[:SEQ_LEN] (the last SEQ_LEN - n_real of them bucket padding), then decode
-    tokens[n_real]. Saves the decode step's final hidden state."""
+def _slot(pos):
+    """KV slot of token position `pos` of the request (its blocks start at block 1)."""
+    return BLOCK_SIZE + pos
+
+
+def _decode_worker(rank, world_size, ckpt, init_file, out_file, n_real, pad_slot):
+    """Prefill tokens[:SEQ_LEN] (the last SEQ_LEN - n_real of them bucket padding whose KV write goes
+    to `pad_slot`), then decode tokens[n_real]. Saves the decode step's final hidden state."""
     dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
     try:
         nh.get_tp_group = lambda: _TPGroup()
@@ -198,13 +206,14 @@ def _decode_worker(rank, world_size, ckpt, init_file, out_file, n_real):
                                generator=torch.Generator().manual_seed(2))
         prompt = tokens[:SEQ_LEN].clone()
         prompt[n_real:] = 0                                   # pad token id, as the runner pads
-        slots = torch.arange(SEQ_LEN)
-        slots[n_real:] = -1                                   # PAD_SLOT_ID
+        slots = _slot(torch.arange(SEQ_LEN))
+        if n_real < SEQ_LEN:
+            slots[n_real:] = pad_slot
         with torch.no_grad():
             model.model(prompt, torch.arange(SEQ_LEN, dtype=torch.int32),
                         _attn_metadata(model, slots, SEQ_LEN))
             hidden = model.model(tokens[n_real:n_real + 1], torch.tensor([n_real], dtype=torch.int32),
-                                 _attn_metadata(model, torch.tensor([n_real]), 1))
+                                 _attn_metadata(model, _slot(torch.tensor([n_real])), 1))
         if rank == 0:
             torch.save({"hidden": hidden, "tokens": tokens}, out_file)
     finally:
@@ -222,23 +231,28 @@ def _full_prefill_last(ckpt, tokens):
         n = tokens.numel()
         with torch.no_grad():
             hidden = model.model(tokens, torch.arange(n, dtype=torch.int32),
-                                 _attn_metadata(model, torch.arange(n), n))
+                                 _attn_metadata(model, _slot(torch.arange(n)), n))
         return hidden[-1:]
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("world_size", [1, 4])
-@pytest.mark.parametrize("n_real", [SEQ_LEN, SEQ_LEN - 5])
-def test_decode_after_prefill_matches_single_shot(world_size, n_real):
+@pytest.mark.parametrize("n_real,pad_slot", [
+    (SEQ_LEN, None),
+    (SEQ_LEN - 5, -1),                       # PAD_SLOT_ID
+    (SEQ_LEN - 5, NULL_BLOCK * BLOCK_SIZE),  # null block, as the 0.24 runner pads
+])
+def test_decode_after_prefill_matches_single_shot(world_size, n_real, pad_slot):
     """Prefill (optionally bucket-padded) + one decode step at TP=world_size must give the same
     hidden state as a TP=1 single-shot prefill over the real tokens plus the decoded one. This runs
     the attention prefill and decode paths, the KV-cache write/read, and the Mamba state handed from
-    prefill to decode, across the TP collectives."""
+    prefill to decode, across the TP collectives, under both padding conventions."""
     with tempfile.TemporaryDirectory() as tmp:
         _write_checkpoint(tmp, HYBRID)
         out_file = os.path.join(tmp, "decode.pt")
-        mp.spawn(_decode_worker, args=(world_size, tmp, os.path.join(tmp, "init"), out_file, n_real),
+        mp.spawn(_decode_worker,
+                 args=(world_size, tmp, os.path.join(tmp, "init"), out_file, n_real, pad_slot),
                  nprocs=world_size, join=True)
         got = torch.load(out_file)
         ref = _full_prefill_last(tmp, got["tokens"][:n_real + 1])

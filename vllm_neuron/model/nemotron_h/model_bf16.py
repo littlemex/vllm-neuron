@@ -943,15 +943,19 @@ class NemotronHModel(nn.Module):
         return None
 
     def _prefill_valid_mask(self, attn_metadata):
-        # Per-token real/pad mask for the current prefill, taken from the attention slot_mapping
-        # (pad tokens are marked PAD_SLOT_ID = -1 by the runner; real tokens get a valid slot). The
-        # Mamba layers have no other pad signal (NoPE, no positions), so this is how they avoid
-        # convolving the bucket-padding tail into the SSM/conv state. Same length/order as the full
+        # Per-token real/pad mask for the current prefill, taken from the attention slot_mapping.
+        # The runner points every padding token's KV write at a slot that no request owns: either
+        # PAD_SLOT_ID (-1) or a slot in the reserved null block (NULL_BLOCK_ID = 0, which the KV
+        # cache manager never allocates to a request). Real tokens always land in an allocated block,
+        # so `slot >= block_size` (block index >= 1) is true exactly for real tokens under both
+        # conventions. The Mamba layers have no other pad signal (NoPE, no positions), so this is how
+        # they keep the bucket-padding tail out of the SSM/conv state. Same length/order as the full
         # token axis the Mamba mixers see. None if no attention layer / no slot_mapping.
         for i, layer in enumerate(self.layers):
             if layer.layer_type == ATTENTION:
-                sm = attn_metadata[f"layers.{i}.self_attn"].get("slot_mapping")
-                return None if sm is None else (sm >= 0)
+                md = attn_metadata[f"layers.{i}.self_attn"]
+                sm = md.get("slot_mapping")
+                return None if sm is None else (sm >= md["block_size"])
         return None
 
     def forward(self, input_ids, positions, attn_metadata):
