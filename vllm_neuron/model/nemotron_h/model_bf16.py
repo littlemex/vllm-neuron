@@ -109,6 +109,7 @@ except (ImportError, NameError):
 _MAMBA_DECODE_NKI = os.environ.get("NEMOTRONH_MAMBA_DECODE", "nki") == "nki"
 try:
     from .mamba_decode_kernel import mamba2_decode_step as _mamba2_decode_step
+    from .mamba_decode_kernel import head_selector as _mamba_head_selector
     _MAMBA_DECODE_KERNEL = _wrap_nki(_mamba2_decode_step)[_LNC]
 except (ImportError, NameError):
     _MAMBA_DECODE_KERNEL = None
@@ -984,6 +985,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 self.conv1d_bias, self.dt_bias.float(), -torch.exp(self.A_log.float()),
                 self.D.float(), ssm_state, self.norm_weight.float(),
                 torch.eye(128, dtype=torch.float32, device=hidden_states.device),
+                _mamba_head_selector(self.num_heads_pr // self.groups_pr, self.head_dim, hidden_states.device),
                 torch.full((1,), self.norm_eps, dtype=torch.float32, device=hidden_states.device))
             out = _decode_matmul(y, self.out_proj_weight, "mamba").view(b, 1, -1)
             if self.world_size > 1:
