@@ -76,6 +76,12 @@ try:
     _MOE_DECODE_KERNEL = _wrap_nki(_moe_relu2_decode)[_LNC]
 except ImportError:          # environments without the Neuron NKI stack
     _MOE_DECODE_KERNEL = None
+_MAMBA_DECODE_NKI = os.environ.get("NEMOTRONH_MAMBA_DECODE", "nki") == "nki"
+try:
+    from .mamba_decode_kernel import mamba2_decode_step as _mamba2_decode_step
+    _MAMBA_DECODE_KERNEL = _wrap_nki(_mamba2_decode_step)[_LNC]
+except (ImportError, NameError):
+    _MAMBA_DECODE_KERNEL = None
 
 
 def _use_moe_decode_kernel(x, hidden, inter_per_rank):
@@ -874,6 +880,18 @@ class NemotronHMamba2Mixer(nn.Module):
         self.conv_state.copy_(conv_state.to(self.conv_state.dtype))
         return out
 
+    def _use_decode_kernel(self, x):
+        """The NKI decode-step kernel assigns one SSM group to each physical core, two 64-wide heads
+        per 128-partition tile, and needs each core's channels to be exactly one gated-RMSNorm group.
+        Other shapes, CPU (tests) and NEMOTRONH_MAMBA_DECODE=torch use the PyTorch path."""
+        if not _MAMBA_DECODE_NKI or _MAMBA_DECODE_KERNEL is None:
+            return False
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+        return (can_run_kernel(x) and x.shape[0] == 1 and self.head_dim == 64
+                and self.ssm_state_size == 128 and self.groups_pr == _LNC
+                and self.im_pr // self.groups_pr == self.intermediate_size // self.n_groups
+                and (self.num_heads_pr // self.groups_pr) % 2 == 0)
+
     def forward_decode(self, hidden_states):
         b, T = hidden_states.shape[0], hidden_states.shape[1]
         if T != 1:
@@ -886,6 +904,20 @@ class NemotronHMamba2Mixer(nn.Module):
         dtype = hidden_states.dtype
         proj = self._in_proj(hidden_states)
         gate, xBC, dt = self._split_proj(proj)
+        if self._use_decode_kernel(hidden_states):
+            # One NKI kernel for conv + SSM step + gated RMSNorm (see mamba_decode_kernel.py).
+            y, conv_new, state_new = _MAMBA_DECODE_KERNEL(
+                xBC[:, 0], gate[:, 0], dt[:, 0], self.conv_state, self.conv1d_weight[:, 0, :],
+                self.conv1d_bias, self.dt_bias.float(), -torch.exp(self.A_log.float()),
+                self.D.float(), self.ssm_state, self.norm_weight.float(),
+                torch.eye(128, dtype=torch.float32, device=hidden_states.device),
+                torch.full((1,), self.norm_eps, dtype=torch.float32, device=hidden_states.device))
+            out = y.view(b, 1, -1) @ self.out_proj_weight
+            if self.world_size > 1:
+                self.tp_group.all_reduce(out)
+            self.ssm_state.copy_(state_new)
+            self.conv_state.copy_(conv_new)
+            return out
         xBC = xBC[:, 0]
         conv_in = torch.cat([self.conv_state, xBC[..., None]], dim=-1)   # [b, conv_dim_pr, K]
         w = self.conv1d_weight[:, 0, :]
