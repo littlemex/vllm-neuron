@@ -39,6 +39,7 @@ import torch.nn.functional as F
 from transformers import PretrainedConfig
 
 from .ssd import chunked_ssd_scan, segmented_causal_conv1d
+from .state_slots import decode_slots, pool_size, prefill_slot
 from .ops import gated_rmsnorm, dense_moe_gate
 
 from vllm.distributed.parallel_state import get_tp_group
@@ -333,12 +334,6 @@ class NemotronHAttention(nn.Module):
         tokens, _ = hidden_states.shape
         S_decode = tokens // B_local
         assert tokens == B_local * S_decode
-        if B_local != 1:
-            raise NotImplementedError(
-                "NemotronH serving currently supports max_num_seqs=1 only: the Mamba2 recurrent "
-                "state is a single per-layer buffer (no per-slot pool), so concurrent sequences "
-                f"would corrupt each other. Got batch size {B_local}."
-            )
         hidden_states = hidden_states.to(self.dtype)
         S_ctx = max_blocks_per_seq * block_size
         nkh = self.num_key_value_heads_per_rank
@@ -351,7 +346,9 @@ class NemotronHAttention(nn.Module):
         # <-- MODEL-SPECIFIC: NemotronH attention is NoPE (no rotary) — see the note in _prefill.
         self._write_kv_cache(k, v, slot_mapping, block_size)
 
-        flat_blocks = block_table.reshape(-1)
+        # Padding rows of a batch carry PAD_SLOT_ID (-1) blocks; read block 0 for them (their output
+        # is discarded).
+        flat_blocks = block_table.reshape(-1).clamp(min=0)
         k_gathered = self.k_cache[flat_blocks]
         v_gathered = self.v_cache[flat_blocks]
         k_dense = (k_gathered.view(B_local, max_blocks_per_seq, nkh, block_size, self.head_dim)
@@ -359,23 +356,25 @@ class NemotronHAttention(nn.Module):
         v_dense = (v_gathered.view(B_local, max_blocks_per_seq, nkh, block_size, self.head_dim)
                    .permute(0, 2, 1, 3, 4).reshape(B_local, nkh, S_ctx, self.head_dim))
         # GQA without materialising the repeated KV: group the query heads under their KV head
-        # ([nkh, groups, S_decode, Dh]) and contract against the nkh-head cache directly. Each KV head
-        # is read (and upcast) once instead of `groups` times. fp32 math as before.
-        k_f32 = k_dense.reshape(B_local * nkh, S_ctx, self.head_dim).to(torch.float32)
-        v_f32 = v_dense.reshape(B_local * nkh, S_ctx, self.head_dim).to(torch.float32)
-        q_f32 = q.to(torch.float32).view(nkh, self.num_key_value_groups, S_decode, self.head_dim)
-        scores = torch.einsum('hgsd,hcd->hgsc', q_f32, k_f32) * self.scaling
+        # ([b, nkh, groups, S_decode, Dh]) and contract against the nkh-head cache directly. Each KV
+        # head is read (and upcast) once instead of `groups` times. fp32 math as before.
+        k_f32 = k_dense.to(torch.float32)                                # [b, nkh, S_ctx, Dh]
+        v_f32 = v_dense.to(torch.float32)
+        q_f32 = (q.to(torch.float32).transpose(0, 1)                     # [tokens, Nh, Dh]
+                 .reshape(B_local, S_decode, nkh, self.num_key_value_groups, self.head_dim)
+                 .permute(0, 2, 3, 1, 4))                                # [b, nkh, groups, S_decode, Dh]
+        scores = torch.einsum('bhgsd,bhcd->bhgsc', q_f32, k_f32) * self.scaling
         arange_ctx = torch.arange(S_ctx, device=q.device)
-        # Per-query causal mask: each of the S_decode query rows attends only up to its own absolute
-        # position. (Masking with positions[-1] alone would let earlier decode-bucket rows attend to
-        # future keys; identical to the single-value mask when S_decode == 1.)
-        valid = arange_ctx.view(1, -1) <= positions.view(-1, 1)     # [S_decode, S_ctx]
-        scores = scores.masked_fill(~valid.view(1, 1, S_decode, S_ctx), float("-inf"))
+        # Per-query causal mask: each query row attends only up to its own absolute position.
+        # (Masking with positions[-1] alone would let earlier decode-bucket rows attend to future
+        # keys; identical to the single-value mask when S_decode == 1.)
+        valid = arange_ctx.view(1, 1, -1) <= positions.view(B_local, S_decode, 1)   # [b, S_decode, S_ctx]
+        scores = scores.masked_fill(~valid.view(B_local, 1, 1, S_decode, S_ctx), float("-inf"))
         attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
-        attn_output = torch.einsum('hgsc,hcd->hgsd', attn_weights, v_f32).to(self.dtype)
-        attn_output = attn_output.reshape(-1, S_decode, self.head_dim)   # [Nh, S_decode, head_dim]
+        attn_output = torch.einsum('bhgsc,bhcd->bhgsd', attn_weights, v_f32).to(self.dtype)
+        attn_output = attn_output.permute(0, 3, 1, 2, 4).reshape(tokens, -1)   # [tokens, Nh * Dh]
 
-        attn_output = _decode_matmul(attn_output.transpose(0, 1).reshape(S_decode, -1), self.o_proj_weight, "attn")
+        attn_output = _decode_matmul(attn_output, self.o_proj_weight, "attn")
         if self.world_size > 1:
             # >>> PARALLELISM: TP all-reduce (decode) <<<
             self.tp_group.all_reduce(attn_output)
@@ -642,16 +641,17 @@ class NemotronHMamba2Mixer(nn.Module):
         self.dt_bias = nn.Parameter(torch.zeros(self.num_heads_pr))
         self.norm_weight = nn.Parameter(torch.ones(self.im_pr))
         self.out_proj_weight = nn.Parameter(torch.empty(self.im_pr, config.hidden_size, dtype=self.dtype))
-        # Recurrent state carried across decode steps. Held as module buffers and updated in place;
-        # the plugin's AliasingOutputRewritePass turns the in-place copy_ into an HLO
-        # input_output_alias so the state persists across the runner's decode-step graph calls
-        # WITHOUT a runner-side state pool. batch=1 (max_num_seqs=1) bring-up: a single slot.
-        # (Materialised to real device tensors in load_weights — the runner builds on `meta`.)
+        # Recurrent state carried across steps: a pool with one row per concurrent request plus a
+        # scratch row (state_slots.py says which row each request uses). Held as module buffers and
+        # updated in place, so the state persists across the runner's graph calls without a
+        # runner-side state pool. (Materialised to real device tensors in load_weights — the runner
+        # builds on `meta`.)
+        rows = pool_size(config.max_num_seqs)
         self.register_buffer(
-            "ssm_state", torch.zeros(1, self.num_heads_pr, self.head_dim, self.ssm_state_size,
+            "ssm_state", torch.zeros(rows, self.num_heads_pr, self.head_dim, self.ssm_state_size,
                                      dtype=torch.float32), persistent=False)
         self.register_buffer(
-            "conv_state", torch.zeros(1, self.conv_dim_pr, self.conv_kernel_size - 1,
+            "conv_state", torch.zeros(rows, self.conv_dim_pr, self.conv_kernel_size - 1,
                                       dtype=self.dtype), persistent=False)
         self._setup_weight_loaders()
 
@@ -761,7 +761,9 @@ class NemotronHMamba2Mixer(nn.Module):
         dt = proj[..., off:off + self.num_heads_pr]
         return gate, xBC, dt
 
-    def forward_prefill(self, hidden_states, ssm_state0=None, cached_seq_len=None, valid_mask=None):
+    def forward_prefill(self, hidden_states, ssm_state0=None, cached_seq_len=None, valid_mask=None,
+                        slot=None):
+        # slot [1]: the state-pool row of this request (state_slots.prefill_slot); row 0 if None.
         # valid_mask[seq] (runtime {0,1} per token, None when the whole prefill is real) marks the
         # REAL tokens: Neuron pads a prefill up to a fixed bucket width with a contiguous suffix of
         # pad tokens. Attention masks pad via slot_mapping=-1, but the Mamba SSM/conv have no such
@@ -773,7 +775,7 @@ class NemotronHMamba2Mixer(nn.Module):
         # Python branch.
         # cached_seq_len is None for a single-shot prefill (unchanged path). When set (segmented /
         # continuation prefill), this is one SEGMENT of a longer prompt: the SSM/conv state left by
-        # the previous segment (in self.ssm_state / self.conv_state, persisted across segment graphs
+        # the previous segment (row `slot` of self.ssm_state / self.conv_state, persisted across graphs
         # by the AliasingOutputRewritePass, exactly like decode) is this segment's initial state.
         # Splitting a prefill this way is mathematically identical to a single-shot prefill (the SSM
         # is a linear recurrence; the conv is causal) — pinned on CPU by
@@ -789,8 +791,10 @@ class NemotronHMamba2Mixer(nn.Module):
         b, seq_len, _ = hidden_states.shape
         if b != 1:
             raise NotImplementedError(
-                "NemotronH Mamba2 forward_prefill supports batch size 1 only: the recurrent state is "
-                f"a single per-layer buffer (no per-slot pool). Got batch size {b}.")
+                "NemotronH Mamba2 forward_prefill takes one request per step (the Neuron scheduler "
+                f"prefills one request at a time). Got batch size {b}.")
+        if slot is None:
+            slot = torch.zeros(1, dtype=torch.int64, device=hidden_states.device)
         dtype = hidden_states.dtype
         # valid_mask must be per-token over THIS forward's tokens (derived from the same-length
         # slot_mapping). A static-shape check so a future SP/gather refactor fails loudly here rather
@@ -813,8 +817,10 @@ class NemotronHMamba2Mixer(nn.Module):
             is_continuation = (cached_seq_len.reshape(()) > 0)               # runtime {0,1} mask
             xBC_c, conv_state = segmented_causal_conv1d(
                 xBC_t, self.conv1d_weight, self.conv1d_bias, self.conv_kernel_size, self.conv_dim_pr,
-                conv_state=self.conv_state, is_continuation=is_continuation, valid_len=valid_len)
-            ssm_state0 = self.ssm_state * is_continuation.to(self.ssm_state.dtype)   # zeroed on first segment
+                conv_state=self.conv_state.index_select(0, slot), is_continuation=is_continuation,
+                valid_len=valid_len)
+            ssm_state0 = (self.ssm_state.index_select(0, slot)
+                          * is_continuation.to(self.ssm_state.dtype))         # zeroed on first segment
         xBC = self.act(xBC_c.transpose(1, 2))
 
         gn = self.groups_pr * self.ssm_state_size
@@ -843,7 +849,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 C.reshape(seq_len, G, N).float(), self.D.float(), s0,
                 torch.triu(torch.ones(128, 128, dtype=torch.float32, device=x.device)))
             y, h = yk[None], hk[None]
-            return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state)
+            return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state, slot)
         B = B.reshape(b, seq_len, G, N).float().repeat_interleave(rep, dim=2)
         C = C.reshape(b, seq_len, G, N).float().repeat_interleave(rep, dim=2)
         if os.environ.get("NEMOTRONH_MAMBA_STUB") == "1":
@@ -915,9 +921,9 @@ class NemotronHMamba2Mixer(nn.Module):
             cs = int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK)))
             s0 = ssm_state0.float() if ssm_state0 is not None else None
             y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
-        return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state)
+        return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state, slot)
 
-    def _prefill_finish(self, y, gate, dtype, b, seq_len, h, conv_state):
+    def _prefill_finish(self, y, gate, dtype, b, seq_len, h, conv_state, slot):
         """Gated RMSNorm + out_proj, and persist the SSM / conv state, after the prefill scan."""
         y = y.reshape(b, seq_len, -1)
         # >>> PARALLELISM: `out` is this rank's partial sum over its heads. It is NOT reduced here:
@@ -925,10 +931,10 @@ class NemotronHMamba2Mixer(nn.Module):
         # the SP shard. Reducing here as well would sum world_size identical copies (all_reduce is in
         # place), scaling every Mamba prefill output by world_size. <<<
         out = self._gated_rmsnorm(y, gate).to(dtype) @ self.out_proj_weight
-        # Persist the final SSM state and the last (K-1) conv inputs for the following decode steps
-        # (in-place → aliased). conv_state = xBC_t[..., -(K-1):] captured before the conv above.
-        self.ssm_state.copy_(h)
-        self.conv_state.copy_(conv_state.to(self.conv_state.dtype))
+        # Persist the final SSM state and the last (K-1) conv inputs in this request's pool row for
+        # the following steps. conv_state = xBC_t[..., -(K-1):] captured before the conv above.
+        self.ssm_state.index_put_((slot,), h.float())
+        self.conv_state.index_put_((slot,), conv_state.to(self.conv_state.dtype))
         return out
 
     def _use_ssd_prefill_kernel(self, x, seq_len):
@@ -948,13 +954,19 @@ class NemotronHMamba2Mixer(nn.Module):
         if not _MAMBA_DECODE_NKI or _MAMBA_DECODE_KERNEL is None:
             return False
         from vllm_neuron.utils.neuron_utils import can_run_kernel
-        return (can_run_kernel(x) and x.shape[0] == 1 and self.head_dim == 64
+        return (can_run_kernel(x) and self.head_dim == 64
                 and self.ssm_state_size == 128 and self.groups_pr == _LNC
                 and self.im_pr // self.groups_pr == self.intermediate_size // self.n_groups
                 and (self.num_heads_pr // self.groups_pr) % 2 == 0)
 
-    def forward_decode(self, hidden_states):
+    def forward_decode(self, hidden_states, slots=None):
+        """hidden_states [b, 1, H]: one token for each of b requests; slots [b] their state-pool rows
+        (state_slots.decode_slots; rows 0..b-1 if None)."""
         b, T = hidden_states.shape[0], hidden_states.shape[1]
+        if slots is None:
+            slots = torch.arange(b, dtype=torch.int64, device=hidden_states.device)
+        conv_state = self.conv_state.index_select(0, slots)              # [b, conv_dim_pr, K-1]
+        ssm_state = self.ssm_state.index_select(0, slots)                # [b, H, P, N]
         if T != 1:
             # Multi-token decode (e.g. speculative decoding's verify step) is not implemented for the
             # recurrent SSM path: this method advances the state by ONE token, so T>1 would silently
@@ -968,19 +980,19 @@ class NemotronHMamba2Mixer(nn.Module):
         if self._use_decode_kernel(hidden_states):
             # One NKI kernel for conv + SSM step + gated RMSNorm (see mamba_decode_kernel.py).
             y, conv_new, state_new = _MAMBA_DECODE_KERNEL(
-                xBC[:, 0], gate[:, 0], dt[:, 0], self.conv_state, self.conv1d_weight[:, 0, :],
+                xBC[:, 0], gate[:, 0], dt[:, 0], conv_state, self.conv1d_weight[:, 0, :],
                 self.conv1d_bias, self.dt_bias.float(), -torch.exp(self.A_log.float()),
-                self.D.float(), self.ssm_state, self.norm_weight.float(),
+                self.D.float(), ssm_state, self.norm_weight.float(),
                 torch.eye(128, dtype=torch.float32, device=hidden_states.device),
                 torch.full((1,), self.norm_eps, dtype=torch.float32, device=hidden_states.device))
             out = _decode_matmul(y, self.out_proj_weight, "mamba").view(b, 1, -1)
             if self.world_size > 1:
                 self.tp_group.all_reduce(out)
-            self.ssm_state.copy_(state_new)
-            self.conv_state.copy_(conv_new)
+            self.ssm_state.index_put_((slots,), state_new)
+            self.conv_state.index_put_((slots,), conv_new)
             return out
         xBC = xBC[:, 0]
-        conv_in = torch.cat([self.conv_state, xBC[..., None]], dim=-1)   # [b, conv_dim_pr, K]
+        conv_in = torch.cat([conv_state, xBC[..., None]], dim=-1)        # [b, conv_dim_pr, K]
         w = self.conv1d_weight[:, 0, :]
         conv_o = (conv_in * w[None]).sum(-1)
         if self.conv1d_bias is not None:
@@ -1000,14 +1012,14 @@ class NemotronHMamba2Mixer(nn.Module):
         C = C.reshape(b, G, N).float().repeat_interleave(rep, dim=1)
         dA = torch.exp(dtv.float() * A)
         dBx = (dtv.float()[..., None, None] * B[:, :, None, :]) * x[..., None]
-        h = self.ssm_state.float() * dA[..., None, None] + dBx
+        h = ssm_state.float() * dA[..., None, None] + dBx
         y = (h * C[:, :, None, :]).sum(dim=-1) + x * self.D[..., None]
         y = y.reshape(b, 1, -1)
         out = self._gated_rmsnorm(y, gate).to(dtype) @ self.out_proj_weight
         if self.world_size > 1:
             self.tp_group.all_reduce(out)
-        self.ssm_state.copy_(h)
-        self.conv_state.copy_(conv_state_new.to(self.conv_state.dtype))
+        self.ssm_state.index_put_((slots,), h)
+        self.conv_state.index_put_((slots,), conv_state_new.to(self.conv_state.dtype))
         return out
 
 
@@ -1050,6 +1062,35 @@ class NemotronHModel(nn.Module):
             [NemotronHDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
         self.norm = NemotronHRMSNorm(config.hidden_size, config.rms_norm_eps, config.torch_dtype)
+        # Which request holds each row of the Mamba state pools (see state_slots.py), updated in
+        # place each step like the pools.
+        rows = pool_size(config.max_num_seqs)
+        self.register_buffer("state_owner", torch.full((rows,), -1, dtype=torch.int32), persistent=False)
+        self.register_buffer("state_live", torch.zeros(rows, dtype=torch.int32), persistent=False)
+
+    def _state_slots(self, attn_metadata, is_prefill, seg_cached_len):
+        """State-pool rows for this step's requests: [1] on prefill, [b] on decode. A request is
+        identified by its first KV block; a model without attention layers (CPU tests) has one
+        request, in row 0."""
+        md = None
+        for i, layer in enumerate(self.layers):
+            if layer.layer_type == ATTENTION:
+                md = attn_metadata[f"layers.{i}.self_attn"]
+                break
+        if md is None:
+            return None
+        keys = md["block_table_tensor"][:, 0]
+        if is_prefill:
+            is_first = (torch.ones((), dtype=torch.bool, device=keys.device) if seg_cached_len is None
+                        else seg_cached_len.reshape(()) == 0)
+            slot, owner, live = prefill_slot(self.state_owner, self.state_live, keys[0], is_first)
+            self.state_owner.copy_(owner)
+            self.state_live.copy_(live)
+            return slot
+        real = md["slot_mapping"].view(keys.shape[0], -1)[:, 0] >= md["block_size"]
+        slots, live = decode_slots(self.state_owner, self.state_live, keys, real)
+        self.state_live.copy_(live)
+        return slots
 
     def _is_prefill(self, attn_metadata):
         # <-- MODEL-SPECIFIC: use the first attention layer's metadata to decide prefill vs decode
@@ -1097,6 +1138,7 @@ class NemotronHModel(nn.Module):
         is_prefill = self._is_prefill(attn_metadata)
         seg_cached_len = self._segmented_cached_len(attn_metadata) if is_prefill else None
         valid_mask = self._prefill_valid_mask(attn_metadata) if is_prefill else None
+        slots = self._state_slots(attn_metadata, is_prefill, seg_cached_len)
         if is_prefill and self.world_size > 1:
             T = input_ids.shape[0]
             if T <= self.world_size or T % self.world_size != 0:
@@ -1117,8 +1159,8 @@ class NemotronHModel(nn.Module):
         # <-- MODEL-SPECIFIC: per-layer-type dispatch loop (Mamba2/Attention/MoE), unique to this
         # hybrid-decoder architecture.
         # Mamba runs on the full (un-SP) hidden states; for TP>1 we all_gather at the SSM boundary.
-        # Recurrent state lives in each mamba mixer's buffers (batch=1): prefill writes it, decode
-        # reads+updates it in place (aliased across steps). No runner-side state pool needed here.
+        # Recurrent state lives in each mamba mixer's state pool, one row per request (`slots`):
+        # prefill writes the request's row, decode reads and updates each request's row in place.
         for i, layer in enumerate(self.layers):
             if layer.layer_type == ATTENTION:
                 normed = layer.norm(hidden_states).to(DT)
@@ -1131,14 +1173,14 @@ class NemotronHModel(nn.Module):
                 if self.world_size > 1 and is_prefill:
                     # >>> PARALLELISM: all-gather to full hidden states at the Mamba/SSM boundary <<<
                     h_norm = self.tp_group.all_gather(h_norm, dim=0)
-                # [T, H] -> [1, T, H] (batch=1 bring-up)
-                h_b = h_norm.unsqueeze(0)
+                # prefill: [T, H] -> [1, T, H] (one request); decode: [b, H] -> [b, 1, H]
+                h_b = h_norm.unsqueeze(0) if is_prefill else h_norm.unsqueeze(1)
                 if is_prefill:
                     out = layer.mixer.forward_prefill(h_b, cached_seq_len=seg_cached_len,
-                                                      valid_mask=valid_mask)
+                                                      valid_mask=valid_mask, slot=slots)
                 else:
-                    out = layer.mixer.forward_decode(h_b)
-                out = out.squeeze(0)
+                    out = layer.mixer.forward_decode(h_b, slots)
+                out = out.squeeze(0) if is_prefill else out.squeeze(1)
                 if self.world_size > 1 and is_prefill:
                     # >>> PARALLELISM: sum the per-rank head partials and return to SP shards (the
                     # only reduction of the Mamba prefill output; decode all_reduces in the mixer) <<<
@@ -1315,6 +1357,9 @@ class NemotronHForCausalLM(nn.Module):
             if hasattr(_mx, "ssm_state"):
                 _mx.ssm_state = torch.zeros(_mx.ssm_state.shape, dtype=torch.float32, device=device)
                 _mx.conv_state = torch.zeros(_mx.conv_state.shape, dtype=_mx.dtype, device=device)
+        _m = self.model
+        _m.state_owner = torch.full(_m.state_owner.shape, -1, dtype=torch.int32, device=device)
+        _m.state_live = torch.zeros(_m.state_live.shape, dtype=torch.int32, device=device)
 
         if os.environ.get("NEMOTRONH_DEBUG_LOAD", "0") == "1":
             model_params = dict(self.named_parameters())

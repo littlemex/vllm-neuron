@@ -2,7 +2,7 @@
 """The NKI Mamba2 decode-step kernel, on the NKI CPU simulator, against a NumPy transcription of
 NemotronHMamba2Mixer.forward_decode (the part between in_proj and out_proj), at the real per-rank
 shapes at TP=4: 16 heads x 64, state 128, 2 groups, conv kernel 4. LNC=2 is simulated with a
-two-program grid (one group per core)."""
+two-program grid (one group per core). A batch of requests must equal each request run alone."""
 import importlib.util
 import os
 
@@ -32,6 +32,7 @@ def _silu(v):
 
 
 def _reference(xBC, gate, dt, conv_state, conv_w, conv_b, dt_bias, A, D, state, norm_w, eps, G):
+    """One request: inputs with a leading axis of 1."""
     H, P, N = state.shape[1:]
     I = H * P
     xBC, gate, dt, conv_state, conv_w, conv_b = (a.astype(f32) for a in (xBC, gate, dt, conv_state, conv_w, conv_b))
@@ -51,28 +52,31 @@ def _reference(xBC, gate, dt, conv_state, conv_w, conv_b, dt_bias, A, D, state, 
     return (yg.reshape(-1) * norm_w)[None], new_conv, h[None]
 
 
-def test_mamba2_decode_step_matches_reference():
+@pytest.mark.parametrize("R", [1, 3])
+def test_mamba2_decode_step_matches_reference(R):
     rng = np.random.default_rng(0)
     H, P, N, G, K = 16, 64, 128, 2, 4
     I = H * P
     C_dim = I + 2 * G * N
-    xBC = rng.standard_normal((1, C_dim)).astype(BF16)
-    gate = rng.standard_normal((1, I)).astype(BF16)
-    dt = rng.standard_normal((1, H)).astype(BF16)
-    conv_state = rng.standard_normal((1, C_dim, K - 1)).astype(BF16)
+    xBC = rng.standard_normal((R, C_dim)).astype(BF16)
+    gate = rng.standard_normal((R, I)).astype(BF16)
+    dt = rng.standard_normal((R, H)).astype(BF16)
+    conv_state = rng.standard_normal((R, C_dim, K - 1)).astype(BF16)
     conv_w = (rng.standard_normal((C_dim, K)) * 0.5).astype(BF16)
     conv_b = (rng.standard_normal(C_dim) * 0.1).astype(BF16)
     dt_bias = rng.standard_normal(H).astype(f32)
     A = -rng.uniform(1.0, 16.0, H).astype(f32)
     D = rng.uniform(0.5, 1.5, H).astype(f32)
-    state = rng.standard_normal((1, H, P, N)).astype(f32)
+    state = rng.standard_normal((R, H, P, N)).astype(f32)
     norm_w = rng.uniform(0.5, 1.5, I).astype(f32)
     eps = np.array([1e-5], f32)
     eye = np.eye(128, dtype=f32)
     y, conv_new, state_new = nki.simulate(_mod.mamba2_decode_step[G])(
         xBC, gate, dt, conv_state, conv_w, conv_b, dt_bias, A, D, state, norm_w, eye, eps)
-    ry, rconv, rstate = _reference(xBC, gate, dt, conv_state, conv_w, conv_b, dt_bias, A, D, state, norm_w,
-                                   1e-5, G)
-    np.testing.assert_allclose(np.asarray(conv_new, f32), rconv, rtol=0, atol=0)
-    np.testing.assert_allclose(np.asarray(state_new, f32), rstate, rtol=1e-3, atol=1e-3)
-    np.testing.assert_allclose(np.asarray(y, f32), ry, rtol=2e-2, atol=2e-2)
+    for r in range(R):
+        one = slice(r, r + 1)
+        ry, rconv, rstate = _reference(xBC[one], gate[one], dt[one], conv_state[one], conv_w, conv_b, dt_bias,
+                                       A, D, state[one], norm_w, 1e-5, G)
+        np.testing.assert_allclose(np.asarray(conv_new, f32)[one], rconv, rtol=0, atol=0)
+        np.testing.assert_allclose(np.asarray(state_new, f32)[one], rstate, rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(np.asarray(y, f32)[one], ry, rtol=2e-2, atol=2e-2)

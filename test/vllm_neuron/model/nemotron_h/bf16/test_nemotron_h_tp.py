@@ -309,3 +309,77 @@ def test_moe_matches_per_expert_reference(is_prefill, expert_group, monkeypatch)
             torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-5)
         finally:
             dist.destroy_process_group()
+
+
+BATCHED = dict(HYBRID, max_num_seqs=3)
+
+
+def _md(model, block_table, slot_mapping, query_len):
+    md = {}
+    for i, layer in enumerate(model.model.layers):
+        if layer.layer_type == "*":
+            md[f"layers.{i}.self_attn"] = {
+                "max_query_len": query_len, "decode_token_threshold": 1,
+                "slot_mapping": slot_mapping, "block_size": BLOCK_SIZE,
+                "block_table_tensor": block_table, "max_blocks_per_seq": block_table.shape[1],
+                "kv_segment_size": None,
+            }
+    return md
+
+
+def _batched_worker(rank, world_size, ckpt, init_file, out_file):
+    """Prefill request A (blocks 1-4) and request B (blocks 5-8) one at a time, then two decode steps
+    with both in one batch, in the order [B, A, padding]. Saves both decode steps' hidden states."""
+    dist.init_process_group("gloo", init_method=f"file://{init_file}", rank=rank, world_size=world_size)
+    try:
+        nh.get_tp_group = lambda: _TPGroup()
+        nn_embedding.reduce_scatter_tensor = _reduce_scatter_tensor
+        model = _build(BATCHED, ckpt)
+        kv = {}
+        for i, layer in enumerate(model.model.layers):
+            if layer.layer_type == "*":
+                a = layer.mixer
+                shape = (2 * NUM_BLOCKS + 1, a.num_key_value_heads_per_rank, BLOCK_SIZE, a.head_dim)
+                kv[f"layers.{i}.self_attn"] = (torch.zeros(shape), torch.zeros(shape))
+        model.bind_kv_cache(kv)
+        g = torch.Generator().manual_seed(3)
+        toks = {r: torch.randint(0, BATCHED["vocab_size"], (SEQ_LEN + 2,), generator=g) for r in "AB"}
+        table = {"A": torch.arange(1, NUM_BLOCKS + 1), "B": torch.arange(NUM_BLOCKS + 1, 2 * NUM_BLOCKS + 1)}
+
+        def slot(r, pos):
+            return table[r][pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE
+
+        hidden = []
+        with torch.no_grad():
+            for r in "AB":
+                pos = torch.arange(SEQ_LEN)
+                model.model(toks[r][:SEQ_LEN], pos.to(torch.int32),
+                            _md(model, table[r].view(1, -1), slot(r, pos), SEQ_LEN))
+            pad_row = torch.full((NUM_BLOCKS,), -1)
+            bt = torch.stack([table["B"], table["A"], pad_row])
+            for p in (SEQ_LEN, SEQ_LEN + 1):
+                ids = torch.stack([toks["B"][p], toks["A"][p], torch.tensor(0)])
+                positions = torch.tensor([p, p, 0], dtype=torch.int32)
+                sm = torch.stack([slot("B", torch.tensor(p)), slot("A", torch.tensor(p)), torch.tensor(-1)])
+                hidden.append(model.model(ids, positions, _md(model, bt, sm, 1)))
+        if rank == 0:
+            torch.save({"hidden": hidden, "tokens": toks}, out_file)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world_size", [1, 4])
+def test_batched_decode_matches_one_request_at_a_time(world_size):
+    """Two requests decoded in one batch (reordered relative to their prefill, plus a padding row)
+    for two steps must each match a TP=1 single-shot prefill over that request's tokens: each batch
+    row reads and writes its own request's Mamba state and KV."""
+    with tempfile.TemporaryDirectory() as tmp:
+        _write_checkpoint(tmp, HYBRID)
+        out_file = os.path.join(tmp, "batched.pt")
+        mp.spawn(_batched_worker, args=(world_size, tmp, os.path.join(tmp, "init"), out_file),
+                 nprocs=world_size, join=True)
+        got = torch.load(out_file)
+        for step in range(2):
+            for row, r in enumerate("BA"):
+                ref = _full_prefill_last(tmp, got["tokens"][r][:SEQ_LEN + step + 1])
+                torch.testing.assert_close(got["hidden"][step][row:row + 1], ref, rtol=1e-4, atol=1e-4)
