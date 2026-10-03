@@ -52,7 +52,7 @@ def _reference(xBC, gate, dt, conv_state, conv_w, conv_b, dt_bias, A, D, state, 
     return (yg.reshape(-1) * norm_w)[None], new_conv, h[None]
 
 
-@pytest.mark.parametrize("R", [1, 3])
+@pytest.mark.parametrize("R", [1, 3, 8])
 def test_mamba2_decode_step_matches_reference(R):
     rng = np.random.default_rng(0)
     H, P, N, G, K = 16, 64, 128, 2, 4
@@ -72,7 +72,8 @@ def test_mamba2_decode_step_matches_reference(R):
     eps = np.array([1e-5], f32)
     eye = np.eye(128, dtype=f32)
     y, conv_new, state_new = nki.simulate(_mod.mamba2_decode_step[G])(
-        xBC, gate, dt, conv_state, conv_w, conv_b, dt_bias, A, D, state, norm_w, eye, eps)
+        xBC, gate, dt, conv_state, conv_w, conv_b, dt_bias, A, D, state, norm_w, eye,
+        _mod.head_selector(H // G, P).numpy(), eps)
     for r in range(R):
         one = slice(r, r + 1)
         ry, rconv, rstate = _reference(xBC[one], gate[one], dt[one], conv_state[one], conv_w, conv_b, dt_bias,
