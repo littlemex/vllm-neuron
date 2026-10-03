@@ -90,6 +90,8 @@ class NemotronHConfig:
 
     # ── Framework config (not model-specific) ────────────────────────────
     neuron_config: NeuronConfig | None = None
+    # Serving: concurrent requests (the scheduler's max_num_seqs). Sizes the Mamba state pool.
+    max_num_seqs: int = 1
 
     def __post_init__(self):
         # <-- MODEL-SPECIFIC: hybrid_override_pattern length/topology validation is unique to this
@@ -173,4 +175,9 @@ class NemotronHConfig:
             if eps is not None:
                 filtered["rms_norm_eps"] = eps
         filtered["neuron_config"] = neuron_config
+        try:
+            from vllm.config import get_current_vllm_config
+            filtered["max_num_seqs"] = get_current_vllm_config().scheduler_config.max_num_seqs or 1
+        except Exception:    # outside a vLLM engine (offline tools): one request at a time
+            pass
         return cls(**filtered)
