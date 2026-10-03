@@ -83,11 +83,15 @@ except (ImportError, NameError):
     _MATVEC_KERNEL = None
 
 
-def _decode_matmul(x, w):
+# Call sites (mamba, attn, shared, lm_head) that keep the plain matmul, e.g. NEMOTRONH_MATVEC_OFF=lm_head.
+_MATVEC_OFF = set(filter(None, os.environ.get("NEMOTRONH_MATVEC_OFF", "").split(",")))
+
+
+def _decode_matmul(x, w, site=""):
     """x [T, H] @ w [H, N] for a decode step: the NKI matvec kernel on a Neuron device for shapes it
     supports (N % LNC == 0, T <= 128), plain matmul otherwise (and on CPU)."""
-    if _MATVEC_NKI and _MATVEC_KERNEL is not None and x.dim() == 2 and x.shape[0] <= 128 \
-            and w.shape[1] % _LNC == 0:
+    if _MATVEC_NKI and _MATVEC_KERNEL is not None and site not in _MATVEC_OFF and x.dim() == 2 \
+            and x.shape[0] <= 128 and w.shape[1] % _LNC == 0:
         from vllm_neuron.utils.neuron_utils import can_run_kernel
         if can_run_kernel(x):
             return _MATVEC_KERNEL(x.contiguous(), w)
@@ -338,7 +342,7 @@ class NemotronHAttention(nn.Module):
         S_ctx = max_blocks_per_seq * block_size
         nkh = self.num_key_value_heads_per_rank
 
-        qkv = _decode_matmul(hidden_states, self.qkv_proj_weight)
+        qkv = _decode_matmul(hidden_states, self.qkv_proj_weight, "attn")
         q, k, v = torch.tensor_split(qkv, self.qkv_split_indices, dim=-1)
         q = q.view(tokens, self.num_attention_heads_per_rank, self.head_dim).transpose(0, 1)
         k = k.view(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(0, 1)
@@ -370,7 +374,7 @@ class NemotronHAttention(nn.Module):
         attn_output = torch.einsum('hgsc,hcd->hgsd', attn_weights, v_f32).to(self.dtype)
         attn_output = attn_output.reshape(-1, S_decode, self.head_dim)   # [Nh, S_decode, head_dim]
 
-        attn_output = _decode_matmul(attn_output.transpose(0, 1).reshape(S_decode, -1), self.o_proj_weight)
+        attn_output = _decode_matmul(attn_output.transpose(0, 1).reshape(S_decode, -1), self.o_proj_weight, "attn")
         if self.world_size > 1:
             # >>> PARALLELISM: TP all-reduce (decode) <<<
             self.tp_group.all_reduce(attn_output)
@@ -557,9 +561,12 @@ class NemotronHMoE(nn.Module):
                 h = F.relu(torch.einsum('td,tkdi->tki', x, up)).pow(2)       # [T, K, mi_pr]
                 out = torch.einsum('tki,tkid->td', h * w.unsqueeze(-1), down)
         # shared expert (relu^2), always on
-        mm = torch.matmul if is_prefill else _decode_matmul
-        sh = F.relu(mm(x, self.shared_up)).pow(2)
-        out = out + mm(sh, self.shared_down)
+        if is_prefill:
+            sh = F.relu(x @ self.shared_up).pow(2)
+            out = out + sh @ self.shared_down
+        else:
+            sh = F.relu(_decode_matmul(x, self.shared_up, "shared")).pow(2)
+            out = out + _decode_matmul(sh, self.shared_down, "shared")
         out = out.reshape(orig_shape)
         # >>> PARALLELISM: experts/shared computed on sharded intermediate → sum partials across
         # ranks (reduce-scatter on prefill, all-reduce on decode) <<<
@@ -955,7 +962,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 "NemotronH Mamba2 forward_decode supports single-token decode only (speculative / "
                 f"multi-token decode is not implemented for the SSM recurrence). Got T={T}.")
         dtype = hidden_states.dtype
-        proj = _decode_matmul(hidden_states.reshape(b, -1), self.in_proj_weight).view(b, 1, -1)
+        proj = _decode_matmul(hidden_states.reshape(b, -1), self.in_proj_weight, "mamba").view(b, 1, -1)
         gate, xBC, dt = self._split_proj(proj)
         if self._use_decode_kernel(hidden_states):
             # One NKI kernel for conv + SSM step + gated RMSNorm (see mamba_decode_kernel.py).
@@ -965,7 +972,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 self.D.float(), self.ssm_state, self.norm_weight.float(),
                 torch.eye(128, dtype=torch.float32, device=hidden_states.device),
                 torch.full((1,), self.norm_eps, dtype=torch.float32, device=hidden_states.device))
-            out = _decode_matmul(y, self.out_proj_weight).view(b, 1, -1)
+            out = _decode_matmul(y, self.out_proj_weight, "mamba").view(b, 1, -1)
             if self.world_size > 1:
                 self.tp_group.all_reduce(out)
             self.ssm_state.copy_(state_new)
@@ -1211,7 +1218,7 @@ class NemotronHForCausalLM(nn.Module):
         positions = positions.to(torch.int32)
         hidden_states = self.model(input_ids, positions, attn_metadata)
         sampled = torch.index_select(hidden_states, 0, sampling_positions)
-        logits = _decode_matmul(sampled, self.lm_head_t)                 # [S, V_pr], this rank's vocab
+        logits = _decode_matmul(sampled, self.lm_head_t, "lm_head")                 # [S, V_pr], this rank's vocab
         if self.on_device_sampling_config is None and self.world_size > 1:
             logits = self.tp_group.all_gather(logits, dim=-1)
         if self.on_device_sampling_config is None:
