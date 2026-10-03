@@ -65,6 +65,29 @@ _DEFAULT_MAMBA_CHUNK = 128
 _MOE_PREFILL_EXPERT_GROUP = int(os.environ.get("NEMOTRONH_MOE_GROUP", "16"))
 
 
+# Logical-core size of trn2 (two physical cores); the MoE decode kernel splits its work across them.
+_LNC = 2
+_moe_decode_kernel_caller = None
+
+
+def _use_moe_decode_kernel(x, hidden, inter_per_rank):
+    """The NKI MoE decode kernel runs on a Neuron device for shapes it supports; CPU (tests) and
+    NEMOTRONH_MOE_DECODE=torch use the PyTorch path, which computes the same thing."""
+    if os.environ.get("NEMOTRONH_MOE_DECODE", "nki") != "nki":
+        return False
+    from vllm_neuron.utils.neuron_utils import can_run_kernel
+    return can_run_kernel(x) and hidden % 128 == 0 and inter_per_rank % _LNC == 0
+
+
+def _moe_decode_kernel():
+    global _moe_decode_kernel_caller
+    if _moe_decode_kernel_caller is None:
+        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+        from .moe_decode_kernel import moe_relu2_decode
+        _moe_decode_kernel_caller = wrap_nki(moe_relu2_decode)[_LNC]
+    return _moe_decode_kernel_caller
+
+
 # ============================================================
 # RMSNorm (NemotronH: standard RMSNorm, weight * normed, no offset)
 # ============================================================
@@ -491,10 +514,14 @@ class NemotronHMoE(nn.Module):
         else:
             # Decode: read only the K selected experts' weights (the dense form reads all E).
             w, idx = torch.topk(gate, self.k, dim=-1)                       # [T, K]
-            up = torch.index_select(self.up, 0, idx.reshape(-1)).view(*idx.shape, self.d, self.mi_per_rank)
-            down = torch.index_select(self.down, 0, idx.reshape(-1)).view(*idx.shape, self.mi_per_rank, self.d)
-            h = F.relu(torch.einsum('td,tkdi->tki', x, up)).pow(2)           # [T, K, mi_pr]
-            out = torch.einsum('tki,tkid->td', h * w.unsqueeze(-1), down)
+            if _use_moe_decode_kernel(x, self.d, self.mi_per_rank):
+                out = _moe_decode_kernel()(x, self.up, self.down, idx.to(torch.int32),
+                                           w.to(torch.float32)).sum(0).to(x.dtype)
+            else:
+                up = torch.index_select(self.up, 0, idx.reshape(-1)).view(*idx.shape, self.d, self.mi_per_rank)
+                down = torch.index_select(self.down, 0, idx.reshape(-1)).view(*idx.shape, self.mi_per_rank, self.d)
+                h = F.relu(torch.einsum('td,tkdi->tki', x, up)).pow(2)       # [T, K, mi_pr]
+                out = torch.einsum('tki,tkid->td', h * w.unsqueeze(-1), down)
         # shared expert (relu^2), always on
         sh = F.linear(x, self.shared_up)
         sh = F.relu(sh).pow(2)
