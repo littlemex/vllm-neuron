@@ -250,8 +250,8 @@ class NemotronHAttention(nn.Module):
             attn_output = NF.flash_attention(
                 q_flash, k_flash, v_flash, scale=self.scaling, causal_mask=True, tp_q=False, tp_out=True,
             )  # [Nh, Dh, T]
-        attn_output = attn_output.unsqueeze(0)
-        attn_output = NF.o_proj(attn_output, self.o_proj_weight, None).squeeze(0)  # [T, H]
+        # [Nh, Dh, T] -> [T, Nh*Dh] @ [Nh*Dh, H] (EXPERIMENT: plain matmul instead of NF.o_proj)
+        attn_output = attn_output.reshape(-1, tokens).transpose(0, 1) @ self.o_proj_weight  # [T, H]
         if self.world_size > 1:
             # >>> PARALLELISM: SP reduce-scatter (prefill) <<<
             attn_output = self.tp_group.reduce_scatter(attn_output, dim=0)
@@ -316,8 +316,8 @@ class NemotronHAttention(nn.Module):
         attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
         attn_output = torch.matmul(attn_weights, v_f32).to(self.dtype)   # [Nh, S_decode, head_dim]
 
-        attn_output = attn_output.transpose(-2, -1).unsqueeze(0)          # [1, Nh, head_dim, S_decode]
-        attn_output = NF.o_proj(attn_output, self.o_proj_weight, None).squeeze(0)  # [S_decode, H]
+        # [Nh, S_decode, Dh] -> [S_decode, Nh*Dh] @ [Nh*Dh, H] (EXPERIMENT: plain matmul)
+        attn_output = attn_output.transpose(0, 1).reshape(S_decode, -1) @ self.o_proj_weight
         if self.world_size > 1:
             # >>> PARALLELISM: TP all-reduce (decode) <<<
             self.tp_group.all_reduce(attn_output)
