@@ -83,8 +83,9 @@ except (ImportError, NameError):
     _MATVEC_KERNEL = None
 
 
-# Call sites (mamba, attn, shared, lm_head) that keep the plain matmul, e.g. NEMOTRONH_MATVEC_OFF=lm_head.
-_MATVEC_OFF = set(filter(None, os.environ.get("NEMOTRONH_MATVEC_OFF", "").split(",")))
+# Call sites (mamba, attn, shared, lm_head) that keep the plain matmul. Default: the shared expert,
+# measured slower through the kernel on trn2 (decode 9.6 vs 9.0 ms/token) than the compiler's matmul.
+_MATVEC_OFF = set(filter(None, os.environ.get("NEMOTRONH_MATVEC_OFF", "shared").split(",")))
 
 
 def _decode_matmul(x, w, site=""):
