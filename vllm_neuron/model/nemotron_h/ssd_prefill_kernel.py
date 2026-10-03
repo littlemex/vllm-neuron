@@ -111,9 +111,12 @@ def ssd_prefill(x, dt, A, B, C, D, state0, tri):
             nisa.nc_matmul(dst=off_ps, stationary=CT, moving=S[hh])
             ecs = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.activation(dst=ecs, op=nl.exp, data=cs)
+            # (the Vector Engine cannot read both operands from PSUM: stage the intra term in SBUF)
+            yi = nl.ndarray((Q, P), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=yi, src=y_ps)
             yo = nl.ndarray((Q, P), dtype=nl.float32, buffer=nl.sbuf)
             nisa.scalar_tensor_tensor(dst=yo, data=off_ps, op0=nl.multiply, operand0=ecs, op1=nl.add,
-                                      operand1=y_ps)
+                                      operand1=yi)
             Dc = nl.ndarray((Q, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(dst=Dc, src=D.ap(pattern=[[0, Q], [1, 1]], offset=h))
             nisa.scalar_tensor_tensor(dst=yo, data=xs, op0=nl.multiply, operand0=Dc, op1=nl.add,
