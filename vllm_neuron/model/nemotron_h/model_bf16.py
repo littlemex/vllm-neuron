@@ -76,6 +76,25 @@ try:
     _MOE_DECODE_KERNEL = _wrap_nki(_moe_relu2_decode)[_LNC]
 except ImportError:          # environments without the Neuron NKI stack
     _MOE_DECODE_KERNEL = None
+_MATVEC_NKI = os.environ.get("NEMOTRONH_MATVEC", "nki") == "nki"
+try:
+    from .matvec_kernel import matvec as _matvec_nki
+    _MATVEC_KERNEL = _wrap_nki(_matvec_nki)[_LNC]
+except (ImportError, NameError):
+    _MATVEC_KERNEL = None
+
+
+def _decode_matmul(x, w):
+    """x [T, H] @ w [H, N] for a decode step: the NKI matvec kernel on a Neuron device for shapes it
+    supports (H % 128 == 0, N % LNC == 0, T <= 128), plain matmul otherwise (and on CPU)."""
+    if _MATVEC_NKI and _MATVEC_KERNEL is not None and x.dim() == 2 and x.shape[0] <= 128 \
+            and x.shape[1] % 128 == 0 and w.shape[1] % _LNC == 0:
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+        if can_run_kernel(x):
+            return _MATVEC_KERNEL(x.contiguous(), w)
+    return x @ w
+
+
 _MAMBA_DECODE_NKI = os.environ.get("NEMOTRONH_MAMBA_DECODE", "nki") == "nki"
 try:
     from .mamba_decode_kernel import mamba2_decode_step as _mamba2_decode_step
@@ -314,7 +333,11 @@ class NemotronHAttention(nn.Module):
         S_ctx = max_blocks_per_seq * block_size
         nkh = self.num_key_value_heads_per_rank
 
-        q, k, v = self._project_qkv(hidden_states, tokens)
+        qkv = _decode_matmul(hidden_states, self.qkv_proj_weight)
+        q, k, v = torch.tensor_split(qkv, self.qkv_split_indices, dim=-1)
+        q = q.view(tokens, self.num_attention_heads_per_rank, self.head_dim).transpose(0, 1)
+        k = k.view(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(0, 1)
+        v = v.view(tokens, self.num_key_value_heads_per_rank, self.head_dim).transpose(0, 1)
         # <-- MODEL-SPECIFIC: NemotronH attention is NoPE (no rotary) — see the note in _prefill.
         self._write_kv_cache(k, v, slot_mapping, block_size)
 
@@ -342,8 +365,7 @@ class NemotronHAttention(nn.Module):
         attn_output = torch.einsum('hgsc,hcd->hgsd', attn_weights, v_f32).to(self.dtype)
         attn_output = attn_output.reshape(-1, S_decode, self.head_dim)   # [Nh, S_decode, head_dim]
 
-        attn_output = attn_output.transpose(-2, -1).unsqueeze(0)          # [1, Nh, head_dim, S_decode]
-        attn_output = NF.o_proj(attn_output, self.o_proj_weight, None).squeeze(0)  # [S_decode, H]
+        attn_output = _decode_matmul(attn_output.transpose(0, 1).reshape(S_decode, -1), self.o_proj_weight)
         if self.world_size > 1:
             # >>> PARALLELISM: TP all-reduce (decode) <<<
             self.tp_group.all_reduce(attn_output)
@@ -902,7 +924,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 "NemotronH Mamba2 forward_decode supports single-token decode only (speculative / "
                 f"multi-token decode is not implemented for the SSM recurrence). Got T={T}.")
         dtype = hidden_states.dtype
-        proj = self._in_proj(hidden_states)
+        proj = _decode_matmul(hidden_states.reshape(b, -1), self.in_proj_weight).view(b, 1, -1)
         gate, xBC, dt = self._split_proj(proj)
         if self._use_decode_kernel(hidden_states):
             # One NKI kernel for conv + SSM step + gated RMSNorm (see mamba_decode_kernel.py).
@@ -912,7 +934,7 @@ class NemotronHMamba2Mixer(nn.Module):
                 self.D.float(), self.ssm_state, self.norm_weight.float(),
                 torch.eye(128, dtype=torch.float32, device=hidden_states.device),
                 torch.full((1,), self.norm_eps, dtype=torch.float32, device=hidden_states.device))
-            out = y.view(b, 1, -1) @ self.out_proj_weight
+            out = _decode_matmul(y, self.out_proj_weight).view(b, 1, -1)
             if self.world_size > 1:
                 self.tp_group.all_reduce(out)
             self.ssm_state.copy_(state_new)
