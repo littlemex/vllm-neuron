@@ -49,7 +49,7 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
 | TP (tensor parallel) | ✅ | Attention Q-head + Mamba head + MoE expert-intermediate sharding; 30B-A3B needs TP=4 on one trn2 chip |
 | SP (sequence parallel) | ✅ | Prefill SP-scatter at the embedding; Mamba all-gathers to full at the SSM boundary |
 | DP (data parallel) | N/A | Not wired for this backbone yet |
-| EP (expert parallel) | N/A | MoE runs a dense per-expert loop on the local TP shard (fast NF.moe path is future work) |
+| EP (expert parallel) | N/A | MoE runs every expert densely on the local TP shard as two GEMMs over the concatenated experts (fast NF.moe path is future work) |
 | Cross-DP EP | N/A | See EP |
 | Eagle3 spec decode | N/A | Not applicable |
 | FP8 KV cache | N/A | bf16 only today (FP8/NVFP4 is future work; `factory.py` rejects other quantizations) |
@@ -97,10 +97,12 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
   one token; a multi-token verify step would silently process only the first. `forward_decode` raises
   on `T != 1` rather than mis-generating.
 - **Bucket padding is masked out of the SSM/conv state.** Neuron pads a prefill up to a fixed bucket
-  width; attention ignores the pad via `slot_mapping = -1`, and the Mamba path derives the same
-  real/pad mask from `slot_mapping` to zero `dt` on pad positions (identity recurrence steps) and to
-  gather the conv state from the real tail — so the state handed to decode is independent of the
-  padding (pinned by `test_prefill_pad_invariance`).
+  width and points the padding tokens' KV writes at a slot no request owns (`PAD_SLOT_ID = -1`, or the
+  reserved null block 0). The Mamba path treats a token as real exactly when its slot is in an
+  allocated block (`slot_mapping >= block_size`), zeroes `dt` on the padding (identity recurrence
+  steps) and gathers the conv state from the real tail, so the state handed to decode is independent
+  of the padding (pinned by `test_prefill_pad_invariance` and, for both padding conventions, by
+  `test_decode_after_prefill_matches_single_shot`).
 - **Precision.** bf16 only (FP8/NVFP4 is future work).
 - **Layer types.** Only the `M` (Mamba2), `E` (MoE), and `*` (Attention) `hybrid_override_pattern`
   entries are implemented. Plain-MLP layers (`-`) are not supported and raise at construction; the
@@ -151,10 +153,17 @@ License; review and comply with it before redistributing weights or a derived ch
 
 ## Verification
 
-On trn2.3xlarge + EFA at TP=4 (real `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` weights), greedy
-generation matches the HF reference: "The capital of France is" → " Paris" (first token matches the
-HF CPU reference exactly); "2 + 2 =" → " 2 + 2 = 4"; "日本の首都は" → "東京…".
+On trn2.3xlarge at TP=4 (real `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` weights, `max_model_len
+8192`, `--max-num-batched-tokens 512`), compared with the same checkpoint on vLLM GPU (bf16, TP=2):
 
+| Check | GPU | Trainium |
+|---|---|---|
+| Greedy probes (facts, two-step arithmetic, ordering, chat, and multi-fact questions over 1k / 4k / 7k-token contexts) | 12/12 | 12/12, same text |
+| gsm8k 5-shot, first 250 test questions, strict-match | 217/250 (86.8%) | 215/250 (86.0%) |
+
+On the 250 gsm8k questions the two backends disagree on 16 (9 solved only on GPU, 7 only on Trainium; exact McNemar p = 0.80).
+
+## Module Structure
 ## Module Structure
 
 ```text
@@ -172,17 +181,23 @@ vllm_neuron/model/nemotron_h/
 
 ```text
 test/vllm_neuron/model/nemotron_h/bf16/
-└── test_nemotron_h_kernels.py   # CPU equivalence tests (no Neuron device / no checkpoint):
-                                  #  - chunked SSD == sequential recurrence (chunk boundaries, long
-                                  #    sequences, small chunks, prefix state) + fp32 stress
-                                  #  - segmented/continuation prefill == single-shot (SSM + conv1d
-                                  #    carry, first-segment mask); bucket-padding does not change the
-                                  #    state (pad-invariance) + negative tests (missing mask diverges)
-                                  #  - mask-before-exp is required to avoid inf*0 = NaN
-                                  #  - gated RMSNorm and DGE-free MoE gate match the ACTUAL HF
-                                  #    reference (MambaRMSNormGated / NemotronHTopkRouter), not a
-                                  #    self-authored oracle
+├── test_nemotron_h_kernels.py   # CPU equivalence tests (no Neuron device / no checkpoint):
+│                                #  - chunked SSD == sequential recurrence (chunk boundaries, long
+│                                #    sequences, small chunks, prefix state) + fp32 stress
+│                                #  - segmented/continuation prefill == single-shot (SSM + conv1d
+│                                #    carry, first-segment mask); bucket-padding does not change the
+│                                #    state (pad-invariance) + negative tests (missing mask diverges)
+│                                #  - mask-before-exp is required to avoid inf*0 = NaN
+│                                #  - gated RMSNorm and DGE-free MoE gate match the ACTUAL HF
+│                                #    reference (MambaRMSNormGated / NemotronHTopkRouter)
+└── test_nemotron_h_tp.py        # the real model on CPU ranks over gloo, from a tiny random
+                                 # checkpoint loaded through load_weights:
+                                 #  - prefill at TP=2 and TP=4 == TP=1 (sharding + SP collectives)
+                                 #  - prefill (unpadded, or padded with PAD_SLOT_ID or the null block)
+                                 #    + one decode step == single-shot prefill, at TP=1 and TP=4
+                                 #  - the two-GEMM MoE == the per-expert sum over the checkpoint
 ```
 
-Run with `pytest test/vllm_neuron/model/nemotron_h/bf16/`. Full-model / HF-parity correctness is
-covered by the on-device verification above.
+Run with `pytest test/vllm_neuron/model/nemotron_h/bf16/`. `test_nemotron_h_tp.py` needs the
+plugin's Python dependencies (it skips without them) but no Neuron device. The on-device numerics
+(NKI kernels, compiled graphs) are covered by the verification above.

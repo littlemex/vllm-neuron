@@ -14,8 +14,8 @@ vLLM-Neuron plugin patterns:
     window, and NoPE (no rotary embedding; position information is carried by the Mamba2 layers).
   - MoE: DeepSeek-style grouped top-k routing (sigmoid + e_score_correction_bias + group select +
     norm + routed_scaling_factor), 128 routed experts top-6 + 1 shared, relu^2 activation
-    (from modeling_nemotron_h.py NemotronHMoE.route_tokens_to_experts). Correctness-first
-    per-expert loop; NF.moe_cte fast path is a later optimization.
+    (from modeling_nemotron_h.py NemotronHMoE.route_tokens_to_experts). All experts run
+    densely as two GEMMs over the concatenated experts; NF.moe_cte fast path is a later optimization.
   - Mamba2: chunked-SSD prefill (default; O(l*C), long sequences) + 1-step-recurrence decode, with
     carried across decode steps via in-place module buffers that the plugin's
     AliasingOutputRewritePass turns into HLO input_output_alias (batch=1). No runner-side state pool.
@@ -344,7 +344,7 @@ class NemotronHMoE(nn.Module):
     Routing (modeling_nemotron_h.py:781): sigmoid(logits) → + e_score_correction_bias →
     group-topk select (n_group / topk_group) → top-k → norm_topk_prob → × routed_scaling_factor.
     TP: experts' intermediate dim is sharded across ranks (each rank holds full expert set but
-    intermediate/world_size wide); shared expert likewise. Correctness-first per-expert loop.
+    intermediate/world_size wide); shared expert likewise. Dense two-GEMM dispatch over all experts.
 
     >>> PARALLELISM: TP (expert-intermediate sharding) <<<
     <-- MODEL-SPECIFIC: DeepSeek-style grouped top-k router, DGE-free dense gate, relu^2 experts
