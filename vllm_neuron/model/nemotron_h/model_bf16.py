@@ -61,6 +61,9 @@ logger = logging.getLogger(__name__)
 # (config.json `chunk_size` = 128). Overridable per-run via NEMOTRONH_CHUNK (experiments only).
 _DEFAULT_MAMBA_CHUNK = 128
 
+# Experts per batched GEMM in the dense MoE prefill (see NemotronHMoE.forward).
+_MOE_PREFILL_EXPERT_GROUP = int(os.environ.get("NEMOTRONH_MOE_GROUP", "16"))
+
 
 # ============================================================
 # RMSNorm (NemotronH: standard RMSNorm, weight * normed, no offset)
@@ -475,9 +478,16 @@ class NemotronHMoE(nn.Module):
         # data-dependent control flow (fast NF.moe path is future work).
         gate = self._gate_dense(x)                      # [T, E], weight in each selected column
         if is_prefill:
-            # Every expert over every token as one batched GEMM over E (no per-expert unroll).
-            h = F.relu(torch.einsum('td,edi->tei', x, self.up)).pow(2)      # [T, E, mi_pr]
-            out = torch.einsum('tei,eid->td', h * gate.unsqueeze(-1), self.down)
+            # Every expert over every token, as batched GEMMs over groups of experts. One group of all
+            # E would make the [T, E, mi_pr] intermediate (60 MB for a 512-token segment) spill out of
+            # SBUF; a group of _MOE_PREFILL_EXPERT_GROUP keeps it on chip.
+            out = None
+            g = min(_MOE_PREFILL_EXPERT_GROUP, self.E)
+            for e0 in range(0, self.E, g):
+                up, down = self.up[e0:e0 + g], self.down[e0:e0 + g]
+                h = F.relu(torch.einsum('td,edi->tei', x, up)).pow(2) * gate[:, e0:e0 + g].unsqueeze(-1)
+                part = torch.einsum('tei,eid->td', h, down)
+                out = part if out is None else out + part
         else:
             # Decode: read only the K selected experts' weights (the dense form reads all E).
             w, idx = torch.topk(gate, self.k, dim=-1)                       # [T, K]

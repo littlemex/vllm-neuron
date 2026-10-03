@@ -274,12 +274,13 @@ def test_prefill_tp_matches_tp1(world_size):
             torch.testing.assert_close(s_got, s_ref[:, :h_pr], rtol=1e-4, atol=1e-4)
 
 
-@pytest.mark.parametrize("is_prefill", [True, False])
-def test_moe_matches_per_expert_reference(is_prefill):
+@pytest.mark.parametrize("is_prefill,expert_group", [(True, 16), (True, 3), (False, 16)])
+def test_moe_matches_per_expert_reference(is_prefill, expert_group, monkeypatch):
     """The concatenated two-GEMM MoE equals the per-expert sum over the checkpoint's own expert
     tensors: sum_e gate[:, e] * down_e(relu(up_e(x))^2) + shared(x). Guards the expert-major layout
     of the up/down loaders (an expert/column mix-up would still run and stay fluent)."""
     from safetensors.torch import load_file
+    monkeypatch.setattr(nh, "_MOE_PREFILL_EXPERT_GROUP", expert_group)   # 3 does not divide E=8
     cfg = dict(TINY, num_hidden_layers=1, hybrid_override_pattern="E")
     with tempfile.TemporaryDirectory() as tmp:
         _write_checkpoint(tmp, cfg)
