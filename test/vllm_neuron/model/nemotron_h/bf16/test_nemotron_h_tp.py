@@ -274,7 +274,8 @@ def test_prefill_tp_matches_tp1(world_size):
             torch.testing.assert_close(s_got, s_ref[:, :h_pr], rtol=1e-4, atol=1e-4)
 
 
-def test_moe_matches_per_expert_reference():
+@pytest.mark.parametrize("is_prefill", [True, False])
+def test_moe_matches_per_expert_reference(is_prefill):
     """The concatenated two-GEMM MoE equals the per-expert sum over the checkpoint's own expert
     tensors: sum_e gate[:, e] * down_e(relu(up_e(x))^2) + shared(x). Guards the expert-major layout
     of the up/down loaders (an expert/column mix-up would still run and stay fluent)."""
@@ -290,7 +291,7 @@ def test_moe_matches_per_expert_reference():
             w = load_file(os.path.join(tmp, "model.safetensors"))
             x = torch.randn(SEQ_LEN, cfg["hidden_size"], generator=torch.Generator().manual_seed(3))
             with torch.no_grad():
-                got = moe(x)
+                got = moe(x, is_prefill=is_prefill)
                 gate = moe._gate_dense(x)
                 p = "backbone.layers.0.mixer"
                 ref = torch.zeros_like(x)

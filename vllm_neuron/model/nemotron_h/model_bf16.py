@@ -396,11 +396,11 @@ class NemotronHMoE(nn.Module):
         self.gate_weight = nn.Parameter(torch.empty(self.E, self.d, dtype=torch.float32))
         self.e_score_correction_bias = nn.Parameter(torch.zeros(self.E, dtype=torch.float32))
 
-        # Routed experts, stored concatenated along the intermediate axis so the whole expert set is
-        # two GEMMs: up [d, E*mi_per_rank] (expert e owns columns e*mi:(e+1)*mi), down
-        # [E*mi_per_rank, d] (same row blocks). relu^2, no gate projection.
-        self.up = nn.Parameter(torch.empty(self.d, self.E * self.mi_per_rank, dtype=self.dtype))
-        self.down = nn.Parameter(torch.empty(self.E * self.mi_per_rank, self.d, dtype=self.dtype))
+        # Routed experts, expert-major: up [E, d, mi_per_rank], down [E, mi_per_rank, d]. relu^2, no
+        # gate projection. Prefill runs every expert as one batched GEMM over E; decode reads only the
+        # selected experts' slices.
+        self.up = nn.Parameter(torch.empty(self.E, self.d, self.mi_per_rank, dtype=self.dtype))
+        self.down = nn.Parameter(torch.empty(self.E, self.mi_per_rank, self.d, dtype=self.dtype))
         # Shared expert (relu^2).
         self.shared_up = nn.Parameter(torch.empty(self.smi_per_rank, self.d, dtype=self.dtype).normal_(0, 0.02))
         self.shared_down = nn.Parameter(torch.empty(self.d, self.smi_per_rank, dtype=self.dtype).normal_(0, 0.02))
@@ -416,16 +416,16 @@ class NemotronHMoE(nn.Module):
         set_weight_loader(self.e_score_correction_bias, SafetensorsWeightLoader(transform=lambda s, r: s[0][:]))
 
         # The mappings feed the E per-expert source keys in expert order; each transform takes this
-        # rank's mi slice of every expert and concatenates them expert-major.
+        # rank's mi slice of every expert and stacks them expert-major.
         def _up_transform(slices, rank):
             lr = rank % ws
-            # HF experts.{e}.up_proj.weight is [mi, d] -> rows lr*mi_pr:(lr+1)*mi_pr, then [d, E*mi_pr].
-            return torch.cat([sl[lr * mi_pr:(lr + 1) * mi_pr, :] for sl in slices], dim=0).T.contiguous()
+            # HF experts.{e}.up_proj.weight is [mi, d] -> rows lr*mi_pr:(lr+1)*mi_pr -> [E, d, mi_pr].
+            return torch.stack([sl[lr * mi_pr:(lr + 1) * mi_pr, :].T for sl in slices], dim=0).contiguous()
 
         def _down_transform(slices, rank):
             lr = rank % ws
-            # HF experts.{e}.down_proj.weight is [d, mi] -> cols lr*mi_pr:(lr+1)*mi_pr, then [E*mi_pr, d].
-            return torch.cat([sl[:, lr * mi_pr:(lr + 1) * mi_pr] for sl in slices], dim=1).T.contiguous()
+            # HF experts.{e}.down_proj.weight is [d, mi] -> cols lr*mi_pr:(lr+1)*mi_pr -> [E, mi_pr, d].
+            return torch.stack([sl[:, lr * mi_pr:(lr + 1) * mi_pr].T for sl in slices], dim=0).contiguous()
 
         set_weight_loader(self.up, SafetensorsWeightLoader(transform=_up_transform))
         set_weight_loader(self.down, SafetensorsWeightLoader(transform=_down_transform))
@@ -479,9 +479,17 @@ class NemotronHMoE(nn.Module):
         # which made the 512-token prefill graph take hours in neuronx-cc. Static shapes, no
         # data-dependent control flow (fast NF.moe path is future work).
         gate = self._gate_dense(x)                      # [T, E], weight in each selected column
-        h = F.relu(x @ self.up).pow(2)                  # [T, E*mi_per_rank]
-        h = h * gate.repeat_interleave(self.mi_per_rank, dim=1)
-        out = h @ self.down                             # [T, d]
+        if is_prefill:
+            # Every expert over every token as one batched GEMM over E (no per-expert unroll).
+            h = F.relu(torch.einsum('td,edi->tei', x, self.up)).pow(2)      # [T, E, mi_pr]
+            out = torch.einsum('tei,eid->td', h * gate.unsqueeze(-1), self.down)
+        else:
+            # Decode: read only the K selected experts' weights (the dense form reads all E).
+            w, idx = torch.topk(gate, self.k, dim=-1)                       # [T, K]
+            up = torch.index_select(self.up, 0, idx.reshape(-1)).view(*idx.shape, self.d, self.mi_per_rank)
+            down = torch.index_select(self.down, 0, idx.reshape(-1)).view(*idx.shape, self.mi_per_rank, self.d)
+            h = F.relu(torch.einsum('td,tkdi->tki', x, up)).pow(2)           # [T, K, mi_pr]
+            out = torch.einsum('tki,tkid->td', h * w.unsqueeze(-1), down)
         # shared expert (relu^2), always on
         sh = F.linear(x, self.shared_up)
         sh = F.relu(sh).pow(2)
