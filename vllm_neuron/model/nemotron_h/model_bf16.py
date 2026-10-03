@@ -61,6 +61,10 @@ logger = logging.getLogger(__name__)
 # (config.json `chunk_size` = 128). Overridable per-run via NEMOTRONH_CHUNK (experiments only).
 _DEFAULT_MAMBA_CHUNK = 128
 
+# DIAGNOSTIC ONLY: comma-separated decode components to skip, to measure their cost on device
+# (moe_routed, mamba, attn). Never set in serving.
+_DIAG = set(filter(None, os.environ.get("NEMOTRONH_DIAG", "").split(",")))
+
 # Experts per batched GEMM in the dense MoE prefill (see NemotronHMoE.forward).
 _MOE_PREFILL_EXPERT_GROUP = int(os.environ.get("NEMOTRONH_MOE_GROUP", "16"))
 
@@ -488,6 +492,8 @@ class NemotronHMoE(nn.Module):
                 h = F.relu(torch.einsum('td,edi->tei', x, up)).pow(2) * gate[:, e0:e0 + g].unsqueeze(-1)
                 part = torch.einsum('tei,eid->td', h, down)
                 out = part if out is None else out + part
+        elif "moe_routed" in _DIAG:
+            out = torch.zeros_like(x)
         else:
             # Decode: read only the K selected experts' weights (the dense form reads all E).
             w, idx = torch.topk(gate, self.k, dim=-1)                       # [T, K]
@@ -1003,6 +1009,8 @@ class NemotronHModel(nn.Module):
         for i, layer in enumerate(self.layers):
             if layer.layer_type == ATTENTION:
                 normed = layer.norm(hidden_states).to(DT)
+                if "attn" in _DIAG and not is_prefill:
+                    continue
                 hidden_states = hidden_states + layer.mixer(normed, positions, attn_metadata).to(torch.float32)
             elif layer.layer_type == MOE:
                 normed = layer.norm(hidden_states).to(DT)
@@ -1017,6 +1025,8 @@ class NemotronHModel(nn.Module):
                 if is_prefill:
                     out = layer.mixer.forward_prefill(h_b, cached_seq_len=seg_cached_len,
                                                       valid_mask=valid_mask)
+                elif "mamba" in _DIAG:
+                    out = torch.zeros_like(h_b)
                 else:
                     out = layer.mixer.forward_decode(h_b)
                 out = out.squeeze(0)
