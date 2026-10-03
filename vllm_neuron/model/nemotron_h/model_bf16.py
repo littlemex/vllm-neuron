@@ -294,27 +294,22 @@ class NemotronHAttention(nn.Module):
                    .permute(0, 2, 1, 3, 4).reshape(B_local, nkh, S_ctx, self.head_dim))
         v_dense = (v_gathered.view(B_local, max_blocks_per_seq, nkh, block_size, self.head_dim)
                    .permute(0, 2, 1, 3, 4).reshape(B_local, nkh, S_ctx, self.head_dim))
-        if B_local == 1:
-            k_full = k_dense.squeeze(0).to(self.dtype)
-            v_full = v_dense.squeeze(0).to(self.dtype)
-        else:
-            k_full = k_dense.reshape(B_local * nkh, S_ctx, self.head_dim).to(self.dtype)
-            v_full = v_dense.reshape(B_local * nkh, S_ctx, self.head_dim).to(self.dtype)
-        k_full = k_full.repeat_interleave(self.num_key_value_groups, dim=0)
-        v_full = v_full.repeat_interleave(self.num_key_value_groups, dim=0)
-
-        q_f32 = q.to(torch.float32)
-        k_f32 = k_full.to(torch.float32)
-        v_f32 = v_full.to(torch.float32)
-        scores = torch.matmul(q_f32, k_f32.transpose(-2, -1)) * self.scaling
+        # GQA without materialising the repeated KV: group the query heads under their KV head
+        # ([nkh, groups, S_decode, Dh]) and contract against the nkh-head cache directly. Each KV head
+        # is read (and upcast) once instead of `groups` times. fp32 math as before.
+        k_f32 = k_dense.reshape(B_local * nkh, S_ctx, self.head_dim).to(torch.float32)
+        v_f32 = v_dense.reshape(B_local * nkh, S_ctx, self.head_dim).to(torch.float32)
+        q_f32 = q.to(torch.float32).view(nkh, self.num_key_value_groups, S_decode, self.head_dim)
+        scores = torch.einsum('hgsd,hcd->hgsc', q_f32, k_f32) * self.scaling
         arange_ctx = torch.arange(S_ctx, device=q.device)
         # Per-query causal mask: each of the S_decode query rows attends only up to its own absolute
         # position. (Masking with positions[-1] alone would let earlier decode-bucket rows attend to
         # future keys; identical to the single-value mask when S_decode == 1.)
         valid = arange_ctx.view(1, -1) <= positions.view(-1, 1)     # [S_decode, S_ctx]
-        scores = scores.masked_fill(~valid.unsqueeze(0), float("-inf"))
+        scores = scores.masked_fill(~valid.view(1, 1, S_decode, S_ctx), float("-inf"))
         attn_weights = F.softmax(scores, dim=-1, dtype=torch.float32)
-        attn_output = torch.matmul(attn_weights, v_f32).to(self.dtype)   # [Nh, S_decode, head_dim]
+        attn_output = torch.einsum('hgsc,hcd->hgsd', attn_weights, v_f32).to(self.dtype)
+        attn_output = attn_output.reshape(-1, S_decode, self.head_dim)   # [Nh, S_decode, head_dim]
 
         attn_output = attn_output.transpose(-2, -1).unsqueeze(0)          # [1, Nh, head_dim, S_decode]
         attn_output = NF.o_proj(attn_output, self.o_proj_weight, None).squeeze(0)  # [S_decode, H]
