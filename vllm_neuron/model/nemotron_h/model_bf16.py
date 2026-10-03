@@ -67,25 +67,24 @@ _MOE_PREFILL_EXPERT_GROUP = int(os.environ.get("NEMOTRONH_MOE_GROUP", "16"))
 
 # Logical-core size of trn2 (two physical cores); the MoE decode kernel splits its work across them.
 _LNC = 2
-_moe_decode_kernel_caller = None
+# NEMOTRONH_MOE_DECODE=torch selects the PyTorch decode path (same math). Resolved once at import: a
+# value that changes between tracing and execution would trip the runner's fail_on_recompile guard.
+_MOE_DECODE_NKI = os.environ.get("NEMOTRONH_MOE_DECODE", "nki") == "nki"
+try:
+    from libtorch_neuronx_lite.nki.nki_hop import wrap_nki as _wrap_nki
+    from .moe_decode_kernel import moe_relu2_decode as _moe_relu2_decode
+    _MOE_DECODE_KERNEL = _wrap_nki(_moe_relu2_decode)[_LNC]
+except ImportError:          # environments without the Neuron NKI stack
+    _MOE_DECODE_KERNEL = None
 
 
 def _use_moe_decode_kernel(x, hidden, inter_per_rank):
-    """The NKI MoE decode kernel runs on a Neuron device for shapes it supports; CPU (tests) and
-    NEMOTRONH_MOE_DECODE=torch use the PyTorch path, which computes the same thing."""
-    if os.environ.get("NEMOTRONH_MOE_DECODE", "nki") != "nki":
+    """The NKI MoE decode kernel runs on a Neuron device for shapes it supports; CPU (tests) uses the
+    PyTorch path, which computes the same thing."""
+    if not _MOE_DECODE_NKI or _MOE_DECODE_KERNEL is None:
         return False
     from vllm_neuron.utils.neuron_utils import can_run_kernel
     return can_run_kernel(x) and hidden % 128 == 0 and inter_per_rank % _LNC == 0
-
-
-def _moe_decode_kernel():
-    global _moe_decode_kernel_caller
-    if _moe_decode_kernel_caller is None:
-        from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-        from .moe_decode_kernel import moe_relu2_decode
-        _moe_decode_kernel_caller = wrap_nki(moe_relu2_decode)[_LNC]
-    return _moe_decode_kernel_caller
 
 
 # ============================================================
@@ -515,8 +514,8 @@ class NemotronHMoE(nn.Module):
             # Decode: read only the K selected experts' weights (the dense form reads all E).
             w, idx = torch.topk(gate, self.k, dim=-1)                       # [T, K]
             if _use_moe_decode_kernel(x, self.d, self.mi_per_rank):
-                out = _moe_decode_kernel()(x, self.up, self.down, idx.to(torch.int32),
-                                           w.to(torch.float32)).sum(0).to(x.dtype)
+                out = _MOE_DECODE_KERNEL(x, self.up, self.down, idx.to(torch.int32),
+                                         w.to(torch.float32)).sum(0).to(x.dtype)
             else:
                 up = torch.index_select(self.up, 0, idx.reshape(-1)).view(*idx.shape, self.d, self.mi_per_rank)
                 down = torch.index_select(self.down, 0, idx.reshape(-1)).view(*idx.shape, self.mi_per_rank, self.d)
