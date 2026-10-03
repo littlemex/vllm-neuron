@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAMBA_CHUNK = 128
 
 # DIAGNOSTIC ONLY: comma-separated components to skip, to measure their cost on device
-# (prefill: p_moe, p_mamba, p_ssd, p_attn). Never set in serving.
+# (prefill: p_moe, p_mamba, p_ssd, p_attn; decode: m_ssm, m_conv). Never set in serving.
 _DIAG = set(filter(None, os.environ.get("NEMOTRONH_DIAG", "").split(",")))
 
 # Experts per batched GEMM in the dense MoE prefill (see NemotronHMoE.forward).
@@ -898,11 +898,14 @@ class NemotronHMamba2Mixer(nn.Module):
         gate, xBC, dt = self._split_proj(proj)
         xBC = xBC[:, 0]
         conv_in = torch.cat([self.conv_state, xBC[..., None]], dim=-1)   # [b, conv_dim_pr, K]
-        w = self.conv1d_weight[:, 0, :]
-        conv_o = (conv_in * w[None]).sum(-1)
-        if self.conv1d_bias is not None:
-            conv_o = conv_o + self.conv1d_bias
-        xBC_new = self.act(conv_o)
+        if "m_conv" in _DIAG:
+            xBC_new = self.act(xBC)
+        else:
+            w = self.conv1d_weight[:, 0, :]
+            conv_o = (conv_in * w[None]).sum(-1)
+            if self.conv1d_bias is not None:
+                conv_o = conv_o + self.conv1d_bias
+            xBC_new = self.act(conv_o)
         conv_state_new = conv_in[..., 1:]
         gn = self.groups_pr * self.ssm_state_size
         im = self.im_pr
@@ -915,10 +918,14 @@ class NemotronHMamba2Mixer(nn.Module):
         x = x.reshape(b, H, P).float()
         B = B.reshape(b, G, N).float().repeat_interleave(rep, dim=1)
         C = C.reshape(b, G, N).float().repeat_interleave(rep, dim=1)
-        dA = torch.exp(dtv.float() * A)
-        dBx = (dtv.float()[..., None, None] * B[:, :, None, :]) * x[..., None]
-        h = self.ssm_state.float() * dA[..., None, None] + dBx
-        y = (h * C[:, :, None, :]).sum(dim=-1) + x * self.D[..., None]
+        if "m_ssm" in _DIAG:
+            h = self.ssm_state.float()
+            y = x * self.D[..., None]
+        else:
+            dA = torch.exp(dtv.float() * A)
+            dBx = (dtv.float()[..., None, None] * B[:, :, None, :]) * x[..., None]
+            h = self.ssm_state.float() * dA[..., None, None] + dBx
+            y = (h * C[:, :, None, :]).sum(dim=-1) + x * self.D[..., None]
         y = y.reshape(b, 1, -1)
         out = self._gated_rmsnorm(y, gate).to(dtype) @ self.out_proj_weight
         if self.world_size > 1:
