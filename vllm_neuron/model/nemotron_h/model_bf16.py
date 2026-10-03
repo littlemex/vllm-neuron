@@ -94,6 +94,12 @@ def _decode_matmul(x, w):
     return x @ w
 
 
+_SSD_PREFILL_NKI = os.environ.get("NEMOTRONH_SSD_PREFILL", "nki") == "nki"
+try:
+    from .ssd_prefill_kernel import ssd_prefill as _ssd_prefill_nki
+    _SSD_PREFILL_KERNEL = _wrap_nki(_ssd_prefill_nki)[_LNC]
+except (ImportError, NameError):
+    _SSD_PREFILL_KERNEL = None
 _MAMBA_DECODE_NKI = os.environ.get("NEMOTRONH_MAMBA_DECODE", "nki") == "nki"
 try:
     from .mamba_decode_kernel import mamba2_decode_step as _mamba2_decode_step
@@ -820,6 +826,16 @@ class NemotronHMamba2Mixer(nn.Module):
         H, P, N, G = self.num_heads_pr, self.head_dim, self.ssm_state_size, self.groups_pr
         rep = H // G
         x = x.reshape(b, seq_len, H, P).float()
+        if self._use_ssd_prefill_kernel(x, seq_len):
+            # NKI chunked-SSD kernel (same math as chunked_ssd_scan; one SSM group per core).
+            s0 = (torch.zeros(H, P, N, dtype=torch.float32, device=x.device) if ssm_state0 is None
+                  else ssm_state0[0].float())
+            yk, hk = _SSD_PREFILL_KERNEL(
+                x[0].contiguous(), dt[0].float().contiguous(), A, B.reshape(seq_len, G, N).float(),
+                C.reshape(seq_len, G, N).float(), self.D.float(), s0,
+                torch.triu(torch.ones(128, 128, dtype=torch.float32, device=x.device)))
+            y, h = yk[None], hk[None]
+            return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state)
         B = B.reshape(b, seq_len, G, N).float().repeat_interleave(rep, dim=2)
         C = C.reshape(b, seq_len, G, N).float().repeat_interleave(rep, dim=2)
         if os.environ.get("NEMOTRONH_MAMBA_STUB") == "1":
@@ -891,6 +907,10 @@ class NemotronHMamba2Mixer(nn.Module):
             cs = int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK)))
             s0 = ssm_state0.float() if ssm_state0 is not None else None
             y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
+        return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state)
+
+    def _prefill_finish(self, y, gate, dtype, b, seq_len, h, conv_state):
+        """Gated RMSNorm + out_proj, and persist the SSM / conv state, after the prefill scan."""
         y = y.reshape(b, seq_len, -1)
         # >>> PARALLELISM: `out` is this rank's partial sum over its heads. It is NOT reduced here:
         # the caller's reduce_scatter (NemotronHModel.forward) is the one reduction, and also returns
@@ -902,6 +922,16 @@ class NemotronHMamba2Mixer(nn.Module):
         self.ssm_state.copy_(h)
         self.conv_state.copy_(conv_state.to(self.conv_state.dtype))
         return out
+
+    def _use_ssd_prefill_kernel(self, x, seq_len):
+        """The NKI SSD prefill kernel: one SSM group per physical core, 128-token chunks, state 128.
+        CPU (tests), other shapes and NEMOTRONH_SSD_PREFILL=torch use chunked_ssd_scan."""
+        if not _SSD_PREFILL_NKI or _SSD_PREFILL_KERNEL is None:
+            return False
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+        return (can_run_kernel(x) and x.shape[0] == 1 and seq_len % 128 == 0
+                and self.ssm_state_size == 128 and self.groups_pr == _LNC
+                and int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK))) == 128)
 
     def _use_decode_kernel(self, x):
         """The NKI decode-step kernel assigns one SSM group to each physical core, two 64-wide heads
