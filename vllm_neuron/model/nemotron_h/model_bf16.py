@@ -61,6 +61,10 @@ logger = logging.getLogger(__name__)
 # (config.json `chunk_size` = 128). Overridable per-run via NEMOTRONH_CHUNK (experiments only).
 _DEFAULT_MAMBA_CHUNK = 128
 
+# DIAGNOSTIC ONLY: comma-separated components to skip, to measure their cost on device
+# (prefill: p_moe, p_mamba, p_ssd, p_attn). Never set in serving.
+_DIAG = set(filter(None, os.environ.get("NEMOTRONH_DIAG", "").split(",")))
+
 # Experts per batched GEMM in the dense MoE prefill (see NemotronHMoE.forward).
 _MOE_PREFILL_EXPERT_GROUP = int(os.environ.get("NEMOTRONH_MOE_GROUP", "16"))
 
@@ -499,7 +503,9 @@ class NemotronHMoE(nn.Module):
         # which made the 512-token prefill graph take hours in neuronx-cc. Static shapes, no
         # data-dependent control flow (fast NF.moe path is future work).
         gate = self._gate_dense(x)                      # [T, E], weight in each selected column
-        if is_prefill:
+        if is_prefill and "p_moe" in _DIAG:
+            out = torch.zeros_like(x)
+        elif is_prefill:
             # Every expert over every token, as batched GEMMs over groups of experts. One group of all
             # E would make the [T, E, mi_pr] intermediate (60 MB for a 512-token segment) spill out of
             # SBUF; a group of _MOE_PREFILL_EXPERT_GROUP keeps it on chip.
@@ -861,7 +867,11 @@ class NemotronHMamba2Mixer(nn.Module):
             # overridable for experiments; a bad (non-int) value raises here rather than mis-shaping.
             cs = int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK)))
             s0 = ssm_state0.float() if ssm_state0 is not None else None
-            y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
+            if "p_ssd" in _DIAG:
+                y = x * self.D[..., None]
+                h = torch.zeros(b, H, P, N, dtype=torch.float32, device=x.device)
+            else:
+                y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
         y = y.reshape(b, seq_len, -1)
         # >>> PARALLELISM: `out` is this rank's partial sum over its heads. It is NOT reduced here:
         # the caller's reduce_scatter (NemotronHModel.forward) is the one reduction, and also returns
@@ -1029,6 +1039,8 @@ class NemotronHModel(nn.Module):
         for i, layer in enumerate(self.layers):
             if layer.layer_type == ATTENTION:
                 normed = layer.norm(hidden_states).to(DT)
+                if "p_attn" in _DIAG and is_prefill:
+                    continue
                 hidden_states = hidden_states + layer.mixer(normed, positions, attn_metadata).to(torch.float32)
             elif layer.layer_type == MOE:
                 normed = layer.norm(hidden_states).to(DT)
@@ -1040,7 +1052,9 @@ class NemotronHModel(nn.Module):
                     h_norm = self.tp_group.all_gather(h_norm, dim=0)
                 # [T, H] -> [1, T, H] (batch=1 bring-up)
                 h_b = h_norm.unsqueeze(0)
-                if is_prefill:
+                if is_prefill and "p_mamba" in _DIAG:
+                    out = torch.zeros_like(h_b)
+                elif is_prefill:
                     out = layer.mixer.forward_prefill(h_b, cached_seq_len=seg_cached_len,
                                                       valid_mask=valid_mask)
                 else:
