@@ -24,7 +24,7 @@ BF16 = ml_dtypes.bfloat16
 
 
 @pytest.mark.parametrize("T,H,N", [(1, 2688, 2576), (1, 1024, 2688), (1, 2688, 1280), (1, 2688, 928),
-                                   (1, 896, 2688), (2, 2688, 2576)])
+                                   (1, 928, 2688), (2, 2688, 2576), (1, 2688, 32768)])
 def test_matvec_matches_numpy(T, H, N):
     rng = np.random.default_rng(0)
     x = rng.standard_normal((T, H)).astype(BF16)

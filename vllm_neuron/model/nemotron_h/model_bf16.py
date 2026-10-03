@@ -45,7 +45,6 @@ from vllm.distributed.parallel_state import get_tp_group
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 import vllm_neuron.functional as NF
-from vllm_neuron.nn import ColumnParallelLinear
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.utils.weight_loader import (
     sharding_weight_loader,
@@ -86,9 +85,9 @@ except (ImportError, NameError):
 
 def _decode_matmul(x, w):
     """x [T, H] @ w [H, N] for a decode step: the NKI matvec kernel on a Neuron device for shapes it
-    supports (H % 128 == 0, N % LNC == 0, T <= 128), plain matmul otherwise (and on CPU)."""
+    supports (N % LNC == 0, T <= 128), plain matmul otherwise (and on CPU)."""
     if _MATVEC_NKI and _MATVEC_KERNEL is not None and x.dim() == 2 and x.shape[0] <= 128 \
-            and x.shape[1] % 128 == 0 and w.shape[1] % _LNC == 0:
+            and w.shape[1] % _LNC == 0:
         from vllm_neuron.utils.neuron_utils import can_run_kernel
         if can_run_kernel(x):
             return _MATVEC_KERNEL(x.contiguous(), w)
@@ -449,9 +448,9 @@ class NemotronHMoE(nn.Module):
         # selected experts' slices.
         self.up = nn.Parameter(torch.empty(self.E, self.d, self.mi_per_rank, dtype=self.dtype))
         self.down = nn.Parameter(torch.empty(self.E, self.mi_per_rank, self.d, dtype=self.dtype))
-        # Shared expert (relu^2).
-        self.shared_up = nn.Parameter(torch.empty(self.smi_per_rank, self.d, dtype=self.dtype).normal_(0, 0.02))
-        self.shared_down = nn.Parameter(torch.empty(self.d, self.smi_per_rank, dtype=self.dtype).normal_(0, 0.02))
+        # Shared expert (relu^2), stored input-major for x @ W: up [d, smi_pr], down [smi_pr, d].
+        self.shared_up = nn.Parameter(torch.empty(self.d, self.smi_per_rank, dtype=self.dtype))
+        self.shared_down = nn.Parameter(torch.empty(self.smi_per_rank, self.d, dtype=self.dtype))
         self._setup_weight_loaders()
 
     def _setup_weight_loaders(self):
@@ -480,11 +479,13 @@ class NemotronHMoE(nn.Module):
 
         def _shared_up_transform(slices, rank):
             lr = rank % ws
-            return slices[0][lr * smi_pr:(lr + 1) * smi_pr, :].contiguous()
+            # HF shared_experts.up_proj.weight [smi, d] -> rows of this rank -> [d, smi_pr]
+            return slices[0][lr * smi_pr:(lr + 1) * smi_pr, :].T.contiguous()
 
         def _shared_down_transform(slices, rank):
             lr = rank % ws
-            return slices[0][:, lr * smi_pr:(lr + 1) * smi_pr].contiguous()
+            # HF shared_experts.down_proj.weight [d, smi] -> cols of this rank -> [smi_pr, d]
+            return slices[0][:, lr * smi_pr:(lr + 1) * smi_pr].T.contiguous()
 
         set_weight_loader(self.shared_up, SafetensorsWeightLoader(transform=_shared_up_transform))
         set_weight_loader(self.shared_down, SafetensorsWeightLoader(transform=_shared_down_transform))
@@ -550,9 +551,9 @@ class NemotronHMoE(nn.Module):
                 h = F.relu(torch.einsum('td,tkdi->tki', x, up)).pow(2)       # [T, K, mi_pr]
                 out = torch.einsum('tki,tkid->td', h * w.unsqueeze(-1), down)
         # shared expert (relu^2), always on
-        sh = F.linear(x, self.shared_up)
-        sh = F.relu(sh).pow(2)
-        out = out + F.linear(sh, self.shared_down)
+        mm = torch.matmul if is_prefill else _decode_matmul
+        sh = F.relu(mm(x, self.shared_up)).pow(2)
+        out = out + mm(sh, self.shared_down)
         out = out.reshape(orig_shape)
         # >>> PARALLELISM: experts/shared computed on sharded intermediate → sum partials across
         # ranks (reduce-scatter on prefill, all-reduce on decode) <<<
@@ -1126,17 +1127,16 @@ class NemotronHForCausalLM(nn.Module):
         self.on_device_sampling_config = (
             config.neuron_config.on_device_sampling_config if config.neuron_config else None
         )
-        self.lm_head = ColumnParallelLinear(
-            config.hidden_size, config.vocab_size, bias=False, dtype=config.torch_dtype,
-            gather_output=not self.on_device_sampling_config,
-        )
-        set_weight_loader(
-            self.lm_head.weight,
-            sharding_weight_loader(
-                shard_dim=0, shard_size=self.lm_head.out_features_per_rank,
-                num_shards=self.lm_head.tp_size, is_storage_transposed=False,
-            ),
-        )
+        # Vocabulary projection, sharded on the vocabulary like ColumnParallelLinear (rank r owns rows
+        # [r*V_pr, (r+1)*V_pr) of the HF lm_head) but stored input-major [hidden, V_pr] so the decode
+        # step can run it as x @ W through the matvec kernel.
+        if config.vocab_size % self.world_size != 0:
+            raise ValueError(f"vocab_size={config.vocab_size} must be divisible by TP={self.world_size}.")
+        self.vocab_per_rank = config.vocab_size // self.world_size
+        self.lm_head_t = nn.Parameter(torch.empty(config.hidden_size, self.vocab_per_rank, dtype=config.torch_dtype))
+        v_pr, ws_ = self.vocab_per_rank, self.world_size
+        set_weight_loader(self.lm_head_t, SafetensorsWeightLoader(
+            transform=lambda sl, r: sl[0][(r % ws_) * v_pr:((r % ws_) + 1) * v_pr, :].T.contiguous()))
         if self.on_device_sampling_config is not None:
             from vllm_neuron.nn.sampler import Sampler
             self.sampler = Sampler(self.on_device_sampling_config, process_group=self.tp_group.device_group)
@@ -1181,7 +1181,9 @@ class NemotronHForCausalLM(nn.Module):
         positions = positions.to(torch.int32)
         hidden_states = self.model(input_ids, positions, attn_metadata)
         sampled = torch.index_select(hidden_states, 0, sampling_positions)
-        logits = self.lm_head(sampled)
+        logits = _decode_matmul(sampled, self.lm_head_t)                 # [S, V_pr], this rank's vocab
+        if self.on_device_sampling_config is None and self.world_size > 1:
+            logits = self.tp_group.all_gather(logits, dim=-1)
         if self.on_device_sampling_config is None:
             return logits
         sampled_tokens = self.sampler(logits, sampling_params, logit_mask=logit_mask, tp_rank=rank)
@@ -1256,7 +1258,7 @@ class NemotronHForCausalLM(nn.Module):
                 mappings[f"model.layers.{i}.mixer.shared_down"] = f"{src}.mixer.shared_experts.down_proj.weight"
         mappings["model.embed_tokens.weight"] = f"{SRC}.embeddings.weight"
         mappings["model.norm.weight"] = f"{SRC}.norm_f.weight"
-        mappings["lm_head.weight"] = LM_HEAD_SRC
+        mappings["lm_head_t"] = LM_HEAD_SRC
 
         checkpoint = SafetensorsCheckpoint(checkpoint_path, cache_dir)
         rank_sharded = checkpoint.load_sharded_pipelined(
