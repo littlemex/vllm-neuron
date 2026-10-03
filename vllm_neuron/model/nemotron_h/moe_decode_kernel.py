@@ -26,6 +26,17 @@ P = 128          # partitions
 F_MAX = 512      # moving free size per matmul (one fp32 PSUM bank)
 
 
+def _tile_starts(total, size):
+    """Start offsets of `size`-wide tiles covering [0, total) (the last one may be shorter). Built
+    outside the kernel body: the NKI tracer does not accept comprehensions there."""
+    starts = []
+    s = 0
+    while s < total:
+        starts.append(s)
+        s += size
+    return starts
+
+
 @nki.jit
 def moe_relu2_decode(x, up, down, expert_index, expert_weight):
     """x [T, H] bf16, up [E, H, I] bf16, down [E, I, H] bf16, expert_index [T, K] int32,
@@ -40,8 +51,8 @@ def moe_relu2_decode(x, up, down, expert_index, expert_weight):
     H1 = H // P
     I_c = I // n_cores
     i0 = core * I_c
-    i_tiles = [(s, min(P, I_c - s)) for s in range(0, I_c, P)]
-    h_chunks = [(s, min(F_MAX, H - s)) for s in range(0, H, F_MAX)]
+    i_starts = _tile_starts(I_c, P)
+    h_starts = _tile_starts(H, F_MAX)
 
     out = nl.ndarray((n_cores, T, H), dtype=nl.float32, buffer=nl.shared_hbm)
 
@@ -51,7 +62,8 @@ def moe_relu2_decode(x, up, down, expert_index, expert_weight):
 
     for t in nl.static_range(T):
         acc = []
-        for (_, hn) in h_chunks:
+        for c in range(len(h_starts)):
+            hn = min(F_MAX, H - h_starts[c])
             acc.append(nl.ndarray((1, hn), dtype=nl.float32, buffer=nl.psum))
         for k in nl.static_range(K):
             e = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
@@ -64,7 +76,9 @@ def moe_relu2_decode(x, up, down, expert_index, expert_weight):
             up_sb = nl.ndarray((P, H1, I_c), dtype=up.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=up_sb, src=up.ap(pattern=[[I, P], [P * I, H1], [1, I_c]], offset=i0,
                                                scalar_offset=e, indirect_dim=0))
-            for j, (s, m) in enumerate(i_tiles):
+            for j in range(len(i_starts)):
+                s = i_starts[j]
+                m = min(P, I_c - s)
                 # h^T for intermediate rows [s, s+m): [m, 1] = up_tile^T @ x_t, accumulated over H
                 hp = nl.ndarray((m, 1), dtype=nl.float32, buffer=nl.psum)
                 for h1 in nl.static_range(H1):
@@ -80,11 +94,15 @@ def moe_relu2_decode(x, up, down, expert_index, expert_weight):
                 dn = nl.ndarray((m, H), dtype=down.dtype, buffer=nl.sbuf)
                 nisa.dma_copy(dst=dn, src=down.ap(pattern=[[H, m], [1, H]], offset=(i0 + s) * H,
                                                   scalar_offset=e, indirect_dim=0))
-                for c, (hs, hn) in enumerate(h_chunks):
+                for c in range(len(h_starts)):
+                    hs = h_starts[c]
+                    hn = min(F_MAX, H - hs)
                     nisa.nc_matmul(dst=acc[c], stationary=hT, moving=dn[0:m, hs:hs + hn],
                                    accumulate=(k > 0 or j > 0))
         row = nl.ndarray((1, H), dtype=nl.float32, buffer=nl.sbuf)
-        for c, (hs, hn) in enumerate(h_chunks):
+        for c in range(len(h_starts)):
+            hs = h_starts[c]
+            hn = min(F_MAX, H - hs)
             nisa.tensor_copy(dst=row[0:1, hs:hs + hn], src=acc[c])
         nisa.dma_copy(dst=out.ap(pattern=[[H, 1], [1, H]], offset=(core * T + t) * H), src=row)
     return out
