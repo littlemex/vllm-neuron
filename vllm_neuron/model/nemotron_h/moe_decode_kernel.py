@@ -35,8 +35,8 @@ def moe_relu2_decode(x, up, down, expert_index, expert_weight):
     K = expert_index.shape[1]
     n_cores = nl.num_programs(0)
     core = nl.program_id(0)
-    assert H % P == 0, "H must be a multiple of 128"
-    assert I % n_cores == 0, "I must split evenly across the cores"
+    # H % 128 == 0 and I % n_cores == 0 are checked by the caller (_use_moe_decode_kernel); the NKI
+    # tracer does not accept assert statements in a kernel body.
     H1 = H // P
     I_c = I // n_cores
     i0 = core * I_c
