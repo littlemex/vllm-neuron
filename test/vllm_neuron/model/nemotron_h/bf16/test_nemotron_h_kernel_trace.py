@@ -55,7 +55,7 @@ def test_moe_decode_traces(T):
     assert out.shape == (2, T, H_MODEL)
 
 
-@pytest.mark.parametrize("T,h,n", [(1, H_MODEL, 2320),      # Mamba in_proj
+@pytest.mark.parametrize("T,h,n", [(1, H_MODEL, 2576),      # Mamba in_proj (gate 1024 + xBC 1536 + dt 16)
                                    (8, 1024, H_MODEL),      # Mamba out_proj
                                    (8, H_MODEL, 32768)])    # vocabulary projection
 def test_matvec_traces(T, h, n):

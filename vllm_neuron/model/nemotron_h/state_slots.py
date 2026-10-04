@@ -26,6 +26,12 @@ every running request (the Neuron scheduler never mixes the two). That gives the
 A request admitted between two decode steps can see rows of requests that finished in the last
 decode step still marked live, so the pool holds 2 * max_num_seqs rows plus the scratch row.
 
+A row is freed only by a decode step that runs without its request. With the Neuron async scheduler
+a request also appears in the decode step scheduled right after its prefill, so even a request that
+ends at its first token (max_tokens=1) is in one decode batch and is freed by the next. Without that
+(synchronous scheduling), requests ending at their prefill keep their rows until a decode step runs;
+more than 2 * max_num_seqs of them in a row would exhaust the pool.
+
 Everything is static-shaped tensor arithmetic (comparisons, max-reductions, where), so one compiled
 graph serves every step. Indices are found with max over (mask * weight) rather than argmax.
 """
