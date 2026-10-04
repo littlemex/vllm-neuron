@@ -106,6 +106,14 @@ try:
     _SSD_PREFILL_KERNEL = _wrap_nki(_ssd_prefill_nki)[_LNC]
 except (ImportError, NameError):
     _SSD_PREFILL_KERNEL = None
+# NEMOTRONH_MOE_PREFILL=dense keeps the all-experts prefill (same math, 21x the expert work).
+_MOE_PREFILL_NKI = os.environ.get("NEMOTRONH_MOE_PREFILL", "nki") == "nki"
+try:
+    from .moe_prefill import BLOCK_SIZE as _MOE_PREFILL_BLOCK
+    from .moe_prefill import moe_relu2_prefill as _moe_relu2_prefill
+    _MOE_PREFILL_KERNEL = _wrap_nki(_moe_relu2_prefill)[_LNC]
+except (ImportError, NameError):
+    _MOE_PREFILL_KERNEL = None
 _MAMBA_DECODE_NKI = os.environ.get("NEMOTRONH_MAMBA_DECODE", "nki") == "nki"
 try:
     from .mamba_decode_kernel import mamba2_decode_step as _mamba2_decode_step
@@ -523,6 +531,25 @@ class NemotronHMoE(nn.Module):
                               self.norm_topk_prob, self.routed_scaling_factor)
         return gate.to(self.dtype)                                 # [T, E] dense gate
 
+    def _use_prefill_kernel(self, x):
+        """nkilib blockwise MoE (moe_prefill.py) on a Neuron device; CPU and other shapes use the
+        dense path, which computes the same thing."""
+        if not _MOE_PREFILL_NKI or _MOE_PREFILL_KERNEL is None:
+            return False
+        from vllm_neuron.utils.neuron_utils import can_run_kernel
+        return (can_run_kernel(x) and 512 <= self.d <= 8192 and self.d % 128 == 0
+                and self.mi_per_rank % 16 == 0 and self.mi_per_rank % _LNC == 0)
+
+    def _prefill_routed(self, x, gate):
+        """Each expert over only the tokens routed to it: tokens grouped into blocks per expert."""
+        affinities, token_position_to_id, block_to_expert, _ = NF.build_blockwise_mapping(
+            expert_affinities=gate.to(torch.float32), num_local_experts=self.E,
+            num_experts_per_token=self.k, block_size=_MOE_PREFILL_BLOCK, moe_group=self.tp_group,
+            tp_degree=1)
+        return _MOE_PREFILL_KERNEL(x, affinities, self.up.unsqueeze(2), self.down,
+                                   token_position_to_id.to(torch.int32),
+                                   block_to_expert.to(torch.int32)).to(x.dtype)
+
     def forward(self, hidden_states, is_prefill=False):
         if is_prefill and self.world_size > 1:
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
@@ -539,7 +566,9 @@ class NemotronHMoE(nn.Module):
         # which made the 512-token prefill graph take hours in neuronx-cc. Static shapes, no
         # data-dependent control flow (fast NF.moe path is future work).
         gate = self._gate_dense(x)                      # [T, E], weight in each selected column
-        if is_prefill:
+        if is_prefill and self._use_prefill_kernel(x):
+            out = self._prefill_routed(x, gate)
+        elif is_prefill:
             # Every expert over every token, as batched GEMMs over groups of experts. One group of all
             # E would make the [T, E, mi_pr] intermediate (60 MB for a 512-token segment) spill out of
             # SBUF; a group of _MOE_PREFILL_EXPERT_GROUP keeps it on chip.
