@@ -19,6 +19,7 @@ import nki.language as nl
 from nki.isa.constants import oob_mode
 
 from nkilib.core.moe.moe_cte import bwmm_shard_on_I as _bwmm
+from nkilib.core.moe.moe_cte.bwmm_shard_on_I import blockwise_mm_baseline_shard_intermediate
 from nkilib.core.moe.moe_cte.moe_cte_utils import SkipMode
 from nkilib.core.utils.common_types import ActFnType, ExpertAffinityScaleMode
 
@@ -75,7 +76,8 @@ def moe_relu2_prefill(hidden_states, expert_affinities_masked, up, down, token_p
     each expert, 0 if not routed), up [E, H, 1, I] bf16, down [E, I, H] bf16, token_position_to_id
     [N*B] int32 (-1 for an empty slot), block_to_expert [N] int32 -> [T, H] bf16:
     sum over the token's experts of weight * relu(x @ up_e)^2 @ down_e (fp32 accumulation)."""
-    return _bwmm.blockwise_mm_baseline_shard_intermediate(
+    # (called by name: the NKI frontend rejects a module attribute lookup inside a kernel)
+    return blockwise_mm_baseline_shard_intermediate(
         hidden_states=hidden_states,
         expert_affinities_masked=expert_affinities_masked,
         gate_up_proj_weight=up,
