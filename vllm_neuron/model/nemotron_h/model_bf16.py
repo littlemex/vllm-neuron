@@ -61,6 +61,9 @@ logger = logging.getLogger(__name__)
 # (config.json `chunk_size` = 128). Overridable per-run via NEMOTRONH_CHUNK (experiments only).
 _DEFAULT_MAMBA_CHUNK = 128
 
+# DIAGNOSTIC ONLY: Mamba prefill parts to skip (p_conv, p_ssd, p_mnorm). Never set in serving.
+_DIAG = set(filter(None, os.environ.get("NEMOTRONH_DIAG", "").split(",")))
+
 # Experts per batched GEMM in the dense MoE prefill (see NemotronHMoE.forward).
 _MOE_PREFILL_EXPERT_GROUP = int(os.environ.get("NEMOTRONH_MOE_GROUP", "16"))
 
@@ -854,6 +857,8 @@ class NemotronHMamba2Mixer(nn.Module):
                 valid_len=valid_len)
             ssm_state0 = (self.ssm_state.index_select(0, slot)
                           * is_continuation.to(self.ssm_state.dtype))         # zeroed on first segment
+        if "p_conv" in _DIAG:
+            xBC_c = xBC_t
         xBC = self.act(xBC_c.transpose(1, 2))
 
         gn = self.groups_pr * self.ssm_state_size
@@ -873,6 +878,10 @@ class NemotronHMamba2Mixer(nn.Module):
         H, P, N, G = self.num_heads_pr, self.head_dim, self.ssm_state_size, self.groups_pr
         rep = H // G
         x = x.reshape(b, seq_len, H, P).float()
+        if "p_ssd" in _DIAG:
+            return self._prefill_finish(x.reshape(b, seq_len, H, P), gate, dtype, b, seq_len,
+                                        torch.zeros(b, H, P, N, dtype=torch.float32, device=x.device),
+                                        conv_state, slot)
         if self._use_ssd_prefill_kernel(x, seq_len):
             # NKI chunked-SSD kernel (same math as chunked_ssd_scan; one SSM group per core).
             s0 = (torch.zeros(H, P, N, dtype=torch.float32, device=x.device) if ssm_state0 is None
@@ -963,7 +972,8 @@ class NemotronHMamba2Mixer(nn.Module):
         # the caller's reduce_scatter (NemotronHModel.forward) is the one reduction, and also returns
         # the SP shard. Reducing here as well would sum world_size identical copies (all_reduce is in
         # place), scaling every Mamba prefill output by world_size. <<<
-        out = self._gated_rmsnorm(y, gate).to(dtype) @ self.out_proj_weight
+        yn = (y * gate) if "p_mnorm" in _DIAG else self._gated_rmsnorm(y, gate)
+        out = yn.to(dtype) @ self.out_proj_weight
         # Persist the final SSM state and the last (K-1) conv inputs in this request's pool row for
         # the following steps. conv_state = xBC_t[..., -(K-1):] captured before the conv above.
         self.ssm_state.index_put_((slot,), h.float())
