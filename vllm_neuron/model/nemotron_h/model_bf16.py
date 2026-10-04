@@ -838,6 +838,9 @@ class NemotronHMamba2Mixer(nn.Module):
         valid_len = None if valid_mask is None else valid_mask.reshape(-1).to(torch.int32).sum()
         proj = self._in_proj(hidden_states)
         gate, xBC, dt = self._split_proj(proj)
+        if self._use_ssd_prefill_kernel(hidden_states, seq_len):
+            return self._prefill_kernel(gate, xBC, dt, cached_seq_len, valid_mask, valid_len, slot,
+                                        dtype, b, seq_len)
         xBC_t = xBC.transpose(1, 2)
         # Causal conv1d with (segmented) history carry — the SAME helper the CPU test uses, so the
         # shipped and tested carry cannot diverge. Single-shot (cached_seq_len None): fresh K-1 zero
@@ -873,16 +876,6 @@ class NemotronHMamba2Mixer(nn.Module):
         H, P, N, G = self.num_heads_pr, self.head_dim, self.ssm_state_size, self.groups_pr
         rep = H // G
         x = x.reshape(b, seq_len, H, P).float()
-        if self._use_ssd_prefill_kernel(x, seq_len):
-            # NKI chunked-SSD kernel (same math as chunked_ssd_scan; one SSM group per core).
-            s0 = (torch.zeros(H, P, N, dtype=torch.float32, device=x.device) if ssm_state0 is None
-                  else ssm_state0[0].float())
-            yk, hk = _SSD_PREFILL_KERNEL(
-                x[0].contiguous(), dt[0].float().contiguous(), A, B.reshape(seq_len, G, N).float(),
-                C.reshape(seq_len, G, N).float(), self.D.float(), s0,
-                torch.triu(torch.ones(128, 128, dtype=torch.float32, device=x.device)))
-            y, h = yk[None], hk[None]
-            return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state, slot)
         B = B.reshape(b, seq_len, G, N).float().repeat_interleave(rep, dim=2)
         C = C.reshape(b, seq_len, G, N).float().repeat_interleave(rep, dim=2)
         if os.environ.get("NEMOTRONH_MAMBA_STUB") == "1":
@@ -956,6 +949,37 @@ class NemotronHMamba2Mixer(nn.Module):
             y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
         return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state, slot)
 
+    def _prefill_kernel(self, gate, xBC, dt, cached_seq_len, valid_mask, valid_len, slot, dtype, b,
+                        seq_len):
+        """Prefill through the NKI kernel (ssd_prefill_kernel.py): causal conv + SiLU + chunked SSD
+        on the token-major in_proj output. The conv history is prepended as K-1 rows; the carried
+        conv state is the last K-1 real rows of history ++ input, as in segmented_causal_conv1d."""
+        K = self.conv_kernel_size
+        H, P, N = self.num_heads_pr, self.head_dim, self.ssm_state_size
+        dev = xBC.device
+        if cached_seq_len is None:
+            hist = torch.zeros(K - 1, self.conv_dim_pr, dtype=xBC.dtype, device=dev)
+            s0 = torch.zeros(H, P, N, dtype=torch.float32, device=dev)
+        else:
+            is_cont = (cached_seq_len.reshape(()) > 0)                         # runtime {0,1} mask
+            hist = (self.conv_state.index_select(0, slot)[0].transpose(0, 1)
+                    * is_cont.to(self.conv_state.dtype)).to(xBC.dtype)        # [K-1, conv_dim]
+            s0 = self.ssm_state.index_select(0, slot)[0] * is_cont.to(torch.float32)
+        full = torch.cat([hist, xBC[0]], dim=0)                               # [K-1+L, conv_dim]
+        if valid_len is None:
+            tail = full[-(K - 1):]
+        else:
+            tail = torch.index_select(full, 0, valid_len.reshape(()).long() + torch.arange(K - 1, device=dev))
+        conv_state = tail.transpose(0, 1).unsqueeze(0)                        # [1, conv_dim, K-1]
+        dt = F.softplus(dt + self.dt_bias)
+        if valid_mask is not None:
+            dt = dt * valid_mask.reshape(1, seq_len, 1).to(dt.dtype)          # pad = identity step
+        y, h = _SSD_PREFILL_KERNEL(
+            full.contiguous(), self.conv1d_weight[:, 0, :].contiguous(), self.conv1d_bias,
+            dt[0].float().contiguous(), -torch.exp(self.A_log.float()), self.D.float(), s0.float(),
+            torch.triu(torch.ones(128, 128, dtype=torch.float32, device=dev)))
+        return self._prefill_finish(y[None], gate, dtype, b, seq_len, h[None], conv_state, slot)
+
     def _prefill_finish(self, y, gate, dtype, b, seq_len, h, conv_state, slot):
         """Gated RMSNorm + out_proj, and persist the SSM / conv state, after the prefill scan."""
         y = y.reshape(b, seq_len, -1)
@@ -971,13 +995,15 @@ class NemotronHMamba2Mixer(nn.Module):
         return out
 
     def _use_ssd_prefill_kernel(self, x, seq_len):
-        """The NKI SSD prefill kernel: one SSM group per physical core, 128-token chunks, state 128.
-        CPU (tests), other shapes and NEMOTRONH_SSD_PREFILL=torch use chunked_ssd_scan."""
+        """The NKI conv + SSD prefill kernel: one SSM group per physical core, 128-token chunks,
+        state 128. CPU (tests), other shapes and NEMOTRONH_SSD_PREFILL=torch use the PyTorch conv and
+        chunked_ssd_scan."""
         if not _SSD_PREFILL_NKI or _SSD_PREFILL_KERNEL is None:
             return False
         from vllm_neuron.utils.neuron_utils import can_run_kernel
         return (can_run_kernel(x) and x.shape[0] == 1 and seq_len % 128 == 0
                 and self.ssm_state_size == 128 and self.groups_pr == _LNC
+                and (self.num_heads_pr // self.groups_pr) * self.head_dim <= 512
                 and int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK))) == 128)
 
     def _use_decode_kernel(self, x):

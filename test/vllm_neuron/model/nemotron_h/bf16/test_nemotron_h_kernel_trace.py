@@ -27,3 +27,14 @@ def test_moe_prefill_traces():
         _meta(T, H), _meta(T * E, 1, dtype=torch.float32), _meta(E, H, 1, I), _meta(E, I, H),
         _meta(N * moe_prefill.BLOCK_SIZE, dtype=torch.int32), _meta(N, dtype=torch.int32))
     assert out.shape == (T, H)
+
+
+def test_ssd_prefill_traces():
+    from vllm_neuron.model.nemotron_h import ssd_prefill_kernel
+    L, H, P, N, G, K = 512, 16, 64, 128, 2, 4
+    C_dim = H * P + 2 * G * N
+    f32 = torch.float32
+    y, s = wrap_nki(ssd_prefill_kernel.ssd_prefill)[2](
+        _meta(K - 1 + L, C_dim), _meta(C_dim, K), _meta(C_dim), _meta(L, H, dtype=f32),
+        _meta(H, dtype=f32), _meta(H, dtype=f32), _meta(H, P, N, dtype=f32), _meta(128, 128, dtype=f32))
+    assert y.shape == (L, H, P) and s.shape == (H, P, N)
