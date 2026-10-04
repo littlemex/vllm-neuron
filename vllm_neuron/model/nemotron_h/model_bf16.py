@@ -106,8 +106,11 @@ try:
     _SSD_PREFILL_KERNEL = _wrap_nki(_ssd_prefill_nki)[_LNC]
 except (ImportError, NameError):
     _SSD_PREFILL_KERNEL = None
-# NEMOTRONH_MOE_PREFILL=dense keeps the all-experts prefill (same math, 21x the expert work).
-_MOE_PREFILL_NKI = os.environ.get("NEMOTRONH_MOE_PREFILL", "nki") == "nki"
+# NEMOTRONH_MOE_PREFILL=blockwise runs each expert only on its routed tokens (moe_prefill.py). Off by
+# default: measured slower than the dense all-experts prefill on trn2 (512-token segments: 1695 vs
+# 2596 tok/s; 2048-token segments: 1270 tok/s), the 256-token blocks being mostly empty at ~24 tokens
+# per expert.
+_MOE_PREFILL_NKI = os.environ.get("NEMOTRONH_MOE_PREFILL", "dense") == "blockwise"
 try:
     from .moe_prefill import BLOCK_SIZE as _MOE_PREFILL_BLOCK
     from .moe_prefill import moe_relu2_prefill as _moe_relu2_prefill
