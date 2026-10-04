@@ -214,6 +214,19 @@ A request's output in a batch does not depend on which other requests share the 
 over different partners). It can differ from the same request run alone: a batch of `b` runs a
 different compiled graph than a batch of 1, and bf16 rounding differs between the two.
 
+## Open items
+
+Known gaps in the current state, in order of how much they matter to a user.
+
+| Item | Status | What would settle it |
+|---|---|---|
+| Accuracy with the NKI kernels | The gsm8k comparison above was measured before the NKI kernels; the current build passes the 12 greedy probes but has not been re-scored on gsm8k. | Re-run the 250 gsm8k questions on the current build and compare with the GPU reference (217/250). |
+| Contexts above about 90k tokens | With `max_model_len 131072`, long-context fact probes pass up to 87.7k tokens; at 112k, one of the two probes answers wrongly. Whether this is a porting error or the model's own limit is not known, because no GPU reference at that length was available. | A GPU reference run of the same probes at 96k to 128k tokens. |
+| `logprobs` requests | A completion request with `logprobs` returns HTTP 500 (`IndexError` while the OpenAI server builds the logprobs), seen with on-device sampling enabled. Not investigated. | Reproduce with and without `on_device_sampling_config`; check what the runner returns for top logprobs. |
+| State-pool rows under synchronous scheduling | Rows are freed only by a decode batch that runs without their request (see Known limitations). With the Neuron async scheduler a request ending at its first token still appears in one decode batch; under synchronous scheduling more than `2 * max_num_seqs` such requests in a row would exhaust the pool. A runner-side release of finished requests would remove the assumption. | A runner hook that reports finished requests to the model between steps, verified under concurrent load. |
+| Batched output vs a request run alone | A request's output is identical whatever shares its batch, but can differ from the same request run alone. The likely cause is that each batch width runs its own compiled graph with different bf16 rounding; this has not been shown directly. | Compare the logits of one request at batch width 1 and 2 at the first step where the texts differ. |
+| Prefill MoE | Prefill is limited by the MoE layers: with 512-token segments nearly all 128 experts are used, so every layer reads all expert weights (about 640 MB per TP rank) and the profile shows about 3.5 ms of waiting per MoE layer. An experimental build that routes tokens to their experts in blocks (nkilib blockwise MoE, not included here) was slower at 512 and 2048-token segments. | A prefill MoE kernel that overlaps the expert weight loads with compute, or longer segments with the dense path. |
+
 ## Module Structure
 
 ```text
