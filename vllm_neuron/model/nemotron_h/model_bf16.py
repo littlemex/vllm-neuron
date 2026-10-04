@@ -14,8 +14,9 @@ vLLM-Neuron plugin patterns:
     window, and NoPE (no rotary embedding; position information is carried by the Mamba2 layers).
   - MoE: DeepSeek-style grouped top-k routing (sigmoid + e_score_correction_bias + group select +
     norm + routed_scaling_factor), 128 routed experts top-6 + 1 shared, relu^2 activation
-    (from modeling_nemotron_h.py NemotronHMoE.route_tokens_to_experts). All experts run
-    densely as two GEMMs over the concatenated experts; NF.moe_cte fast path is a later optimization.
+    (from modeling_nemotron_h.py NemotronHMoE.route_tokens_to_experts). Experts are stored
+    expert-major; prefill runs every expert over every token as batched GEMMs over groups of
+    experts, decode reads only the selected experts' weights.
   - Mamba2: chunked-SSD prefill (default; O(l*C), long sequences) + 1-step-recurrence decode, the
     state carried across steps in a per-request pool of in-place module buffers (state_slots.py says
     which row a request uses). This is the NemotronH-specific piece plamo3 does not have.
@@ -64,8 +65,12 @@ _DEFAULT_MAMBA_CHUNK = 128
 _MOE_PREFILL_EXPERT_GROUP = int(os.environ.get("NEMOTRONH_MOE_GROUP", "16"))
 
 
-# Logical-core size of trn2 (two physical cores); the MoE decode kernel splits its work across them.
+# The NKI kernels split their work across the two physical cores of a logical core (LNC=2, the
+# trn2 default). Under any other logical-core configuration every call site keeps the PyTorch path.
 _LNC = 2
+_LNC_OK = os.environ.get("NEURON_LOGICAL_NC_CONFIG", str(_LNC)) == str(_LNC)
+# Mamba prefill chunk (NEMOTRONH_CHUNK), resolved once at import like the kernel switches below.
+_MAMBA_CHUNK = int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK)))
 # NEMOTRONH_MOE_DECODE=torch selects the PyTorch decode path (same math). Resolved once at import: a
 # value that changes between tracing and execution would trip the runner's fail_on_recompile guard.
 _MOE_DECODE_NKI = os.environ.get("NEMOTRONH_MOE_DECODE", "nki") == "nki"
@@ -84,15 +89,15 @@ except (ImportError, NameError):
 
 
 # Call sites (mamba, attn, shared, lm_head) that keep the plain matmul. Default: the shared expert,
-# measured slower through the kernel on trn2 (decode 9.6 vs 9.0 ms/token) than the compiler's matmul.
+# measured slower through the kernel on trn2 than the compiler's matmul (one-request decode 0.6 ms/token slower).
 _MATVEC_OFF = set(filter(None, os.environ.get("NEMOTRONH_MATVEC_OFF", "shared").split(",")))
 
 
 def _decode_matmul(x, w, site=""):
     """x [T, H] @ w [H, N] for a decode step: the NKI matvec kernel on a Neuron device for shapes it
     supports (N % LNC == 0, T <= 128), plain matmul otherwise (and on CPU)."""
-    if _MATVEC_NKI and _MATVEC_KERNEL is not None and site not in _MATVEC_OFF and x.dim() == 2 \
-            and x.shape[0] <= 128 and w.shape[1] % _LNC == 0:
+    if _LNC_OK and _MATVEC_NKI and _MATVEC_KERNEL is not None and site not in _MATVEC_OFF \
+            and x.dim() == 2 and x.shape[0] <= 128 and x.shape[1] == w.shape[0] and w.shape[1] % _LNC == 0:
         from vllm_neuron.utils.neuron_utils import can_run_kernel
         if can_run_kernel(x):
             return _MATVEC_KERNEL(x.contiguous(), w)
@@ -101,6 +106,7 @@ def _decode_matmul(x, w, site=""):
 
 _SSD_PREFILL_NKI = os.environ.get("NEMOTRONH_SSD_PREFILL", "nki") == "nki"
 try:
+    from .ssd_prefill_kernel import Q as _SSD_CHUNK
     from .ssd_prefill_kernel import ssd_prefill as _ssd_prefill_nki
     _SSD_PREFILL_KERNEL = _wrap_nki(_ssd_prefill_nki)[_LNC]
 except (ImportError, NameError):
@@ -117,7 +123,7 @@ except (ImportError, NameError):
 def _use_moe_decode_kernel(x, hidden, inter_per_rank):
     """The NKI MoE decode kernel runs on a Neuron device for shapes it supports; CPU (tests) uses the
     PyTorch path, which computes the same thing."""
-    if not _MOE_DECODE_NKI or _MOE_DECODE_KERNEL is None:
+    if not _LNC_OK or not _MOE_DECODE_NKI or _MOE_DECODE_KERNEL is None:
         return False
     from vllm_neuron.utils.neuron_utils import can_run_kernel
     return can_run_kernel(x) and hidden % 128 == 0 and inter_per_rank % _LNC == 0
@@ -527,16 +533,13 @@ class NemotronHMoE(nn.Module):
             hidden_states = self.tp_group.all_gather(hidden_states, dim=0)
         orig_shape = hidden_states.shape
         x = hidden_states.reshape(-1, orig_shape[-1])   # [T, d]
-        # Dense, trace-safe dispatch: build a per-expert weight matrix [T, E] (0 for unselected),
-        # then run every expert over all tokens and scale each expert's activations by its column.
-        # `_gate_dense` builds the gate with only reductions/elementwise ops (no data-dependent
-        # scatter/gather), which the Neuron compiler mishandles once several MoE layers are stacked.
-        # With the experts concatenated, the whole set is two GEMMs and one elementwise scale:
-        #   out = (relu(x @ up)^2 * gate_per_column) @ down
-        # which equals sum_e gate[:, e] * down_e(relu(up_e(x))^2), since unselected experts get 0.
-        # A per-expert Python loop computes the same thing but unrolls into E small GEMMs per layer,
-        # which made the 512-token prefill graph take hours in neuronx-cc. Static shapes, no
-        # data-dependent control flow (fast NF.moe path is future work).
+        # The router builds a dense per-expert weight matrix [T, E] (0 for unselected) with only
+        # reductions/elementwise ops (no data-dependent scatter/gather, which the Neuron compiler
+        # mishandles once several MoE layers are stacked). Prefill runs every expert over every token
+        # in batched GEMMs over groups of experts, each expert's activations scaled by its column:
+        #   out = sum_e (relu(x @ up_e)^2 * gate[:, e]) @ down_e
+        # (unselected experts contribute 0). Decode takes the top-k of the same matrix and reads only
+        # those experts' weights.
         gate = self._gate_dense(x)                      # [T, E], weight in each selected column
         if is_prefill:
             # Every expert over every token, as batched GEMMs over groups of experts. One group of all
@@ -584,9 +587,7 @@ class NemotronHMoE(nn.Module):
 class NemotronHMamba2Mixer(nn.Module):
     """Chunked-SSD prefill + 1-step decode. The recurrent (ssm+conv) state lives in a pool of module
     buffers (one row per request) updated in place, so it persists across the runner's graph calls.
-    Trainium lessons baked in
-    (slice not zero-size split; vectorized SSD not chunked-SSD). TP: shard the inner (heads)
-    dimension across ranks.
+    TP: shard the inner (heads) dimension across ranks.
 
     <-- MODEL-SPECIFIC: entire Mamba2 mixer is new for this architecture (no reference model in the
     plugin has an SSM/recurrent layer); TP head sharding within it is noted per-method below.
@@ -775,8 +776,8 @@ class NemotronHMamba2Mixer(nn.Module):
         # Python branch.
         # cached_seq_len is None for a single-shot prefill (unchanged path). When set (segmented /
         # continuation prefill), this is one SEGMENT of a longer prompt: the SSM/conv state left by
-        # the previous segment (row `slot` of self.ssm_state / self.conv_state, persisted across graphs
-        # by the AliasingOutputRewritePass, exactly like decode) is this segment's initial state.
+        # the previous segment (row `slot` of self.ssm_state / self.conv_state, written in place by the
+        # previous segment's graph, exactly like decode) is this segment's initial state.
         # Splitting a prefill this way is mathematically identical to a single-shot prefill (the SSM
         # is a linear recurrence; the conv is causal) — pinned on CPU by
         # test_segmented_prefill_matches_single_shot, INCLUDING the conv-history carry.
@@ -844,10 +845,11 @@ class NemotronHMamba2Mixer(nn.Module):
             # NKI chunked-SSD kernel (same math as chunked_ssd_scan; one SSM group per core).
             s0 = (torch.zeros(H, P, N, dtype=torch.float32, device=x.device) if ssm_state0 is None
                   else ssm_state0[0].float())
+            Q = _SSD_CHUNK
             yk, hk = _SSD_PREFILL_KERNEL(
                 x[0].contiguous(), dt[0].float().contiguous(), A, B.reshape(seq_len, G, N).float(),
                 C.reshape(seq_len, G, N).float(), self.D.float(), s0,
-                torch.triu(torch.ones(128, 128, dtype=torch.float32, device=x.device)))
+                torch.triu(torch.ones(Q, Q, dtype=torch.float32, device=x.device)))
             y, h = yk[None], hk[None]
             return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state, slot)
         B = B.reshape(b, seq_len, G, N).float().repeat_interleave(rep, dim=2)
@@ -918,7 +920,7 @@ class NemotronHMamba2Mixer(nn.Module):
             # Default chunk 128 = the checkpoint config's mamba `chunk_size` (config.json chunk_size);
             # it trades the intra-chunk O(chunk^2) pass against the chunk count T=ceil(l/chunk). Kept
             # overridable for experiments; a bad (non-int) value raises here rather than mis-shaping.
-            cs = int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK)))
+            cs = _MAMBA_CHUNK
             s0 = ssm_state0.float() if ssm_state0 is not None else None
             y, h = chunked_ssd_scan(x, B, C, dt.float(), A, self.D, cs, s0)
         return self._prefill_finish(y, gate, dtype, b, seq_len, h, conv_state, slot)
@@ -940,18 +942,18 @@ class NemotronHMamba2Mixer(nn.Module):
     def _use_ssd_prefill_kernel(self, x, seq_len):
         """The NKI SSD prefill kernel: one SSM group per physical core, 128-token chunks, state 128.
         CPU (tests), other shapes and NEMOTRONH_SSD_PREFILL=torch use chunked_ssd_scan."""
-        if not _SSD_PREFILL_NKI or _SSD_PREFILL_KERNEL is None:
+        if not _LNC_OK or not _SSD_PREFILL_NKI or _SSD_PREFILL_KERNEL is None:
             return False
         from vllm_neuron.utils.neuron_utils import can_run_kernel
-        return (can_run_kernel(x) and x.shape[0] == 1 and seq_len % 128 == 0
-                and self.ssm_state_size == 128 and self.groups_pr == _LNC
-                and int(os.environ.get("NEMOTRONH_CHUNK", str(_DEFAULT_MAMBA_CHUNK))) == 128)
+        Q = _SSD_CHUNK
+        return (can_run_kernel(x) and seq_len % Q == 0 and _MAMBA_CHUNK == Q
+                and self.ssm_state_size == Q and self.groups_pr == _LNC)
 
     def _use_decode_kernel(self, x):
         """The NKI decode-step kernel assigns one SSM group to each physical core, two 64-wide heads
         per 128-partition tile, and needs each core's channels to be exactly one gated-RMSNorm group.
         Other shapes, CPU (tests) and NEMOTRONH_MAMBA_DECODE=torch use the PyTorch path."""
-        if not _MAMBA_DECODE_NKI or _MAMBA_DECODE_KERNEL is None:
+        if not _LNC_OK or not _MAMBA_DECODE_NKI or _MAMBA_DECODE_KERNEL is None:
             return False
         from vllm_neuron.utils.neuron_utils import can_run_kernel
         return (can_run_kernel(x) and self.head_dim == 64
@@ -1065,6 +1067,10 @@ class NemotronHModel(nn.Module):
         self.norm = NemotronHRMSNorm(config.hidden_size, config.rms_norm_eps, config.torch_dtype)
         # Which request holds each row of the Mamba state pools (see state_slots.py), updated in
         # place each step like the pools.
+        if config.max_num_seqs > 1 and ATTENTION not in config.hybrid_override_pattern:
+            raise NotImplementedError(
+                "Concurrent requests need an attention layer: a request's Mamba state row is found from "
+                "its first KV block id. Use max_num_seqs=1 for a pattern without attention layers.")
         rows = pool_size(config.max_num_seqs)
         self.register_buffer("state_owner", torch.full((rows,), -1, dtype=torch.int32), persistent=False)
         self.register_buffer("state_live", torch.zeros(rows, dtype=torch.int32), persistent=False)
@@ -1082,12 +1088,21 @@ class NemotronHModel(nn.Module):
             return None
         keys = md["block_table_tensor"][:, 0]
         if is_prefill:
+            if keys.shape[0] != 1:
+                raise NotImplementedError(
+                    "NemotronH prefill takes one request per step (the Neuron scheduler prefills one "
+                    f"request at a time); got {keys.shape[0]}.")
             is_first = (torch.ones(1, dtype=torch.bool, device=keys.device) if seg_cached_len is None
                         else seg_cached_len.reshape(1) == 0)
             slot, owner, live = prefill_slot(self.state_owner, self.state_live, keys[:1], is_first)
             self.state_owner.copy_(owner)
             self.state_live.copy_(live)
             return slot
+        if keys.shape[0] > self.config.max_num_seqs:
+            raise ValueError(f"decode batch of {keys.shape[0]} exceeds max_num_seqs="
+                             f"{self.config.max_num_seqs} the Mamba state pool was sized for")
+        # Padding rows write their KV to PAD_SLOT_ID (-1) or into the null block 0, so a row is real
+        # exactly when its slot lies in block 1 or above (as in _prefill_valid_mask).
         real = md["slot_mapping"].view(keys.shape[0], -1)[:, 0] >= md["block_size"]
         slots, live = decode_slots(self.state_owner, self.state_live, keys, real)
         self.state_live.copy_(live)

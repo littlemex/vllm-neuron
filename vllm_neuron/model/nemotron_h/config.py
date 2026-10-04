@@ -175,9 +175,10 @@ class NemotronHConfig:
             if eps is not None:
                 filtered["rms_norm_eps"] = eps
         filtered["neuron_config"] = neuron_config
-        try:
-            from vllm.config import get_current_vllm_config
-            filtered["max_num_seqs"] = get_current_vllm_config().scheduler_config.max_num_seqs or 1
-        except Exception:    # outside a vLLM engine (offline tools): one request at a time
-            pass
+        # Inside an engine the scheduler's max_num_seqs sizes the Mamba state pool: vLLM sets the
+        # current config while the runner builds the model. Outside one (offline tools) the dataclass
+        # default of one request stays; get_current_vllm_config() would return a default config there.
+        from vllm.config import vllm as _vllm_config
+        if _vllm_config._current_vllm_config is not None:
+            filtered["max_num_seqs"] = _vllm_config._current_vllm_config.scheduler_config.max_num_seqs or 1
         return cls(**filtered)

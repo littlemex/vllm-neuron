@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The NKI decode-projection kernel on the NKI CPU simulator, at the per-rank (TP=4) shapes it is
-used for: Mamba in_proj / out_proj, attention qkv / o_proj, shared-expert up / down."""
+the model can use it for: Mamba in_proj / out_proj, attention qkv / o_proj, the vocabulary
+projection, and the shared expert (off by default, NEMOTRONH_MATVEC_OFF), up to a decode batch of 8."""
 import importlib.util
 import os
 
@@ -24,7 +25,7 @@ BF16 = ml_dtypes.bfloat16
 
 
 @pytest.mark.parametrize("T,H,N", [(1, 2688, 2576), (1, 1024, 2688), (1, 2688, 1280), (1, 2688, 928),
-                                   (1, 928, 2688), (2, 2688, 2576), (1, 2688, 32768)])
+                                   (1, 928, 2688), (2, 2688, 2576), (8, 2688, 2576), (1, 2688, 32768)])
 def test_matvec_matches_numpy(T, H, N):
     rng = np.random.default_rng(0)
     x = rng.standard_normal((T, H)).astype(BF16)

@@ -37,7 +37,7 @@ def _reference(x, up, down, idx, w):
     return out
 
 
-@pytest.mark.parametrize("T", [1, 2])
+@pytest.mark.parametrize("T", [1, 2, 8])
 def test_moe_relu2_decode_matches_reference(T):
     rng = np.random.default_rng(0)
     E, H, I, K = 8, 2688, 464, 6
