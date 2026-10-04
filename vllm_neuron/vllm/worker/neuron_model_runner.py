@@ -1812,6 +1812,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
     # in the helper stubs above (get_model, _may_reorder_batch,
     # _get_valid_sampled_token_count, _init_mrope_positions,
     # _init_xdrope_positions, _update_streaming_request).
+    def _release_finished_request_state(self, finished_req_ids) -> None:
+        """Tell a model that keeps per-request state outside the KV cache (a recurrent-state pool,
+        for example) which requests finished, identified by the first KV block each one held. The
+        model's ``release_request_state(first_block_ids)`` runs between steps, outside the compiled
+        graphs. A request can finish without another decode step (``max_tokens=1``, an abort after
+        prefill), so the model cannot learn this from the batches it sees."""
+        release = getattr(self.model, "release_request_state", None)
+        if release is None or not finished_req_ids:
+            return
+        first_blocks = []
+        for req_id in finished_req_ids:
+            req_state = self.requests.get(req_id)
+            if req_state is not None and req_state.block_ids and req_state.block_ids[0]:
+                first_blocks.append(req_state.block_ids[0][0])
+        if first_blocks:
+            release(first_blocks)
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1822,6 +1839,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
+        self._release_finished_request_state(scheduler_output.finished_req_ids)
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)

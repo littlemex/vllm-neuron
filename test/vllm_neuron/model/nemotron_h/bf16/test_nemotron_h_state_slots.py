@@ -63,3 +63,40 @@ def test_prefill_drops_stale_row_of_reused_block():
     assert int(live[slot_a]) == 0 and int(owner[slot_a]) == -1
     slot_c, owner, live = prefill_slot(owner, live, torch.tensor([7]), torch.tensor([False]))
     assert int(slot_c) == int(slot_b)
+
+
+def _release(owner, live, keys):
+    """NemotronHModel.release_state_rows on bare tensors (what the runner hook runs between steps)."""
+    from types import SimpleNamespace
+
+    from vllm_neuron.model.nemotron_h.model_bf16 import NemotronHModel
+    m = SimpleNamespace(state_owner=owner, state_live=live.clone())
+    NemotronHModel.release_state_rows(m, keys)
+    return m.state_live
+
+
+@pytest.mark.parametrize("released", [False, True])
+def test_requests_finishing_in_prefill(released):
+    """Requests that end in their prefill step (max_tokens=1, an abort after prefill) never appear
+    in a decode batch. Unless the runner reports them, their rows stay live; after 2 * max_num_seqs
+    of them, two long requests admitted next both get the scratch row and share one state."""
+    max_num_seqs = 2
+    S = pool_size(max_num_seqs)
+    owner = torch.full((S,), -1, dtype=torch.int32)
+    live = torch.zeros(S, dtype=torch.int32)
+    block = 1
+    for _ in range(3 * max_num_seqs):                       # short requests, fresh first blocks
+        _, owner, live = prefill_slot(owner, live, torch.tensor([block]), torch.tensor([True]))
+        if released:
+            live = _release(owner, live, [block])
+        block += 1
+    rows = []
+    for _ in range(2):                                     # two long requests
+        slot, owner, live = prefill_slot(owner, live, torch.tensor([block]), torch.tensor([True]))
+        rows.append(int(slot))
+        block += 1
+    slots, _ = decode_slots(owner, live, torch.tensor([block - 2, block - 1]), torch.tensor([True, True]))
+    if released:
+        assert rows[0] != rows[1] and S - 1 not in rows and [int(x) for x in slots] == rows
+    else:
+        assert rows == [S - 1, S - 1]                       # the failure the hook prevents

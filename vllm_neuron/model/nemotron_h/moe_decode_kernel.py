@@ -13,7 +13,7 @@ two physical cores of a logical core (LNC=2) split the intermediate axis I, and
 each writes its partial sum to its own row of the output, which the caller adds.
 
 Layout choices for a matrix-vector product on the Tensor Engine:
-  - gate/up: x (one column) is the stationary operand and the weight streams as the moving one,
+  - up: x (one column) is the stationary operand and the weight streams as the moving one,
     giving h as a row; two PE transposes turn it into the h^T columns the down projection contracts
     over. (The weight as the stationary operand would reload the array once per 128x128 tile.)
   - down: h^T is the stationary operand (one column per token) and the weight streams as the moving
@@ -63,7 +63,7 @@ def moe_relu2_decode(x, up, down, expert_index, expert_weight):
 
     for t in nl.static_range(T):
         # Issue every selected expert's weight loads first so they overlap with the compute below.
-        es, wks, ups, dns = [], [], [], []
+        wks, ups, dns = [], [], []
         for k in nl.static_range(K):
             e = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
             nisa.dma_copy(dst=e, src=expert_index.ap(pattern=[[1, 1], [1, 1]], offset=t * K + k))
@@ -84,7 +84,6 @@ def moe_relu2_decode(x, up, down, expert_index, expert_weight):
                                                   scalar_offset=e, indirect_dim=0),
                               dge_mode=nisa.dge_mode.hwdge)
                 dn_k.append(dn)
-            es.append(e)
             wks.append(wk)
             ups.append(up_sb)
             dns.append(dn_k)

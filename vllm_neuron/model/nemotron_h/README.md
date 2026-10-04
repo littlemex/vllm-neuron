@@ -37,7 +37,8 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
 - **DGE-free MoE router.** The top-k gate is built with reductions + elementwise comparisons only
   (no data-dependent `scatter`/`gather`), which avoids a neuronx-cc miscompilation that surfaced as a
   `scatter/gather (vector DGE) out-of-bound` once several MoE layers were stacked. Math is identical
-  to the argmax+scatter router.
+  to the argmax+scatter router. Decode then reads the selected experts' weights by index (an indirect
+  DMA in the NKI kernel; an `index_select` on the `NEMOTRONH_MOE_DECODE=torch` path).
 - **NoPE attention.** No rotary embedding — matches the HF `NemotronHAttention`, which carries
   position information through the Mamba2 layers.
 - **Config unwrapping.** `config.py` unwraps the Omni wrapper (`llm_config`/`language_model`/
@@ -90,7 +91,9 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
 - **Concurrent requests.** Decode batches up to `max_num_seqs` requests. The Mamba2 state pool row
   of each request is resolved inside the graph from its first KV block id (`state_slots.py`): a
   prefill's first segment takes the lowest free row, later segments and decode steps look the row up
-  by owner, and a row whose request is absent from a decode batch is released. This relies on the
+  by owner, and a row is released when the runner reports its request finished
+  (`release_request_state`, called between steps by `NeuronModelRunner._update_states`) or when its
+  request is absent from a decode batch. This relies on the
   Neuron scheduler running either one prefill request (all its segments in a row) or a decode batch
   of every running request, never a mix; the pool holds `2 * max_num_seqs + 1` rows because requests
   that finished in the last decode step still look live to a prefill admitted before the next one.
@@ -204,7 +207,7 @@ Throughput on the same setup (`max_model_len 8192`, `--max-num-batched-tokens 51
 | Decode, one request | 9.2 ms/token |
 | Decode, 8 concurrent requests (`--max-num-seqs 8`, 128 tokens each, including their prefills) | 215 tokens/s aggregate |
 | Prefill | about 2600 tokens/s (487 to 7165-token prompts) |
-| Greedy probes with all 12 in flight at once | 12/12 |
+| Greedy probes, all 12 submitted at once (8 decoded concurrently) | 12/12 |
 
 A request's output in a batch does not depend on which other requests share the batch (bit-identical
 over different partners). It can differ from the same request run alone: a batch of `b` runs a
@@ -250,7 +253,8 @@ test/vllm_neuron/model/nemotron_h/bf16/
 ├── test_nemotron_h_state_slots.py  # state-pool rows under a simulated scheduler (admissions,
 │                                #    multi-segment prefills, shuffled padded decode batches,
 │                                #    finished requests, reused first blocks)
-├── test_nemotron_h_*_kernel.py  # each NKI kernel on the NKI CPU simulator vs the PyTorch path
+├── test_nemotron_h_*_kernel.py  # each NKI kernel on the NKI CPU simulator, against the shipped
+│                                #    PyTorch scan (SSD) or a NumPy transcription of the decode math
 └── test_nemotron_h_kernel_trace.py # each NKI kernel through the device compiler frontend on meta
                                  # tensors (catches constructs the simulator accepts but the device
                                  # frontend rejects)

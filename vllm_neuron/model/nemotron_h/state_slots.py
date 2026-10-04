@@ -23,8 +23,10 @@ every running request (the Neuron scheduler never mixes the two). That gives the
     first block (its request has finished and the block was reused). Later segments find the row by
     owner, like decode.
 
-A request admitted between two decode steps can see rows of requests that finished in the last
-decode step still marked live, so the pool holds 2 * max_num_seqs rows plus the scratch row.
+The runner also reports finished requests between steps (NemotronHForCausalLM.release_request_state):
+a request can end without another decode step (max_tokens=1, an abort after prefill), and nothing in
+the later batches would show it. Rows of requests preempted since the last decode step stay live
+until that step, so the pool holds 2 * max_num_seqs rows plus the scratch row.
 
 Everything is static-shaped tensor arithmetic (comparisons, max-reductions, where), so one compiled
 graph serves every step. Indices are found with max over (mask * weight) rather than argmax.
