@@ -16,10 +16,9 @@ vLLM-Neuron plugin patterns:
     norm + routed_scaling_factor), 128 routed experts top-6 + 1 shared, relu^2 activation
     (from modeling_nemotron_h.py NemotronHMoE.route_tokens_to_experts). All experts run
     densely as two GEMMs over the concatenated experts; NF.moe_cte fast path is a later optimization.
-  - Mamba2: chunked-SSD prefill (default; O(l*C), long sequences) + 1-step-recurrence decode, with
-    carried across decode steps via in-place module buffers that the plugin's
-    AliasingOutputRewritePass turns into HLO input_output_alias (batch=1). No runner-side state pool.
-    This is the NemotronH-specific piece plamo3 does not have.
+  - Mamba2: chunked-SSD prefill (default; O(l*C), long sequences) + 1-step-recurrence decode, the
+    state carried across steps in a per-request pool of in-place module buffers (state_slots.py says
+    which row a request uses). This is the NemotronH-specific piece plamo3 does not have.
 
 TP: standard tensor parallelism (head sharding for attention, expert/intermediate sharding for MoE
 and Mamba inner dim). 30B-A3B bf16 (~62 GB) needs TP=4 to fit 4 NeuronCores of one trn2 chip.
@@ -583,9 +582,9 @@ class NemotronHMoE(nn.Module):
 # Mamba2 mixer (stateful; ssm+conv state carried via in-place module buffers)
 # ============================================================
 class NemotronHMamba2Mixer(nn.Module):
-    """Vectorized-SSD prefill + 1-step decode. The recurrent (ssm+conv) state lives in module
-    buffers updated in place; the plugin's AliasingOutputRewritePass turns the copy_ into an HLO
-    input_output_alias so state persists across decode steps (batch=1). Trainium lessons baked in
+    """Chunked-SSD prefill + 1-step decode. The recurrent (ssm+conv) state lives in a pool of module
+    buffers (one row per request) updated in place, so it persists across the runner's graph calls.
+    Trainium lessons baked in
     (slice not zero-size split; vectorized SSD not chunked-SSD). TP: shard the inner (heads)
     dimension across ranks.
 

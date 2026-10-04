@@ -29,9 +29,11 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
   mask + a bounded (exponent ≤ 0) decay, the same op shapes as attention — so it compiles on the
   neuronx-cc path. The causal mask is applied to the decay exponent **before** `exp` (the upper
   triangle would otherwise overflow to +inf on real `dt` and produce `inf*0 = NaN`).
-- **Recurrent state without a runner state pool.** The Mamba2 ssm/conv state is carried across decode
-  steps via in-place module buffers; the plugin's `AliasingOutputRewritePass` turns the `copy_` into
-  an HLO `input_output_alias`, so state persists across decode-step graphs (batch=1 / `max_num_seqs=1`).
+- **Recurrent state in a model-side pool.** Each Mamba2 layer keeps its ssm/conv state in a pool of
+  `2 * max_num_seqs + 1` rows held in module buffers and updated in place, so the state persists
+  across the runner's graph calls. The runner hands the model no per-request index and a request's
+  batch row changes from step to step, so the row is found from the request's first KV block id,
+  which stays fixed for the request's lifetime (`state_slots.py`, below).
 - **DGE-free MoE router.** The top-k gate is built with reductions + elementwise comparisons only
   (no data-dependent `scatter`/`gather`), which avoids a neuronx-cc miscompilation that surfaced as a
   `scatter/gather (vector DGE) out-of-bound` once several MoE layers were stacked. Math is identical
@@ -49,7 +51,7 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
 | TP (tensor parallel) | ✅ | Attention Q-head + Mamba head + MoE expert-intermediate sharding; 30B-A3B needs TP=4 on one trn2 chip |
 | SP (sequence parallel) | ✅ | Prefill SP-scatter at the embedding; Mamba all-gathers to full at the SSM boundary |
 | DP (data parallel) | N/A | Not wired for this backbone yet |
-| EP (expert parallel) | N/A | MoE runs every expert densely on the local TP shard as two GEMMs over the concatenated experts (fast NF.moe path is future work) |
+| EP (expert parallel) | N/A | Experts are sharded on the intermediate axis (TP). Prefill runs every expert over every token as batched GEMMs over groups of experts; decode reads only the selected experts' weights |
 | Cross-DP EP | N/A | See EP |
 | Eagle3 spec decode | N/A | Not applicable |
 | FP8 KV cache | N/A | bf16 only today (FP8/NVFP4 is future work; `factory.py` rejects other quantizations) |
@@ -85,13 +87,21 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
   compile + NEFF/weight-load memory grows with `max_model_len`; on trn2.3xlarge (≈125 GiB) the 30B
   model fits single-shot up to a few hundred tokens (256 verified) but a 1024 single-shot prefill
   OOMs — use segmented prefill (above) or a larger instance for longer single-shot contexts.
-- **Batch size.** batch=1 (`max_num_seqs=1`): the Mamba2 recurrent state is a single per-layer
-  buffer (no per-slot pool), so concurrent sequences would corrupt each other. Both the Mamba prefill
-  (batch != 1) and attention decode raise rather than producing wrong output.
+- **Concurrent requests.** Decode batches up to `max_num_seqs` requests. The Mamba2 state pool row
+  of each request is resolved inside the graph from its first KV block id (`state_slots.py`): a
+  prefill's first segment takes the lowest free row, later segments and decode steps look the row up
+  by owner, and a row whose request is absent from a decode batch is released. This relies on the
+  Neuron scheduler running either one prefill request (all its segments in a row) or a decode batch
+  of every running request, never a mix; the pool holds `2 * max_num_seqs + 1` rows because requests
+  that finished in the last decode step still look live to a prefill admitted before the next one.
+  Prefill takes one request per step and raises otherwise. The KV cache must hold `max_num_seqs`
+  full-length requests for the batch to fill (`--num-gpu-blocks-override`, or the scheduler holds
+  requests back).
 - **Automatic Prefix Caching (APC) is not supported.** Do not set `--enable-prefix-caching`. The
   attention KV is addressable by block hash and can be reused across requests, but the Mamba2
-  recurrent state is a single mutable buffer with no block-hash addressing, so a reused prefix would
-  silently continue from the wrong SSM/conv state. (The stock runner only checks that APC implies
+  recurrent state is per request with no block-hash addressing, so a reused prefix would silently
+  continue from the wrong SSM/conv state. Shared first blocks would also break the state-row lookup
+  above, which needs every running request to own its first KV block. (The stock runner only checks that APC implies
   segmented prefill; it does not know this model is recurrent, so the guard is the operator's.)
 - **Speculative decoding is not supported.** The SSM `forward_decode` advances the state by exactly
   one token; a multi-token verify step would silently process only the first. `forward_decode` raises
@@ -107,6 +117,19 @@ language model only). NemotronH is a hybrid decoder that interleaves **Mamba2 (S
 - **Layer types.** Only the `M` (Mamba2), `E` (MoE), and `*` (Attention) `hybrid_override_pattern`
   entries are implemented. Plain-MLP layers (`-`) are not supported and raise at construction; the
   30B-A3B checkpoint does not use them.
+
+## NKI kernels
+
+On a Neuron device the hot paths run as NKI kernels; on CPU (tests) and for shapes a kernel does not
+support, the PyTorch path computes the same thing. Each kernel splits its work across the two
+physical cores of a logical core (LNC=2).
+
+| Kernel | Used in | What it does |
+|---|---|---|
+| `ssd_prefill_kernel.py` | Mamba2 prefill | Chunked SSD scan (128-token chunks), one SSM group per core. Exponents are formed as clamped differences `cs_i - cs_j` (never `exp(cumsum)`), so a large `|A| * sum(dt)` within a chunk cannot overflow. |
+| `mamba_decode_kernel.py` | Mamba2 decode | Conv step + SSM step + gated RMSNorm for a batch of requests, one SSM group per core. Per-channel and per-head work is done for all requests at once (requests on the free axis); per-head values reach the (head, p) partitions through a matmul against a head selector. |
+| `moe_decode_kernel.py` | MoE decode | Reads only each token's selected experts (indirect DMA on the expert index), relu² expert MLP, cores split the intermediate axis. |
+| `matvec_kernel.py` | decode projections | `x @ W` for a few rows: Mamba in/out, attention qkv/o, the vocabulary projection. The shared expert keeps the compiler matmul (faster on trn2). |
 
 ## Environment variables
 
@@ -137,6 +160,17 @@ machine-epsilon) but reduce in a different order, so in bf16 they can pick a dif
 a near-tie — exactly as the quadratic form itself differs from the 1-step recurrence in bf16 (the
 chunked scan adds no error beyond that reformulation-rounding envelope).
 
+Kernel selection (each defaults to the NKI kernel on a Neuron device; `torch` selects the PyTorch path):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `NEMOTRONH_SSD_PREFILL` | nki | Mamba2 prefill scan kernel. |
+| `NEMOTRONH_MAMBA_DECODE` | nki | Mamba2 decode-step kernel. |
+| `NEMOTRONH_MOE_DECODE` | nki | MoE decode kernel. |
+| `NEMOTRONH_MATVEC` | nki | Decode projection kernel. |
+| `NEMOTRONH_MATVEC_OFF` | shared | Comma-separated call sites (`mamba`, `attn`, `shared`, `lm_head`) that keep the plain matmul. |
+| `NEMOTRONH_MOE_GROUP` | 16 | Experts per batched GEMM in the MoE prefill (keeps the intermediate in SBUF). |
+
 The following are **diagnostic only — do not set them in production**; they change or disable numerics:
 
 | Variable | Default | Effect |
@@ -163,7 +197,19 @@ On trn2.3xlarge at TP=4 (real `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` weigh
 
 On the 250 gsm8k questions the two backends disagree on 16 (9 solved only on GPU, 7 only on Trainium; exact McNemar p = 0.80).
 
-## Module Structure
+Throughput on the same setup (`max_model_len 8192`, `--max-num-batched-tokens 512`):
+
+| Measure | Value |
+|---|---|
+| Decode, one request | 9.2 ms/token |
+| Decode, 8 concurrent requests (`--max-num-seqs 8`, 128 tokens each, including their prefills) | 215 tokens/s aggregate |
+| Prefill | about 2600 tokens/s (487 to 7165-token prompts) |
+| Greedy probes with all 12 in flight at once | 12/12 |
+
+A request's output in a batch does not depend on which other requests share the batch (bit-identical
+over different partners). It can differ from the same request run alone: a batch of `b` runs a
+different compiled graph than a batch of 1, and bf16 rounding differs between the two.
+
 ## Module Structure
 
 ```text
@@ -174,6 +220,9 @@ vllm_neuron/model/nemotron_h/
 ├── factory.py         # NemotronHForCausalLM factory (bf16 today; FP8/NVFP4 future)
 ├── ssd.py             # chunked_ssd_scan + segmented_causal_conv1d: Mamba2 SSD prefill + conv carry
 ├── ops.py             # gated_rmsnorm + dense_moe_gate (single source; test compares vs HF reference)
+├── state_slots.py     # which Mamba2 state-pool row each request of a step uses
+├── ssd_prefill_kernel.py, mamba_decode_kernel.py, moe_decode_kernel.py, matvec_kernel.py
+│                      # NKI kernels (see above)
 └── model_bf16.py      # RMSNorm / Attention / MoE / Mamba2 mixers + model + HF weight loader
 ```
 
@@ -190,14 +239,25 @@ test/vllm_neuron/model/nemotron_h/bf16/
 │                                #  - mask-before-exp is required to avoid inf*0 = NaN
 │                                #  - gated RMSNorm and DGE-free MoE gate match the ACTUAL HF
 │                                #    reference (MambaRMSNormGated / NemotronHTopkRouter)
-└── test_nemotron_h_tp.py        # the real model on CPU ranks over gloo, from a tiny random
-                                 # checkpoint loaded through load_weights:
-                                 #  - prefill at TP=2 and TP=4 == TP=1 (sharding + SP collectives)
-                                 #  - prefill (unpadded, or padded with PAD_SLOT_ID or the null block)
-                                 #    + one decode step == single-shot prefill, at TP=1 and TP=4
-                                 #  - the two-GEMM MoE == the per-expert sum over the checkpoint
+├── test_nemotron_h_tp.py        # the real model on CPU ranks over gloo, from a tiny random
+│                                # checkpoint loaded through load_weights:
+│                                #  - prefill at TP=2 and TP=4 == TP=1 (sharding + SP collectives)
+│                                #  - prefill (unpadded, or padded with PAD_SLOT_ID or the null block)
+│                                #    + one decode step == single-shot prefill, at TP=1 and TP=4
+│                                #  - two requests decoded in one reordered, padded batch == each
+│                                #    request on its own, at TP=1 and TP=4
+│                                #  - the grouped-GEMM MoE == the per-expert sum over the checkpoint
+├── test_nemotron_h_state_slots.py  # state-pool rows under a simulated scheduler (admissions,
+│                                #    multi-segment prefills, shuffled padded decode batches,
+│                                #    finished requests, reused first blocks)
+├── test_nemotron_h_*_kernel.py  # each NKI kernel on the NKI CPU simulator vs the PyTorch path
+└── test_nemotron_h_kernel_trace.py # each NKI kernel through the device compiler frontend on meta
+                                 # tensors (catches constructs the simulator accepts but the device
+                                 # frontend rejects)
 ```
 
 Run with `pytest test/vllm_neuron/model/nemotron_h/bf16/`. `test_nemotron_h_tp.py` needs the
-plugin's Python dependencies (it skips without them) but no Neuron device. The on-device numerics
+plugin's Python dependencies (it skips without them) but no Neuron device; the kernel tests need the
+NKI package, and the trace test the Neuron compiler stack (`NEURON_PLATFORM_TARGET_OVERRIDE=trn2` is
+set for it, so no device is needed). The on-device numerics
 (NKI kernels, compiled graphs) are covered by the verification above.
